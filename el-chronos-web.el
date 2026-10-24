@@ -192,7 +192,8 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
 1. 绑定 `el-chronos-collect--suppress-block-p' 为 t —— 采集层心跳据此直接跳过判定；
 2. 把 `el-chronos-block-threshold-ms' 临时抬到
    `el-chronos-web--suppress-block-threshold-ms'（60s）—— 兜住「抑制变量还没被
-   采集层读取」的过渡期；
+   采集层读取」的过渡期（Web 请求在主线程同步执行、通常不会让出，故这一层主要防的是
+   变量尚未生效的那一瞬；report 版还要额外兜 `read-file-name' 之类让出主线程的间隙）；
 3. 收尾把 `el-chronos-collect--last-heartbeat' 重设为当前时刻 —— 关键一步：主线程被
    BODY 占住时心跳 timer 根本不会运行，`let' 绑定在 BODY 返回时就已解除，心跳是在**之后**
    才补跑、看到整段 gap 的。只做 1、2 两层拦不住这一次补跑，必须重置基线。
