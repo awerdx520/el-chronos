@@ -381,10 +381,12 @@
 
 (ert-deftest el-chronos-collect-test-adds-local-hook-when-shadowed ()
   "局部值**不含** t 时它完全遮蔽全局默认值 → 必须补挂局部值，否则该 buffer 漏采（TD-9）。
-本用例守住 D1 修复的边界：收紧判据只该去掉「局部值带 t」的情形，不该连 TD-9 一起放掉。"
+本用例守住 D1 修复的边界：收紧判据只该去掉「局部值带 t」的情形，不该连 TD-9 一起放掉。
+buffer 名**不以空格开头**：内部 buffer（空格开头）按 `--internal-buffer-p' 一律不补挂，
+另有 `el-chronos-collect-test-skips-internal-buffers' 覆盖那一条。"
   (let ((el-chronos-heartbeat-seconds 3600)
         (el-chronos-sample-window-seconds 3600)
-        (buf (generate-new-buffer " *chronos-td9*")))
+        (buf (generate-new-buffer "chronos-td9")))
     (unwind-protect
         (progn
           (with-current-buffer buf
@@ -395,6 +397,29 @@
                         (buffer-local-value 'pre-command-hook buf)))
           (should (memq #'el-chronos-collect--post-command
                         (buffer-local-value 'post-command-hook buf))))
+      (el-chronos-collect-stop)
+      (kill-buffer buf))))
+
+(ert-deftest el-chronos-collect-test-skips-internal-buffers ()
+  "内部 buffer（名字以空格开头）即使局部值遮蔽全局值也不补挂，但仍然登记。
+ETAF 挂载、`with-temp-buffer' 每次渲染都会新建这类 buffer：补挂没有意义（它们不承载
+用户命令），却会让 `buffer-list-update-hook' 反复遍历全部 buffer、把 `--hooked-buffers'
+撑大（dashboard 重复打开时的观感负担）。登记仍要做，避免每次 buffer 切换重复判断。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600)
+        (buf (generate-new-buffer " *chronos-internal*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (setq-local pre-command-hook '(ignore))
+            (setq-local post-command-hook '(ignore)))
+          (el-chronos-collect-start)
+          (should (el-chronos-collect--internal-buffer-p buf))
+          (should-not (memq #'el-chronos-collect--pre-command
+                            (buffer-local-value 'pre-command-hook buf)))
+          (should-not (memq #'el-chronos-collect--post-command
+                            (buffer-local-value 'post-command-hook buf)))
+          (should (gethash buf el-chronos-collect--hooked-buffers)))
       (el-chronos-collect-stop)
       (kill-buffer buf))))
 

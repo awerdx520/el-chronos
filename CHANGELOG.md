@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **dashboard 重复打开导致内存暴涨（OOM）**：`:sessions` 查询无行数上限（一年重启数千次即数千行），
+  而该表标为「不分页」，`--tables` 把整表交给 ETAF；`etaf-table` 为每行保留一个行组件，于是
+  单次渲染多保留约 62 万 cons、RSS +26 MB（6 次渲染 133 MB→304 MB，隔离实例 OOM）。修法：
+  ① `--render-rows` 在构造行描述**之前**截断（分页表按页、不分页表只取首页，标题注明「共 N 条，
+  显示前 M 条」）；② 新增 `el-chronos-dashboard-max-rows`（200），快照每个列表字段封顶，挡
+  `:sessions` / `:trend` / `:heatmap` 这类无界查询；③ `--reload-snapshot` 重载前先丢弃旧快照。
+  实测（3000 会话 fixture）：单次渲染交给 ETAF 的行数 2161→80、耗时 25–34s→4–5s、6 次打开后
+  RSS 304 MB→105 MB、存活 cons 361 万→38 万（采样窗口 flush 后回落到 24.7 万）。见
+  `docs/ui.org`「每页行数与内存」。
+- **内部 buffer 不再补挂命令计时 hook**：`el-chronos-collect--internal-buffer-p` 识别名字以空格
+  开头的 buffer（ETAF 挂载的 ` *work*`、`with-temp-buffer` 等），跳过补挂但仍登记——
+  消掉每次渲染遍历全部 buffer 的负担（`--hooked-buffers` 因此稳定不增）。
+
 ### 变更
 
 - **TD-1 关闭**（native-comp `.eln` 归因）：实测 Emacs 31.1 下 `symbol-file` 对原生编译函数返回 `eln-cache` 内的 `.eln` 路径；落地「文件名剪哈希 + `locate-library` 反查」方案，真实 844 个 `.eln` 中 **815 个反查成功（96.6%）**、加 trampoline 判 `built-in` 后**仅 9 个 `unknown`（1.1%）**，共归因到 162 个包；未采用代价更高的 `comp-el-to-eln-filename` 遍历方案。

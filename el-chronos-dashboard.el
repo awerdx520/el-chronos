@@ -130,7 +130,17 @@ ETAF 由 `etaf' 与 `etaf-ui' 提供（recipe 见 thomas-emacs 的 `lisp/init-et
   "降级页列格式：区块 / 名称 / 值 / 明细（向量里的元素是字面量列表，不要写 `(list ...)'）。")
 
 (defcustom el-chronos-dashboard-page-size 20
-  "表格每页行数（慢命令与热点函数两张主表分页）。" :type 'integer :group 'el-chronos)
+  "表格每页行数（5 张表都受此上限约束：分页表按页取，不分页表只取首页）。
+这是**单次渲染**进入 ETAF 组件的行数上限：`etaf-table' 会为每一行保留一个行 Host
+（含单元格子组件），行数直接决定单次渲染的分配量与保留量（实测见
+`docs/ui.org'「每页行数与内存」）。不要为了「一次看全」把它调到几百以上。"
+  :type 'integer :group 'el-chronos)
+(defcustom el-chronos-dashboard-max-rows 200
+  "单表进入数据快照的最大行数（防御无界查询）。
+`:sessions' 按时间窗查询且**无行数上限**（一年重启数千次就有数千行）、`:trend' /
+`:heatmap' 同理随窗口增长。快照只保留前 max-rows 行，渲染再按
+`el-chronos-dashboard-page-size' 取首页，两级上限共同把单次渲染的内存占住。"
+  :type 'integer :group 'el-chronos)
 (defcustom el-chronos-dashboard-chart-points 60
   "趋势折线最多使用的采样点数（超出等距抽稀）。" :type 'integer :group 'el-chronos)
 (defcustom el-chronos-dashboard-chart-width 72
@@ -443,6 +453,8 @@ WIDTH 是可用字符宽度（默认 `el-chronos-dashboard-chart-width'）。"
 RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归一为符号**（见
 `--range-symbol'）：analysis 层的范围键是符号，传字符串会被静默当成 7 天。
 快照里的 `:range' 保留原始入参（显示用），`:range-symbol' 是归一后的符号（查询用）。
+每个列表字段都过 `--cap-rows'（`el-chronos-dashboard-max-rows'）：`:sessions' /
+`:trend' / `:heatmap' 没有行数上限，窗口一大就能把整表搬进内存。
 分析层已把查询失败降级为 nil 并 `display-warning'，这里再包一层 `condition-case'
 是双保险（I6：可视化出错不得向宿主抛错）。"
   (let ((symbol (el-chronos-dashboard--range-symbol range)))
@@ -450,18 +462,35 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
         (list :range range :range-symbol symbol
               :loaded-at (truncate (* 1000 (float-time)))
               :overview (el-chronos-analysis-overview symbol)
-              :slow (el-chronos-analysis-slow-commands symbol 60)
-              :functions (el-chronos-analysis-top-functions symbol 60)
-              :packages (el-chronos-analysis-package-breakdown symbol 12)
-              :trend (el-chronos-analysis-trend symbol)
-              :heatmap (el-chronos-analysis-heatmap symbol 8)
-              :blockers (el-chronos-analysis-blocking-events symbol 20)
-              :regressions (el-chronos-analysis-regressions symbol 20)
-              :sessions (el-chronos-analysis-sessions symbol))
+              :slow (el-chronos-dashboard--cap-rows
+                     (el-chronos-analysis-slow-commands symbol 60))
+              :functions (el-chronos-dashboard--cap-rows
+                          (el-chronos-analysis-top-functions symbol 60))
+              :packages (el-chronos-dashboard--cap-rows
+                         (el-chronos-analysis-package-breakdown symbol 12))
+              :trend (el-chronos-dashboard--cap-rows (el-chronos-analysis-trend symbol))
+              :heatmap (el-chronos-dashboard--cap-rows
+                        (el-chronos-analysis-heatmap symbol 8))
+              :blockers (el-chronos-dashboard--cap-rows
+                         (el-chronos-analysis-blocking-events symbol 20))
+              :regressions (el-chronos-dashboard--cap-rows
+                            (el-chronos-analysis-regressions symbol 20))
+              :sessions (el-chronos-dashboard--cap-rows
+                         (el-chronos-analysis-sessions symbol)))
       (error (display-warning 'el-chronos
                               (format "可视化数据加载失败：%s" error-object) :warning)
              (list :range range :range-symbol symbol
                    :loaded-at (truncate (* 1000 (float-time))))))))
+
+(defun el-chronos-dashboard--reload-snapshot (range)
+  "丢弃旧快照后按 RANGE 重新加载（返回新快照并写进 `--snapshot'）。
+先把全局置 nil 再查询：否则查询期间新旧两代快照同时存活，内存峰值翻倍
+（重查询本身可能耗时数百毫秒，两代都被 profiler 采样扫到）。"
+  (setq el-chronos-dashboard--snapshot nil)
+  (setq el-chronos-dashboard--snapshot
+        (el-chronos-dashboard--load-snapshot
+         (or range (plist-get el-chronos-dashboard--state :range))))
+  el-chronos-dashboard--snapshot)
 
 ;;; 概览卡片与状态栏
 
@@ -555,26 +584,52 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
     (:sessions "会话与启动耗时" nil))
   "5 个表格区块：(KIND 标题 是否分页)。")
 
+(defun el-chronos-dashboard--cap-rows (rows)
+  "把 ROWS 截到 `el-chronos-dashboard-max-rows' 行以内；nil / 短列表原样返回。
+快照层的上限：挡无界查询（`:sessions' 无行数上限）把整张表搬进内存。"
+  (let ((limit (max 1 (or el-chronos-dashboard-max-rows 200))))
+    (cond ((null rows) nil)
+          ((<= (length rows) limit) rows)
+          (t (cl-subseq rows 0 limit)))))
+
+(defun el-chronos-dashboard--render-rows (rows paged page size)
+  "取本次渲染要交给 ETAF 的 ROWS：分页表取第 PAGE 页，不分页表只取前 SIZE 行。
+**必须在构造行描述（`--row'）之前就截断**：先全量构造再截断会让整表都进过一次
+内存（实测 2100 行会话表 → 每次渲染多保留约 61 万 cons，见 docs/ui.org）。"
+  (let ((size (max 1 (or size 1))))
+    (if paged
+        (el-chronos-dashboard--page-slice rows page size)
+      (when (and rows (> (length rows) 0))
+        (cl-subseq rows 0 (min (length rows) size))))))
+
+(defun el-chronos-dashboard--table-title (title rows paged page size)
+  "表格标题：分页表带页码，不分页表在超出行数上限时注明已加载条数与截断。
+用「已加载」而非「共」：快照本身受 `el-chronos-dashboard-max-rows' 约束，屏幕上的总数
+不等于库里的总数，标题不谎称全量。"
+  (let ((size (max 1 (or size 1)))
+        (total (length (or rows nil))))
+    (cond (paged (format "%s（第 %d/%d 页）" title (1+ (max 0 page))
+                         (el-chronos-dashboard--page-count rows size)))
+          ((> total size) (format "%s（已加载 %d 条，显示前 %d 条）" title total size))
+          (t title))))
+
 (defun el-chronos-dashboard--tables (page)
-  "按 PAGE 生成 5 个表格的渲染描述：标题（分页表带页码）、列、行、行点击回调。"
+  "按 PAGE 生成 5 个表格的渲染描述：标题（分页表带页码）、列、行、行点击回调。
+每个表交给 ETAF 的行数都不超过 `el-chronos-dashboard-page-size'（见 `--render-rows'）。"
   (let ((size el-chronos-dashboard-page-size))
     (mapcar (lambda (section)
               (let* ((kind (nth 0 section))
                      (all (or (el-chronos-dashboard--snapshot-get kind) nil))
                      (paged (nth 2 section)))
-                (list :title (if paged
-                                 (format "%s（第 %d/%d 页）" (nth 1 section)
-                                         (1+ (max 0 page))
-                                         (el-chronos-dashboard--page-count all size))
-                               (nth 1 section))
+                (list :title (el-chronos-dashboard--table-title
+                              (nth 1 section) all paged page size)
                       :columns (mapcar (lambda (column)
                                          (list :key (nth 0 column) :label (nth 1 column)
                                                :width (nth 2 column)))
                                        (alist-get kind el-chronos-dashboard--columns))
                       :rows (mapcar (lambda (row) (el-chronos-dashboard--row kind row))
-                                    (if paged
-                                        (el-chronos-dashboard--page-slice all page size)
-                                      all))
+                                    (el-chronos-dashboard--render-rows
+                                     all paged page size))
                       :on-press (lambda (row) (el-chronos-dashboard--drill kind row)))))
             el-chronos-dashboard--sections)))
 
@@ -809,8 +864,7 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
 不卸载就重挂会让弹窗与状态栏停在旧值上。"
   (el-chronos-dashboard--define-components)
   (el-chronos-dashboard--ensure-state range)
-  (setq el-chronos-dashboard--snapshot
-        (el-chronos-dashboard--load-snapshot (plist-get el-chronos-dashboard--state :range)))
+  (el-chronos-dashboard--reload-snapshot range)
   (let* ((state el-chronos-dashboard--state)
          (buffer (get-buffer-create el-chronos-dashboard--buffer-name)))
     (when-let* ((runtime (etaf-runtime-for-buffer buffer))) (etaf-unmount runtime))
@@ -874,8 +928,7 @@ tabulated-list（标题行也是条目），保证 `*el-chronos*' 仍是 tabulat
 (defun el-chronos-dashboard--render-fallback (range)
   "用 RANGE 渲染 tabulated-list 降级页，返回 `--buffer-name' buffer。"
   (el-chronos-dashboard--ensure-state range)
-  (setq el-chronos-dashboard--snapshot
-        (el-chronos-dashboard--load-snapshot (plist-get el-chronos-dashboard--state :range)))
+  (el-chronos-dashboard--reload-snapshot range)
   (let ((buffer (get-buffer-create el-chronos-dashboard--buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))

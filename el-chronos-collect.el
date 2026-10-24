@@ -551,6 +551,13 @@ store 侧再按键（小时 + 会话 + 名字）累加，写库由 store 的 flu
 Emacs 31.1：hook 内 `get-buffer-create' 再触发同一个 hook 一次），用本标志挡掉，
 避免将来的改动把补挂逻辑变成递归。")
 
+(defun el-chronos-collect--internal-buffer-p (buffer)
+  "BUFFER 是否是「内部 buffer」（名字以空格开头，Emacs 约定不可见）。
+这类 buffer（ETAF 挂载用的 ` *work*'、`with-temp-buffer' 的临时 buffer 等）不承载
+用户命令，不给它们补挂命令计时 hook；只判断名字，不读 buffer 内容。"
+  (let ((name (buffer-name buffer)))
+    (and (stringp name) (> (length name) 0) (eq (aref name 0) ?\s))))
+
 (defun el-chronos-collect--ensure-buffer-hooks ()
   "给「局部 hook 值遮蔽了全局默认值」的 buffer 补挂本模块的命令计时 hook（TD-9）。
 Emacs 31 起两个 command hook 是 auto-buffer-local：buffer 一旦有局部绑定，全局默认值
@@ -564,6 +571,10 @@ Emacs 31 起两个 command hook 是 auto-buffer-local：buffer 一旦有局部�
 在无局部绑定时会回落全局值，区分不出这两种情况，故只在确认有局部绑定后才用它读局部值。
 
 跳过 minibuffer：其命令循环语义与普通 buffer 不同（`minibufferp' 为真即跳过）。
+跳过**内部 buffer**（名字以空格开头，见 `--internal-buffer-p`）：ETAF 挂载、`with-temp-buffer`
+等每次渲染都会新建这类 buffer，它们不承载用户命令，补挂既无意义，又让
+`buffer-list-update-hook' 在每次渲染时反复遍历全部 buffer（「打开 dashboard 要碰全部
+buffer」的观感来源）。跳过也登记，避免下次重复判断。
 每个 buffer 单独 `condition-case'，单个 buffer 失败不影响其余（I6），整体再兜一层；
 `--ensuring-p' 挡住 `buffer-list-update-hook' 的重入。
 幂等：`add-hook' 自带去重，`--hooked-buffers' 保证不重复判断（跳过的 buffer 也登记）。"
@@ -575,13 +586,14 @@ Emacs 31 起两个 command hook 是 auto-buffer-local：buffer 一旦有局部�
                         (gethash buf el-chronos-collect--hooked-buffers))
               (condition-case err-in-buffer
                   (with-current-buffer buf
-                    (dolist (pair '((pre-command-hook . el-chronos-collect--pre-command)
-                                    (post-command-hook . el-chronos-collect--post-command)))
-                      (let ((hook (car pair)))
-                        ;; 只补「有局部绑定且局部值不含 t」的 buffer（判据见 docstring）
-                        (when (and (local-variable-p hook buf)
-                                   (not (memq t (buffer-local-value hook buf))))
-                          (add-hook hook (cdr pair) nil t))))
+                    (unless (el-chronos-collect--internal-buffer-p buf)
+                      (dolist (pair '((pre-command-hook . el-chronos-collect--pre-command)
+                                      (post-command-hook . el-chronos-collect--post-command)))
+                        (let ((hook (car pair)))
+                          ;; 只补「有局部绑定且局部值不含 t」的 buffer（判据见 docstring）
+                          (when (and (local-variable-p hook buf)
+                                     (not (memq t (buffer-local-value hook buf))))
+                            (add-hook hook (cdr pair) nil t)))))
                     (puthash buf t el-chronos-collect--hooked-buffers))
                 (error
                  (el-chronos-collect--warn "buffer %s 补挂命令 hook 失败：%S"

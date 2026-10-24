@@ -534,6 +534,125 @@ fixture 放一条「1 小时内」（确定落在 1d 窗口内）与一条「5 �
       (when (process-live-p blocker) (delete-process blocker))
       (ignore-errors (el-chronos-web-stop)))))
 
+;;; dashboard：每页行数上限与重复打开不增长（内存回归）
+
+(ert-deftest el-chronos-ui-test-dashboard-tables-cap-rows ()
+  "5 张表交给 ETAF 的行数都不超过 `el-chronos-dashboard-page-size'。
+回归背景：`:sessions' 查询**无行数上限**（一年重启数千次 → 数千行），旧实现把整表交给
+`etaf-table'，每行会保留一个行 Host + 单元格子组件，单次渲染多保留约 61 万 cons，
+连续打开 dashboard 导致进程内存暴涨（实测 6 次渲染 RSS 148MB→306MB）。
+
+判据分两层：
+  - 分页表（慢命令 / 热点函数）取第 PAGE 页，行数 ≤ size，标题带页码；
+  - 不分页表（阻塞 / 回归 / 会话）只取前 size 行，超限时标题注明「共 N 条，显示前 M 条」。"
+  (let* ((size 20)
+         (el-chronos-dashboard-page-size size)
+         (el-chronos-dashboard--snapshot
+          (list :slow (cl-loop for i below 200 collect (list :name (format "cmd-%d" i)))
+                :functions (cl-loop for i below 200 collect (list :function (format "fn-%d" i)))
+                :blockers (cl-loop for i below 200 collect (list :id i))
+                :regressions (cl-loop for i below 200 collect (list :function (format "r-%d" i)))
+                :sessions (cl-loop for i below 200 collect (list :id i)))))
+    (dolist (page (list 0 3))
+      (dolist (table (el-chronos-dashboard--tables page))
+        (should (<= (length (plist-get table :rows)) size))
+        (should (stringp (plist-get table :title)))))
+    ;; 分页表：第 0 页是前 20 条，第 3 页是第 61–80 条（顺序由快照给定）
+    (let* ((slow (nth 0 (el-chronos-dashboard--tables 0)))
+           (slow-page-3 (nth 0 (el-chronos-dashboard--tables 3)))
+           (first-row (car (plist-get slow :rows)))
+           (row-60 (car (plist-get slow-page-3 :rows))))
+      (should (= 20 (length (plist-get slow :rows))))
+      (should (equal "cmd-0" (plist-get (alist-get :source first-row) :name)))
+      (should (equal "cmd-60" (plist-get (alist-get :source row-60) :name)))
+      ;; 10 页（200 行 / 20 行每页）
+      (should (string-match-p "第 1/10 页" (plist-get slow :title))))
+    ;; 不分页表：只取首页 + 标题如实说明截断
+    (let ((sessions (nth 4 (el-chronos-dashboard--tables 0))))
+      (should (= size (length (plist-get sessions :rows))))
+      (should (string-match-p "已加载 200 条，显示前 20 条" (plist-get sessions :title))))
+    ;; 短列表不改标题、不加截断说明
+    (let* ((el-chronos-dashboard--snapshot (list :sessions (list (list :id 1))))
+           (sessions (nth 4 (el-chronos-dashboard--tables 0))))
+      (should (= 1 (length (plist-get sessions :rows))))
+      (should-not (string-match-p "已加载 " (plist-get sessions :title))))))
+
+(ert-deftest el-chronos-ui-test-dashboard-snapshot-cap-rows ()
+  "`--load-snapshot' 每个列表字段都不超过 `el-chronos-dashboard-max-rows'。
+`:sessions' / `:trend' / `:heatmap' 随窗口增长而没有行数上限，快照必须自己封顶，
+否则一次渲染就把整表搬进内存（快照持有到下次渲染）。"
+  (el-chronos-ui-test--with-temp-db
+    (should (el-chronos-store-open))
+    (let ((el-chronos-dashboard-max-rows 5)
+          (rows (cl-loop for i below 50 collect (list :id i))))
+      (cl-letf (((symbol-function 'el-chronos-analysis-sessions) (lambda (&rest _) rows))
+                ((symbol-function 'el-chronos-analysis-trend) (lambda (&rest _) rows))
+                ((symbol-function 'el-chronos-analysis-slow-commands)
+                 (lambda (&rest _) rows))
+                ((symbol-function 'el-chronos-analysis-overview) (lambda (&rest _) nil)))
+        (let ((snapshot (el-chronos-dashboard--load-snapshot "7d")))
+          (should (= 5 (length (plist-get snapshot :sessions))))
+          (should (= 5 (length (plist-get snapshot :trend))))
+          (should (= 5 (length (plist-get snapshot :slow))))
+          ;; 截断保留的是前 N 条（顺序不变）
+          (should (equal 0 (plist-get (car (plist-get snapshot :sessions)) :id)))
+          (should (equal 4 (plist-get (nth 4 (plist-get snapshot :sessions)) :id))))
+        ;; 短列表原样返回（不截断、不返 nil）
+        (cl-letf (((symbol-function 'el-chronos-analysis-sessions)
+                   (lambda (&rest _) (list (list :id 1) (list :id 2)))))
+          (should (= 2 (length (plist-get (el-chronos-dashboard--load-snapshot "7d")
+                                          :sessions)))))))))
+
+(ert-deftest el-chronos-ui-test-dashboard-reload-snapshot-drops-old ()
+  "重载快照前先把旧快照置 nil：查询期间不持有两代数据，且新快照替换旧值。"
+  (el-chronos-ui-test--with-temp-db
+    (should (el-chronos-store-open))
+    (let ((delivered (list (list :id 1))))
+      (cl-letf (((symbol-function 'el-chronos-analysis-sessions) (lambda (&rest _) delivered))
+                ((symbol-function 'el-chronos-analysis-overview) (lambda (&rest _) nil)))
+        (setq el-chronos-dashboard--snapshot (list :sessions (list (list :id 'stale))))
+        (el-chronos-dashboard--reload-snapshot "7d")
+        (let ((sessions (plist-get el-chronos-dashboard--snapshot :sessions)))
+          (should (= 1 (length sessions)))
+          (should (equal 1 (plist-get (car sessions) :id)))))
+      (setq el-chronos-dashboard--snapshot nil))))
+
+(ert-deftest el-chronos-ui-test-dashboard-repeat-open-no-growth ()
+  "连续打开 dashboard 不增长 buffer 数与 hook 登记表，ETAF runtime 至多 1 个。
+回归背景：每次打开都新建 runtime / buffer 却不回收时，连开数次就把隔离实例撑爆
+（实测修复前 6 次渲染 RSS 148MB→306MB，存活 cons 92 万→361 万）。
+ETAF 缺席时（`make test' 不带 ETAF 的 load-path）走 tabulated-list 降级页，同一套断言仍然成立。"
+  (el-chronos-ui-test--with-temp-db
+    (let ((db (el-chronos-store-open)))
+      (should db)
+      (sqlite-execute db
+                      "INSERT INTO sessions (started_at, emacs_version, host) VALUES (?, ?, ?)"
+                      (list (truncate (* 1000 (float-time))) "el-chronos-test" "test-host"))
+      (unwind-protect
+          (progn
+            (el-chronos-dashboard "7d")
+            (let ((buffers (length (buffer-list)))
+                  (sessions (length (plist-get el-chronos-dashboard--snapshot :sessions)))
+                  (hooked (hash-table-count el-chronos-collect--hooked-buffers))
+                  ;; ETAF 缺席时变量不存在：用 `boundp' + `symbol-value' 读，
+                  ;; 避免字节编译在 ETAF 不在 load-path 时报自由变量告警
+                  (runtimes (and (boundp 'etaf--runtimes)
+                                 (hash-table-count (symbol-value 'etaf--runtimes)))))
+              (dotimes (_ 4) (el-chronos-dashboard "7d"))
+              ;; 允许首次渲染期新建 1 个内部 buffer（ETAF 的 ` *work*'）
+              (should (<= (length (buffer-list)) (1+ buffers)))
+              (should (= hooked (hash-table-count el-chronos-collect--hooked-buffers)))
+              (when runtimes
+                (should (<= (hash-table-count (symbol-value 'etaf--runtimes))
+                            (max 1 runtimes))))
+              ;; 关键：快照每次整体替换，行数不随打开次数累积
+              (should (= sessions
+                         (length (plist-get el-chronos-dashboard--snapshot :sessions))))))
+        (when (get-buffer el-chronos-dashboard--buffer-name)
+          (kill-buffer (get-buffer el-chronos-dashboard--buffer-name)))
+        (setq el-chronos-dashboard--state nil
+              el-chronos-dashboard--snapshot nil)))))
+
 (provide 'el-chronos-ui-test)
 
 ;;; el-chronos-ui-test.el ends here

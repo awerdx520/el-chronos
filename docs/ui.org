@@ -274,11 +274,57 @@ ETAF 可用时 =eval= 一次；挂载形式同样走 =eval=。原因见下文踩
 | 项 | 取值 | 控制手段 |
 |---|---|---|
 | 表格分页 | dashboard 每页 =el-chronos-dashboard-page-size= 20 行；Web 每页 10 行 | 单页行数固定，避免一次塞入全部排行拖慢重绘（TD-5） |
+| 每页行数与内存 | 5 张表**都**受 =el-chronos-dashboard-page-size= 约束（分页表按页取，不分页表只取首页）；快照层另有 =el-chronos-dashboard-max-rows= 200 行上限 | 见下节「每页行数与内存」：行数直接决定 ETAF 保留量与单次渲染的 RSS 峰值 |
 | 图表采样点 | dashboard =el-chronos-dashboard-chart-points= 60 点（=--downsample= 等距抽稀）；图表逻辑宽 =el-chronos-dashboard-chart-width= 72 | 采样点有上限，趋势桶数由 analysis 决定（24/168/720） |
 | 数据快照 | 一次挂载取齐 9 组数据；切范围/翻页/下钻只重绘 | 不在交互路径上重复查库 |
 | ETAF 重绘 | 每次重绘重建整棵组件树（先 =etaf-unmount=） | 已知代价：大数据量下的重绘耗时尚**未实测**（TD-5）；超 1s 则下调每页行数与采样点，必要时改按需渲染 |
 | Web 查询 | 列表 =limit= 默认 20、上限 1000；堆栈默认 50 | 单线程串行，长查询会占主线程 |
 | Web 前端 | 一次取数 + 本地渲染；自动刷新默认 30s | 关掉自动刷新即零轮询；搜索/排序/分页均在本地数据上做 |
+
+** 每页行数与内存（2026-10-24 实测，Emacs 31.1）
+
+**症状**：打开 dashboard 数次后进程内存暴涨，隔离实例（=elisp-test=）OOM。
+
+**量化**（batch + ETAF，fixture = 3000 会话 / 2 万命令 / 4800 函数行 / 6000 阻塞事件，
+每次 =M-x el-chronos-dashboard= 后先 =garbage-collect= 再读 =garbage-collect= 的 USED 与
+=/proc/self/status= 的 VmRSS）：
+
+| 指标 | 修复前（每渲染） | 修复后（每渲染） |
+|---|---|---|
+| 交给 =etaf-table= 的行数 | 2161（=:sessions= 无行数上限 2101 行 + 其余 60） | 80（5 表各 ≤ 20） |
+| =--tables= 的 =prin1= 长度 | 512 KB | 19.7 KB |
+| 快照 =prin1= 长度 | 225 KB | 40 KB |
+| GC 后存活 cons | 92 万 → 361 万（+62 万/次，线性不收敛） | 24.7 万 → 38 万（+3.3 万/次，采样窗口 flush 后回落到 24.7 万） |
+| VmRSS | 133 MB → 304 MB（+26 MB/次） | 103 MB → 105 MB |
+| 单次渲染耗时 | 25–34 s | 4–5 s |
+
+**主因**（证据链，逐层排除）：
+1. =el-chronos-analysis-sessions= 按时间窗查询且**无行数上限**（一年重启数千次即数千行），
+   而 5 个表区块中 =:sessions= 标的是「不分页」，于是 =--tables= 把**整表**构造好交给 ETAF。
+1. =etaf-table= 用 =:for (item ...)= 逐行创建**保留式行组件**（每行一个 row Host + 单元格
+   子组件 + 行 key），行数直接等于保留对象数——不是「渲染时截断」能省的。
+1. 每次挂载 =etaf-unmount= 只 =remhash= 旧 runtime，页对象要等 GC；而采集层开着 CPU 采样时
+   （=el-chronos-mode 1=，10ms 间隔）GC 对采样栈保守扫描，旧页在采样日志 flush 前拿不回来
+   → 会话表越大，「每渲染泄漏一页」越贵。
+1. 排除项（实测均不是主因）：=--ensure-buffer-hooks= 的 =--hooked-buffers= 恒为 5、
+   buffer 数恒为 7（首开 +2 后不增）；=--components-defined-p= 守卫生效（组件只 =eval= 一次）；
+   =etaf--runtimes= 恒为 1（unmount 生效）；纯查询（不渲染）10 次的存活 cons 只 +0.5 万。
+
+**修法**：
+- =--render-rows=：**在构造行描述之前**截断——分页表取第 PAGE 页，不分页表只取前
+  =el-chronos-dashboard-page-size= 行；标题如实写「已加载 N 条，显示前 M 条」。
+- =--cap-rows= + =el-chronos-dashboard-max-rows=（200）：快照每个列表字段都封顶，
+  挡 =:sessions= / =:trend= / =:heatmap= 这类无界查询。
+- =--reload-snapshot=：重载前先把旧快照置 nil，查询期间不持有两代数据。
+- =el-chronos-collect--internal-buffer-p=：内部 buffer（名字以空格开头，如 ETAF 的
+  = *work*=）不补挂命令计时 hook（仍登记，避免重复判断）——顺带消掉「打开 dashboard 要碰
+  全部 buffer」的观感负担。
+
+**残余**：+3.3 万 cons/次是采样期间的保守保留，采集层每个 =el-chronos-sample-window-seconds=
+窗口 flush 采样日志后回落到基线（实测 =--sample-tick= 后 38 万 → 24.7 万），属有界抖动，
+且与行数成正比——所以行数上限是这条链路的第一道闸。回归用例见
+=test/el-chronos-ui-test.el=（=dashboard-tables-cap-rows= / =dashboard-snapshot-cap-rows= /
+=dashboard-repeat-open-no-growth=）。
 
 **待实测**：ETAF 页面在 30 天真实数据下的首次渲染与切范围重绘耗时（TD-5）；
 terminal 文本字符图的可读性；Web 页在 30 天数据下的火焰图渲染耗时。
