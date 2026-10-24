@@ -36,6 +36,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'subr-x)
 (require 'json)
 (require 'sqlite)
 (require 'el-chronos)
@@ -43,6 +44,17 @@
 (require 'el-chronos-collect)            ; `--heartbeat'：验证渲染不新增假阻塞
 (require 'el-chronos-dashboard)
 (require 'el-chronos-web)
+
+;; ETAF / ebox 是可选依赖（`make test' 的 load-path 里没有）：只为渲染用例的函数调用
+;; 消掉「未知函数」字节编译告警，不是运行期依赖。
+(declare-function etaf-mount "etaf" (buffer-or-name view &optional options))
+(declare-function etaf-unmount "etaf" (&optional runtime))
+(declare-function etaf-runtime-for-buffer "etaf" (buffer-or-name))
+(declare-function ebox-buffer-mount "ebox" (buffer-or-name))
+(declare-function ebox-mount-root "ebox" (mount))
+(declare-function ebox-node-children "ebox" (node))
+(declare-function ebox-node-geometry "ebox" (node))
+(declare-function ebox-node-classes "ebox" (node))
 
 ;;; 测试夹具与辅助
 
@@ -652,6 +664,192 @@ ETAF 缺席时（`make test' 不带 ETAF 的 load-path）走 tabulated-list 降�
           (kill-buffer (get-buffer el-chronos-dashboard--buffer-name)))
         (setq el-chronos-dashboard--state nil
               el-chronos-dashboard--snapshot nil)))))
+
+;;; dashboard 宽度策略与主题配色（不截断、不溢出、背景跟随主题）
+
+(defconst el-chronos-ui-test--widths '(60 80 120 160)
+  "宽度自适应用例覆盖的窗口列数：60 是分屏下的常见下限。")
+
+(ert-deftest el-chronos-ui-test-dashboard-card-fields-complete ()
+  "`--card' 把数据行拆成 `:head' + `:detail'，两者都保留**完整文本**（不含 `…'）。
+这是用户可见性要求的直接断言：命令名 / 函数名 / 包名 / 路径这类数据文本一旦被截断
+（旧实现的 `etaf-table' 定宽列会用 `truncate-string-to-width' 补 `…'，`:overflow hidden'
+则直接裁掉），就再也读不到完整信息。"
+  (let* ((long-name "el-chronos-very-long-command-name-exceeding-any-column-width")
+         (rows (list (cons :slow (list :name long-name :total-ms 1234 :count 7 :aborted 1))
+                     (cons :functions (list :function long-name :package "el-chronos"
+                                            :self-ms 1234 :pct 42.5))
+                     (cons :blockers (list :ts 1700000000000 :duration-ms 980
+                                           :command long-name :mode "emacs-lisp-mode"))
+                     (cons :regressions (list :function long-name :growth 1.5
+                                              :current-ms 800 :previous-ms 400
+                                              :current-samples 10 :previous-samples 8))
+                     (cons :sessions (list :id 3 :started-at 1700000000000
+                                           :startup-ms 1234 :emacs-version "31.1"
+                                           :host long-name)))))
+    (dolist (entry rows)
+      (let* ((kind (car entry))
+             (card (el-chronos-dashboard--card kind (cdr entry)))
+             (head (plist-get card :head))
+             (detail (plist-get card :detail))
+             (columns (alist-get kind el-chronos-dashboard--columns))
+             (head-key (alist-get kind el-chronos-dashboard--card-primary))
+             (head-label (nth 1 (assq head-key columns))))
+        ;; 主键全文本出现，且卡片里没有截断标记
+        (should (stringp head))
+        (should (string-match-p (regexp-quote long-name) (concat head " " detail)))
+        (should-not (string-match-p "…" head))
+        (should-not (string-match-p "…" detail))
+        ;; 除主键外每个字段的标签都在 `:detail' 里（数据不丢字段）
+        (dolist (column (cl-remove head-key columns :key #'car :test #'eq))
+          (should (string-match-p (regexp-quote (nth 1 column)) detail)))
+        ;; 主键不重复出现在 detail 里（首行已完整显示）
+        (should-not (string-match-p (regexp-quote head-label) detail))))))
+
+(ert-deftest el-chronos-ui-test-dashboard-theme-palette ()
+  "`--theme-palette' 从 `default' / `shadow' / `link' 等 face 派生 ETAF 主题色。
+判据：颜色可用时必须给出 `:ui-bg' 与 `:ui-fg'（页面与文字跟随主题），面板表面色是
+背景的明暗偏移；主题未指定（`emacs -Q --batch' 的 `unspecified-bg'）时返回 nil ——
+绝不把 `unspecified-bg' 当颜色传下去（实测那会让面板拿到非法颜色）。"
+  (cl-letf (((symbol-function 'face-attribute)
+             (lambda (face attribute &optional _frame _inherit)
+               (pcase (cons face attribute)
+                 ('(default . :background) "#202634")
+                 ('(default . :foreground) "#F4F6FB")
+                 ('(shadow . :foreground) "#7A8699")
+                 ('(link . :foreground) "#4FC1FF")
+                 ('(highlight . :background) "#2F6FE4")
+                 (_ "unspecified")))))
+    (let ((palette (el-chronos-dashboard--theme-palette)))
+      (should (equal "#202634" (plist-get palette :ui-bg)))
+      (should (equal "#F4F6FB" (plist-get palette :ui-fg)))
+      (should (equal "#F4F6FB" (plist-get palette :ui-panel-fg)))
+      (should (equal "#7A8699" (plist-get palette :ui-muted-fg)))
+      (should (equal "#4FC1FF" (plist-get palette :ui-accent)))
+      (should (equal "#2F6FE4" (plist-get palette :ui-button-primary-bg)))
+      ;; 面板表面色 = 背景的明暗偏移（可解析为合法颜色）
+      (should (color-name-to-rgb (plist-get palette :ui-panel-bg)))
+      ;; 只有解析出颜色串的键才出现（nil 值会让组件拿 nil 当颜色）
+      (should (cl-every #'stringp (cl-loop for (_key value) on palette by #'cddr
+                                           collect value)))))
+  ;; 主题不可用（`emacs -Q --batch' 的默认情形）→ nil，而不是把 `unspecified-bg' 当颜色
+  (cl-letf (((symbol-function 'face-attribute)
+             (lambda (_face attribute &optional _frame _inherit)
+               (if (eq attribute :background) "unspecified-bg" "unspecified-fg"))))
+    (should-not (el-chronos-dashboard--theme-palette))))
+
+(ert-deftest el-chronos-ui-test-dashboard-chart-width-fits ()
+  "图表宽度不超过内容宽度；文本图逐行截断后每行都不超内容宽度（图表文本允许缩略）。"
+  (dolist (avail el-chronos-ui-test--widths)
+    (let ((content (el-chronos-dashboard--content-cells avail)))
+      (should (<= (el-chronos-dashboard--chart-width content) content))
+      (dolist (kind '(trend bars heatmap))
+        (let ((text (el-chronos-dashboard--fit-text-chart
+                     kind
+                     (list (list :label "a-very-long-command-name-exceeding-the-cell"
+                                 :value 12 :pct 50.0 :values '(1 2 3)))
+                     content)))
+          (should (stringp text))
+          (dolist (line (split-string text "\n"))
+            (should (<= (string-width line) content))))))))
+
+(defun el-chronos-ui-test--default-remap-spec ()
+  "返回 `face-remapping-alist' 里 `default' 的重映射 face spec（`set-base' 与
+`add-relative' 两种形态都兼容：前者是 plist，后者是列表尾部带 `default' 的 spec）。"
+  (let ((spec (cdr (assq 'default face-remapping-alist))))
+    (cond ((null spec) nil)
+          ((keywordp (car spec)) spec)
+          ((consp (car spec)) (car spec)))))
+
+(defun el-chronos-ui-test--squeeze (text)
+  "去掉 TEXT 的空白与换行：用于比较「折行后仍完整」的文本。"
+  (replace-regexp-in-string "[ \t\n\u3000]+" "" (or text "")))
+
+(ert-deftest el-chronos-ui-test-dashboard-render-no-truncation ()
+  "ETAF 实际渲染：60/80/120/160 列窗口下不截断（无 `…'）、不溢出、数据文本完整、背景跟随主题。
+
+判据分四层：
+  1. 渲染文本里**不出现** `…'（数据行与标签都不允许省略）；
+  2. 每行 `string-width' ≤ 窗口列数（折行发生在窗口内，不越界）；
+  3. 把渲染文本去掉空白后仍**包含完整的命令名 / 函数名**（折行不丢字符）；
+  4. 主题背景可用时，buffer 的 `default' face remap 背景等于主题背景。
+ETAF 不在 load-path（`make test' 默认如此）时跳过。"
+  (skip-unless (and (require 'ebox nil t)
+                    (el-chronos-dashboard-etaf-available-p)))
+  (el-chronos-ui-test--with-temp-db
+    (let ((db (el-chronos-store-open))
+          (long-command "el-chronos-very-long-command-name-01-suffix"))
+      (should db)
+      (let ((hour (* 3600000 (floor (/ (float-time) 3600))))
+            (now (truncate (* 1000 (float-time)))))
+        (sqlite-execute db "INSERT INTO sessions (started_at, emacs_version, host, startup_ms)\
+ VALUES (?, ?, ?, ?)" (list (- now 3600000) "31.1" "test-host" 1234))
+        (dotimes (index 6)
+          (sqlite-execute db "INSERT INTO commands (ts, session_id, name, duration_ms, gc_ms,\
+ mode, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                          (list (- now (* (1+ index) 60000))
+                                (caar (sqlite-select db "SELECT max(id) FROM sessions"))
+                                (format "%s-%02d" long-command index)
+                                (* 100 (1+ index)) 1 "emacs-lisp-mode" "ok"))
+          (sqlite-execute db "INSERT INTO hourly_functions (hour_ts, session_id, function, file,\
+ package, self_ms, total_ms, samples) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                          (list hour 1 (format "el-chronos--long-function-name-%02d" index)
+                                "/tmp/el-chronos-dashboard.el" "el-chronos"
+                                (* 10.0 (1+ index)) (* 20.0 (1+ index)) (1+ index)))))
+      (unwind-protect
+          (progn
+            (el-chronos-dashboard--render-etaf "7d")
+            (dolist (cells el-chronos-ui-test--widths)
+              (let* ((buffer (get-buffer el-chronos-dashboard--buffer-name))
+                     (pixels (* cells (frame-char-width)))
+                     (ebox-viewport-width pixels)
+                     (theme-bg (el-chronos-dashboard--theme-background)))
+                (ignore ebox-viewport-width)
+                (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
+                  (etaf-unmount runtime))
+                (etaf-mount buffer
+                            (eval `(etaf-view (el-chronos-dashboard-app
+                                               :range "7d" :page 0 :selected nil))
+                                  t))
+                (with-current-buffer buffer
+                  (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+                    ;; 1) 数据文本不截断
+                    (should-not (string-match-p "…" text))
+                    ;; 3) 折行不丢字符：完整命令名仍在
+                    (should (string-match-p (regexp-quote (el-chronos-ui-test--squeeze
+                                                           long-command))
+                                            (el-chronos-ui-test--squeeze text)))
+                    ;; 2) 每行不超窗口
+                    (dolist (line (split-string text "\n"))
+                      (should (<= (string-width line) cells)))
+                    ;; 4) 背景跟随主题（有主题时）
+                    (when theme-bg
+                      (should (equal theme-bg
+                                     (plist-get (el-chronos-ui-test--default-remap-spec)
+                                                :background))))))
+                ;; 不溢出：任何节点的右边界都在窗口内
+                (let ((overflow 0))
+                  (el-chronos-ui-test--walk-nodes
+                   (ebox-mount-root (ebox-buffer-mount buffer))
+                   (lambda (node)
+                     (let ((geometry (ignore-errors (ebox-node-geometry node))))
+                       (when (and geometry
+                                  (numberp (plist-get geometry :x))
+                                  (numberp (plist-get geometry :width))
+                                  (> (+ (plist-get geometry :x) (plist-get geometry :width))
+                                     pixels))
+                         (setq overflow (1+ overflow))))))
+                  (should (= 0 overflow))))))
+        (when (get-buffer el-chronos-dashboard--buffer-name)
+          (kill-buffer (get-buffer el-chronos-dashboard--buffer-name)))
+        (setq el-chronos-dashboard--state nil
+              el-chronos-dashboard--snapshot nil)))))
+
+(defun el-chronos-ui-test--walk-nodes (node function)
+  "对 NODE 及其子树逐个调用 FUNCTION（先父后子）。"
+  (funcall function node)
+  (dolist (child (ebox-node-children node))
+    (el-chronos-ui-test--walk-nodes child function)))
 
 (provide 'el-chronos-ui-test)
 

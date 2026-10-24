@@ -8,7 +8,7 @@
 
 ;;; Commentary:
 
-;; Emacs 内可视化页面（T8）：组件树 + SVG 图表 + 表格 + 下钻。数据全部来自
+;; Emacs 内可视化页面（T8）：组件树 + SVG 图表 + 数据卡片 + 下钻。数据全部来自
 ;; `el-chronos-analysis'（本模块不写 SQL、不写库、不改采集行为）；阻塞事件的完整栈复用
 ;; `el-chronos-report' 的 `*el-chronos-event*'。
 ;;
@@ -32,6 +32,15 @@
 ;; `etaf-view'（宏缺席会被编成普通函数调用，运行期即使 ETAF 在位也会失败）。代价是组件体
 ;; 不做编译期检查，故组件体只调用本文件已定义好的函数。
 ;;
+;; 配色与宽度（详见 docs/ui.org「主题与配色」「宽度策略与不截断」）：
+;; - 背景 / 文字跟随当前 Emacs 主题：根组件 `:setup' 用 `etaf-theme-provide' 提供从
+;;   `default' / `shadow' / `link' 等 face 派生的调色板（内置组件的语义 token 全部命中）；
+;;   根 column 再带 `:background-color' / `:color'，挂载后 `--apply-theme-canvas' 用
+;;   `face-remap-set-base' 把 buffer 的 `default' face 也 remap 成主题色。
+;; - 数据文本**不截断**：`etaf-table' 的单元格固定 `:overflow hidden' + `:wrap-mode none'，
+;;   整数列宽还会补 `…'，两条路都违反可见性要求，故数据行改用卡片（`el-chronos-dashboard-card'），
+;;   主键一行、其余字段一行，按窗口宽度折行。`--fit-text' 只用于标题与图表标签。
+;;
 ;; 图表纯函数（ERT 可直接断言，需 ETAF 在 load-path）：`--bar' `--scale' `--sparkline'
 ;; `--bar-chart' `--heatmap' `--range-symbol' `--range-string' `--range->days' `--page-slice'
 ;; `--to-text-bars'。
@@ -40,6 +49,8 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'color)
+(require 'face-remap)
 (require 'tabulated-list)
 (require 'el-chronos)
 (require 'el-chronos-analysis)
@@ -53,6 +64,7 @@
 (declare-function etaf-ui-svg-text "etaf-ui" (x y text &rest attributes))
 (declare-function etaf-unmount "etaf" (&optional runtime))
 (declare-function etaf-runtime-for-buffer "etaf" (buffer-or-name))
+(declare-function etaf-runtime-viewport "etaf" (&optional runtime))
 
 ;;; ETAF 软依赖探测（I9）
 
@@ -179,6 +191,201 @@ buffer，而页面是单例。")
     ('time (if (numberp value) (format-time-string "%m-%d %H:%M" (/ (float value) 1000.0)) "-"))
     (_ (let ((text (and value (format "%s" value))))
          (if (or (null text) (string-empty-p text)) "-" text)))))
+
+;;; 宽度策略（任何 ≥ 60 列的窗口都不溢出、数据文本不被截断）
+
+;;
+;; 目标有两个，且它们互相拉扯：
+;;   (a) 不溢出：任何节点都不越过窗口右边界；
+;;   (b) 不截断：命令名 / 函数名 / 包名 / 路径这类**数据文本**必须完整可见，
+;;       既不许用 `…' 省略，也不许被 `:overflow hidden' 裁掉。
+;;
+;; 为什么数据区不再用 `etaf-table'（读 `etaf-ui-table.el' 确认，实验复核见 docs/ui.org）：
+;;   - 整数列宽 N：ETAF 走「定宽文本」快路径（整行一个 padded Text Host），列严格对齐，
+;;     但超长单元格由 `etaf-ui--table-fit-text' 调 `truncate-string-to-width' 补 `…' → 违反 (b)。
+;;   - `(fr N)' 权重列宽：走 Grid 路径，`etaf-ui--table-cell' 仍是 `:overflow hidden
+;;     :wrap-mode none'，超长文本直接被裁掉（连 `…' 都没有）→ 同样违反 (b)；
+;;     且**每行各自算 track**（行容器 shrink-wrap），表头与数据行、数据行彼此都列不对齐
+;;     （实测三行 `(fr 4)/(fr 1)/(fr 1)'：表头首列 6 列、数据行首列 48 列，起始位置各不相同；
+;;     给单元格加 `:min-width (px 0)' 也压不住 min-content 差异）。
+;;   结论：**ETAF 表格无法同时满足 (a) 与 (b)**。故数据行改为**卡片布局**：每条记录一个
+;;   `column'，主键一行、其余字段一行，都用 `:wrap-mode word' 在窗口内自动折行 —— 文本完整、
+;;   不越过窗口。代价是失去表格式的列对齐（卡片布局本来也没有列）。见 docs/ui.org「不截断策略」。
+;;
+;; 仍然按窗口宽度算的东西：图表宽度、tile 单元格宽度、下钻弹窗宽度、文本图逐行宽度。
+;; 它们的宽度预算与 ETAF 盒模型逐项对应（见 docs/ui.org「宽度策略」）：
+;;   窗口列数
+;;   − 面板左右占位 6（`etaf-panel' 内边距 `(ch 2)' × 2 边 + 1px 边框两侧按 2 列算）
+;;   − 余量 1（像素取整）
+;; = 内容可用列数
+
+(defconst el-chronos-dashboard--panel-padding-cells 6
+  "面板左右占位合计（字符）：内边距 `(ch 2)' × 2 边 = 4，再按 2 列算 1px 边框（两侧各 1px）。
+实测 chart-block 的 x 坐标 = 3、宽度 = 窗口宽度 − 6，与 6 列占位一致。")
+
+(defconst el-chronos-dashboard--width-safety-cells 1
+  "像素取整的余量（列）：宁可少 1 列，也不要因取整溢出。")
+
+(defconst el-chronos-dashboard--fallback-width 80
+  "拿不到 viewport 时的兜底列数：`emacs -Q --batch' 的 frame 宽度就是 80。")
+
+(defun el-chronos-dashboard--viewport-cells ()
+  "返回页面可用字符列数（窗口 body 宽度）。
+
+优先读 ETAF viewport：组件**渲染期**读取它即建立响应式依赖，窗口缩放后 ETAF 会重渲染
+（`ebox-viewport-change-functions'）——这是列宽 / 图宽自适应的唯一可靠输入；
+`(window-body-width)' 在首渲染时可能还是旧窗口，且不参与响应式。
+viewport 宽度的单位是像素（图形 frame）/ 字符单元（文本终端），故按 `frame-char-width' 折算成列。
+未挂载（纯函数测试、首次挂载前）时回退 `(window-body-width)'，再回退 `--fallback-width'。"
+  (let* ((char-width (max 1 (frame-char-width)))
+         (pixels (car-safe (ignore-errors (etaf-runtime-viewport)))))
+    (cond
+     ((and (numberp pixels) (> pixels 0)) (max 20 (floor pixels char-width)))
+     ((and (fboundp 'window-body-width) (window-body-width))
+      (max 20 (window-body-width)))
+     (t el-chronos-dashboard--fallback-width))))
+
+(defun el-chronos-dashboard--content-cells (&optional avail)
+  "AVAIL（默认 `--viewport-cells'）扣掉面板内边距与边框余量后的内容列数。"
+  (max 24 (- (or avail (el-chronos-dashboard--viewport-cells))
+             el-chronos-dashboard--panel-padding-cells
+             el-chronos-dashboard--width-safety-cells)))
+
+(defun el-chronos-dashboard--fit-text (text width)
+  "把单行 TEXT 截到 WIDTH 列以内（超出部分用 `…'）。"
+  (let ((text (format "%s" (or text ""))))
+    (if (<= (string-width text) (max 1 width)) text
+      (truncate-string-to-width text (max 1 width) 0 nil "…"))))
+
+(defun el-chronos-dashboard--fit-text-block (text width)
+  "把多行 TEXT 逐行截到 WIDTH 列以内（超出部分用 `…'），返回同样行数的字符串。
+
+文本图一行由 `%-6s 条形 峰值 N' 拼成，窄窗口下总宽超过内容宽度就会被 ETAF 折行——
+一张图被拆成两行（`布局错乱' 的又一来源）。逐行截断保证每行仍是一行，图整体不被拆散。"
+  (mapconcat (lambda (line) (el-chronos-dashboard--fit-text line width))
+             (split-string (format "%s" (or text "")) "\n")
+             "\n"))
+
+(defun el-chronos-dashboard--widest-line (text)
+  "返回多行 TEXT 中最宽一行的显示宽度（列）。"
+  (cl-loop for line in (split-string (format "%s" (or text "")) "\n")
+           maximize (string-width line)))
+
+(defun el-chronos-dashboard--fit-text-chart (kind rows limit)
+  "在 LIMIT 列内渲染 KIND 文本图，返回逐行都不超 LIMIT 的字符串。
+
+文本图一行的宽度不仅取决于 `width'，还取决于条形字符的实际显示宽度（`█'/`░' 在等宽字体里
+通常占 1 列，在 `char-width' 表里可能是 2 列）。故先按当前图表宽度画，宽了就缩窄图表宽度重画
+（最多 4 轮），仍超宽才逐行截断——这样「峰值 N」这类尾部信息尽量保住，而不是一刀切掉。"
+  (let* ((width (el-chronos-dashboard--chart-width))
+         (text (el-chronos-dashboard--to-text-bars (list :kind kind :rows rows) width))
+         (round 0))
+    (while (and (< round 4)
+                (> (el-chronos-dashboard--widest-line text) limit))
+      (setq width (max 20 (- width (max 2 (ceiling (/ (- (el-chronos-dashboard--widest-line text)
+                                                         limit)
+                                                      2.0)))))
+            text (el-chronos-dashboard--to-text-bars (list :kind kind :rows rows) width)
+            round (1+ round)))
+    (el-chronos-dashboard--fit-text-block text limit)))
+
+;;; 主题配色（背景 / 文字跟随当前 Emacs 主题）
+
+;;
+;; 为什么经由 ETAF 的 Theme 机制，而不是给每个节点写死颜色（读 `etaf-context.el' /
+;; `etaf-ui-style.el' / `ebox-buffer.el' 确认）：
+;;   - `etaf-ui' 的每个内置组件都从「继承的 Theme」里取语义色 token（`:ui-panel-bg' /
+;;     `:ui-fg' / `:ui-table-border' …），取不到才回落到包内**固定浅色**调色板（`#FFFDF8'
+;;     等）——所以页面默认永远是浅色，与用户主题无关；
+;;   - 「让整页跟随主题」= 在组件树根部 provide 一份主题调色板（`etaf-theme-provide'，
+;;     与 `etaf-provide' 同一提供机制，可在组件 `:setup' 里调用），子树内所有组件的
+;;     token 解析自动生效（实测：面板及其**全部后代**节点的 `ebox-cs-bg' 都变成提供的颜色）；
+;;   - `etaf-mount' 只有 `:viewport-width' / `:viewport-height' / `:observer' 三个选项，
+;;     **不接受** `:background' / `:foreground'（`etaf-app-open' 接受，但它自带
+;;     buffer / 窗口 / 模式行一整套语义，与本页面的挂载方式不兼容），所以背景走两条腿：
+;;       ① Theme 调色板 → 页面内部（面板、表格、按钮、文字）跟随主题；
+;;       ② 根节点 `:background-color' / `:color' → ebox 的 `ebox--sync-canvas' 把 buffer
+;;          的 `default' face 背景 remap 成同一颜色，面板之外的行尾空白不再露出宿主底色。
+;; 颜色取不到（`emacs -Q --batch' 没有主题）时一律返回 nil / 空 plist：绝不把
+;; `unspecified-bg' 当颜色传下去（实测那样面板会拿到一个非法颜色）。
+
+(defconst el-chronos-dashboard--theme-shade-amount 4
+  "面板表面相对页面背景的明暗偏移（百分数）：同一颜色太糊，偏移 4 足以分层又不刺眼。")
+
+(defun el-chronos-dashboard--face-color (attribute face)
+  "返回 FACE 的 ATTRIBUTE（`:background' / `:foreground'）颜色串，取不到返回 nil。
+INHERIT 传 t，主题通过 face 继承设置的颜色同样可取到；未定义或未指定时 Emacs 返回
+`unspecified-bg' / `unspecified-fg' 这类字符串，一律按 nil 处理（否则会被当颜色使用）。"
+  (when (facep face)
+    (let ((value (ignore-errors (face-attribute face attribute nil t))))
+      (and (stringp value)
+           (not (string-prefix-p "unspecified" value))
+           (not (string-empty-p value))
+           value))))
+
+(defun el-chronos-dashboard--theme-surface (color)
+  "把页面色 COLOR 往对比方向推 `--theme-shade-amount'，作为面板表面色；失败时原样返回。"
+  (or (ignore-errors
+        (if (eq (frame-parameter nil 'background-mode) 'dark)
+            (color-lighten-name color el-chronos-dashboard--theme-shade-amount)
+          (color-darken-name color el-chronos-dashboard--theme-shade-amount)))
+      color))
+
+(defun el-chronos-dashboard--theme-palette ()
+  "从当前 Emacs 主题派生 ETAF 调色板（keyword plist）；主题不可用时返回 nil。
+只收录**确实解析出颜色串**的键：缺失键由 ETAF 回落到包内默认调色板，而给一个 nil 值
+会让组件把 nil 当颜色用（渲染期报非法颜色）。"
+  (let* ((bg (el-chronos-dashboard--face-color :background 'default))
+         (fg (el-chronos-dashboard--face-color :foreground 'default))
+         (muted (or (el-chronos-dashboard--face-color :foreground 'shadow) fg))
+         (border (or (el-chronos-dashboard--face-color :foreground 'shadow)
+                     (el-chronos-dashboard--face-color :background 'mode-line)
+                     fg))
+         (accent (or (el-chronos-dashboard--face-color :foreground 'link) fg))
+         (accent-bg (or (el-chronos-dashboard--face-color :background 'highlight) accent))
+         (surface (and bg (el-chronos-dashboard--theme-surface bg)))
+         (pairs (list :ui-bg bg :ui-fg fg
+                      :ui-panel-bg surface :ui-panel-fg fg
+                      :ui-panel-border border :ui-border border
+                      :ui-table-border border :ui-muted-fg muted
+                      :ui-accent accent :ui-accent-fg bg
+                      :ui-button-primary-bg accent-bg :ui-button-primary-fg bg
+                      :ui-button-secondary-bg surface :ui-button-secondary-fg accent
+                      :ui-button-ghost-fg fg
+                      :ui-success-fg (el-chronos-dashboard--face-color :foreground 'success)
+                      :ui-warning-fg (el-chronos-dashboard--face-color :foreground 'warning)
+                      :ui-danger-fg (el-chronos-dashboard--face-color :foreground 'error)
+                      :ui-info-fg accent)))
+    (when (and bg fg)
+      (cl-loop for (key value) on pairs by #'cddr
+               when (and (keywordp key) (stringp value))
+               append (list key value)))))
+
+(defun el-chronos-dashboard--theme-background ()
+  "页面底色（字符串）或 nil：根节点 `:background-color' 用，nil 时不写该属性。"
+  (el-chronos-dashboard--face-color :background 'default))
+
+(defun el-chronos-dashboard--theme-foreground ()
+  "页面文字色（字符串）或 nil：根节点 `:color' 用，nil 时不写该属性。"
+  (el-chronos-dashboard--face-color :foreground 'default))
+
+(defun el-chronos-dashboard--apply-theme-canvas (buffer)
+  "把 BUFFER 的 `default' face 重映射成当前主题的背景 / 前景色，返回 BUFFER。
+
+这是 etaf 的 `etaf-app--paint-canvas' 用的同一机制（`face-remap-set-base'）：
+`etaf-mount' 不接受 `:background' / `:foreground'，而 ebox 的 `ebox--sync-canvas' 只在
+**显示时**（有 window）才把根节点背景 remap 到 `default' face —— batch / 首次挂载前读不到。
+这里在挂载后显式设置一次：面板之外的行尾空白、`text' 节点未覆盖的列都跟随主题背景，
+文字默认色也跟随主题前景。用 `set-base' 而非 `add-relative'：重复渲染幂等，不会叠加。
+主题颜色取不到（batch 无主题）时复位，保持宿主默认。"
+  (with-current-buffer buffer
+    (let ((bg (el-chronos-dashboard--theme-background))
+          (fg (el-chronos-dashboard--theme-foreground)))
+      (if (or bg fg)
+          (face-remap-set-base 'default (append (and bg (list :background bg))
+                                                (and fg (list :foreground fg))))
+        (face-remap-reset-base 'default))))
+  buffer)
 
 ;;; 纯函数：分页与图元
 
@@ -351,17 +558,23 @@ Y 用 SVG 习惯（0 在顶、HEIGHT 在底）；MAX 非正时全部落底。"
     (aref chars (min (1- (length chars)) (round (* ratio (1- (length chars))))))))
 
 (defun el-chronos-dashboard--text-chart (kind rows width)
-  "把图表 KIND 的行 ROWS 渲染成文本字符图（每行一条）。"
-  (let ((rows (cl-remove-if-not #'consp rows))
-        (bar-width (max 4 (- width 26)))
-        (fmt (lambda (k v) (el-chronos-dashboard--fmt k v))))
+  "把图表 KIND 的行 ROWS 渲染成文本字符图（每行一条）。
+
+标签列按固定宽度截断（`%-16s' / `%-6s' / `%-18s' 只是补齐，长标签不截断会把同一张图
+各行推成不同起点），故先 `--fit-text' 再补齐：图内各行的条形 / 时间桶因此始终对齐。"
+  (let* ((rows (cl-remove-if-not #'consp rows))
+         (bar-width (max 4 (- width 26)))
+         (fmt (lambda (k v) (el-chronos-dashboard--fmt k v)))
+         (label (lambda (row size)
+                  (el-chronos-dashboard--fit-text
+                   (funcall fmt 'str (plist-get row :label)) size))))
     (if (null rows) el-chronos-dashboard--empty
       (pcase kind
         ('bars (let ((peak (cl-loop for row in rows maximize
                                     (float (or (plist-get row :value) 0)))))
                  (mapconcat (lambda (row)
                               (format "%-16s %s %s"
-                                      (funcall fmt 'str (plist-get row :label))
+                                      (funcall label row 16)
                                       (el-chronos-dashboard--bar (plist-get row :value)
                                                                  peak bar-width)
                                       (funcall fmt 'pct (plist-get row :pct))))
@@ -370,7 +583,7 @@ Y 用 SVG 习惯（0 在顶、HEIGHT 在底）；MAX 非正时全部落底。"
                              (let ((peak (cl-loop for v in (plist-get row :values)
                                                   maximize (or v 0))))
                                (format "%-6s %s 峰值 %s"
-                                       (funcall fmt 'str (plist-get row :label))
+                                       (funcall label row 6)
                                        (el-chronos-dashboard--bar peak peak bar-width)
                                        (funcall fmt 'num peak))))
                            rows "\n"))
@@ -380,7 +593,7 @@ Y 用 SVG 习惯（0 在顶、HEIGHT 在底）；MAX 非正时全部落底。"
              (mapconcat (lambda (row)
                           (let ((values (append (plist-get row :values) nil)))
                             (format "%-18s %s"
-                                    (funcall fmt 'str (plist-get row :label))
+                                    (funcall label row 18)
                                     (mapconcat (lambda (value)
                                                  (el-chronos-dashboard--heat-char
                                                   value peak))
@@ -504,9 +717,11 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
 
 (defun el-chronos-dashboard--metric-text (row column)
   "tile-grid 的 `cell-text' / `cell-label' 回调：第 ROW 行第 COLUMN 列指标的单行文本。
-必须单行且不超过 `:cell-width'（ETAF 会校验），故用「名称 值」短格式。"
+必须单行且不超过 `:cell-width'（ETAF 会校验，超出直接报错），故用「名称 值」短格式并按
+`--tile-cell-width' 截断——窄窗口下 cell-width 会变小，不截断就会抛 ETAF 校验错误。"
   (when-let* ((pair (nth (+ (* row 3) column) (el-chronos-dashboard--metric-pairs))))
-    (format "%s %s" (car pair) (cdr pair))))
+    (el-chronos-dashboard--fit-text (format "%s %s" (car pair) (cdr pair))
+                                    (el-chronos-dashboard--tile-cell-width))))
 
 (defun el-chronos-dashboard--metric-image (row column)
   "tile-grid 的 `cell-image' 回调：图形 frame 下的 SVG 指标卡片。
@@ -563,6 +778,51 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
                           'str)
                   (plist-get row key))))))
 
+;;; 卡片（数据行的呈现单位）
+
+(defconst el-chronos-dashboard--card-primary
+  '((:slow . :name) (:functions . :function) (:blockers . :command)
+    (:regressions . :function) (:sessions . :started-at))
+  "卡片首行（`:head'）显示的数据键：一律取**全文本**，不截断。
+选「最需要看全的那个字段」：命令名 / 函数名 / 阻塞事件的命令；会话没有名字，用启动时间。")
+
+(defun el-chronos-dashboard--card (kind row)
+  "把 KIND 的第 ROW 行渲染成卡片描述：`:head' `:detail' `:key' `:source' `:kind'。
+`:head' 是主键全文本，`:detail' 是其余字段的 `标签 值' 串联（全文本）。两者**都不经过**
+`--fit-text'：数据文本一旦补 `…' 就再也读不到完整信息，可见性优先于整齐。"
+  (let* ((columns (alist-get kind el-chronos-dashboard--columns))
+         (cells (el-chronos-dashboard--row kind row))
+         (value (lambda (key) (format "%s" (or (cdr (assq key cells)) "-"))))
+         (head-key (or (alist-get kind el-chronos-dashboard--card-primary)
+                       (nth 0 (nth 0 columns)))))
+    (list :head (funcall value head-key)
+          :detail (mapconcat (lambda (column)
+                               (format "%s %s" (nth 1 column) (funcall value (nth 0 column))))
+                             (cl-remove head-key columns :key #'car :test #'eq)
+                             " · ")
+          :key (cdr (assq :key cells))
+          :source (cdr (assq :source cells))
+          :kind kind)))
+
+(defun el-chronos-dashboard--chart-width (&optional avail)
+  "图表宽度（字符列）：声明的 `el-chronos-dashboard-chart-width' 与可用宽度取小。
+
+图形 frame 下图是 `:columns' 个字符宽的 SVG image，文本终端下是等宽字符图，两者都占
+`width' 列；上限取内容宽度减 2（图内左右留白），下限 20——再窄的窗口继续缩也读不出趋势，
+剩下的交给 `--fit-text-block' 逐行截断。"
+  (let* ((avail (or avail (el-chronos-dashboard--content-cells)))
+         (cap (max 20 (- avail 2))))
+    (min (max 20 (or el-chronos-dashboard-chart-width 72)) cap)))
+
+(defun el-chronos-dashboard--tile-cell-width ()
+  "概览 3 列 tile 的单元格宽度（字符）：不超过 24，且 3 列合计不超内容宽度。
+`:cell-width' 由 ETAF 校验（正整数），单元格文本也必须 ≤ 它，故两边用同一函数取宽。"
+  (max 8 (min 24 (floor (el-chronos-dashboard--content-cells) 3))))
+
+(defun el-chronos-dashboard--dialog-width ()
+  "下钻弹窗宽度（字符）：不超过 64，且不超内容宽度。"
+  (max 24 (min 64 (el-chronos-dashboard--content-cells))))
+
 (defun el-chronos-dashboard--row (kind row)
   "把分析层的 ROW 转成 KIND 表格行：alist（列 KEY → 展示串）+ `:key' + `:source'。"
   (cons (cons :source row)
@@ -614,22 +874,24 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
           (t title))))
 
 (defun el-chronos-dashboard--tables (page)
-  "按 PAGE 生成 5 个表格的渲染描述：标题（分页表带页码）、列、行、行点击回调。
-每个表交给 ETAF 的行数都不超过 `el-chronos-dashboard-page-size'（见 `--render-rows'）。"
+  "按 PAGE 生成 5 个区块的渲染描述：标题（分页表带页码）、列定义、行、`--row' 行描述、卡片。
+每个区块交给 ETAF 的行数都不超过 `el-chronos-dashboard-page-size'（见 `--render-rows'）。
+`:cards' 是实际渲染单位（见 `--card'）：数据文本不截断，故不再用 `etaf-table'，也不再
+按窗口宽度压缩列宽（表格的定宽 `…' 截断与 `:overflow hidden' 都与「不截断」冲突）。"
   (let ((size el-chronos-dashboard-page-size))
     (mapcar (lambda (section)
               (let* ((kind (nth 0 section))
                      (all (or (el-chronos-dashboard--snapshot-get kind) nil))
-                     (paged (nth 2 section)))
+                     (paged (nth 2 section))
+                     (rows (el-chronos-dashboard--render-rows all paged page size)))
                 (list :title (el-chronos-dashboard--table-title
                               (nth 1 section) all paged page size)
                       :columns (mapcar (lambda (column)
                                          (list :key (nth 0 column) :label (nth 1 column)
                                                :width (nth 2 column)))
                                        (alist-get kind el-chronos-dashboard--columns))
-                      :rows (mapcar (lambda (row) (el-chronos-dashboard--row kind row))
-                                    (el-chronos-dashboard--render-rows
-                                     all paged page size))
+                      :rows (mapcar (lambda (row) (el-chronos-dashboard--row kind row)) rows)
+                      :cards (mapcar (lambda (row) (el-chronos-dashboard--card kind row)) rows)
                       :on-press (lambda (row) (el-chronos-dashboard--drill kind row)))))
             el-chronos-dashboard--sections)))
 
@@ -743,12 +1005,30 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
 ;;; ETAF 组件（延迟定义，见 Commentary）
 
 (defconst el-chronos-dashboard--component-forms
-  '(;; 图表组件：图形 frame → SVG image；terminal → 文本字符图（I11）
+  '(;; 数据卡片：主键一行 + 其余字段一行，均按窗口宽度自动折行（数据文本不截断）
+    (etaf-define-component el-chronos-dashboard-card (&key head detail press)
+      "把一条数据记录渲染成卡片：HEAD 加粗、DETAIL 次要色，两者都 `wrap-mode word' 折行。
+不用 `etaf-table' 承载数据行：表格单元格固定为 `:overflow hidden' + `:wrap-mode none'，
+整数列宽还会被 `truncate-string-to-width' 补 `…'，数据文本必然显示不全（依据与实测见
+`docs/ui.org'「不截断策略」）。"
+      :view
+      (column :class "el-chronos-card"
+              :width 'stretch :item-gap '(lh 0) :wrap-mode 'word
+              :on-press press
+              :padding '((lh 0) (ch 1))
+              :border-bottom-width '(px 1) :border-bottom-style 'solid
+              :border-bottom-color (etaf-theme-value :ui-table-border "#687386")
+        (box :width 'stretch :wrap-mode 'word :font-weight 'bold
+             (text (expr head)))
+        (box :width 'stretch :wrap-mode 'word
+             :color (etaf-theme-value :ui-muted-fg "#526174")
+             (text (expr detail)))))
+    ;; 图表组件：图形 frame → SVG image；terminal → 文本字符图（I11）
     (etaf-define-component el-chronos-dashboard-chart (&key kind rows width height)
       "把一个图表 KIND 渲染成 SVG image（图形 frame）或文本字符图（terminal frame）。"
       :render
       (let* ((graphic (el-chronos-dashboard--graphic-p))
-             (width (or width el-chronos-dashboard-chart-width))
+             (width (or width (el-chronos-dashboard--chart-width)))
              (height (or height el-chronos-dashboard--chart-height)))
         (if graphic
             (etaf-view
@@ -761,16 +1041,24 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
                           (* width 8) (* height 18) (list 0 0 width height))
                     :columns width :rows height))
           (etaf-view
-           ;; text Host 里的非字面量必须写成 `(expr FORM)'，否则 ETAF 报 DSL 语法错
-           (text (expr (el-chronos-dashboard--to-text-bars
-                        (list :kind kind :rows rows) width)))))))
+           ;; text Host 里的非字面量必须写成 `(expr FORM)'，否则 ETAF 报 DSL 语法错；
+           ;; 文本图超宽会被 ETAF 折行（一张图拆成两行），故按内容宽度重算条形宽度再截断
+           (text (expr (el-chronos-dashboard--fit-text-chart
+                        kind rows (el-chronos-dashboard--content-cells))))))))
     ;; 根组件：:bindings 持有 range / page / selected 三项 UI 状态
     (etaf-define-component el-chronos-dashboard-app (&key (range "7d") (page 0) (selected nil))
-      "el-chronos 页面根组件：顶栏 + 概览 + 图表 + 5 张表 + 下钻弹窗。"
+      "el-chronos 页面根组件：顶栏 + 概览 + 图表 + 5 组数据卡片 + 下钻弹窗。"
+      :setup (let ((palette (el-chronos-dashboard--theme-palette)))
+               (when palette (etaf-theme-provide palette)))
       :bindings ((range-state (etaf-ref range)) (page-state (etaf-ref page))
                  (selected-state (etaf-ref selected)))
       :view
-      (column :class "el-chronos-dashboard" :item-gap '(lh 1)
+      (column :class "el-chronos-dashboard" :width 'stretch :item-gap '(lh 1)
+              ;; 主题色取自 `default' face：`:background-color' 由 ebox 的
+              ;; `ebox--sync-canvas' 同步到 buffer 的 `default' face 背景（面板之外的行尾
+              ;; 空白不再露出宿主底色），`:color' 沿子树继承给所有文字。
+              :background-color (el-chronos-dashboard--theme-background)
+              :color (el-chronos-dashboard--theme-foreground)
         (etaf-panel :title "el-chronos · 性能与用法观测器"
           (row :class "el-chronos-toolbar"
             (etaf-button :label "1 天" :variant 'primary
@@ -785,7 +1073,10 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
                          :on-press #'el-chronos-dashboard-next-page))
           (etaf-label :text (el-chronos-dashboard--status-line) :variant 'muted))
         (etaf-panel :title "概览（6 指标）"
-          (etaf-tile-grid :rows 2 :columns 3 :cell-width 24 :cell-height 3
+          (etaf-tile-grid :rows 2 :columns 3
+                          ;; cell-width 必须随窗口收窄：3 × 24 = 72 列在 60 列窗口里会溢出并折行
+                          :cell-width (el-chronos-dashboard--tile-cell-width)
+                          :cell-height 3
                           :cell-text #'el-chronos-dashboard--metric-text
                           :cell-label #'el-chronos-dashboard--metric-text
                           :cell-image #'el-chronos-dashboard--metric-image))
@@ -798,24 +1089,31 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
                       (el-chronos-dashboard-chart
                        :kind (plist-get spec :kind)
                        :rows (el-chronos-dashboard--chart-rows (plist-get spec :kind))
-                       :width el-chronos-dashboard-chart-width
+                       :width (el-chronos-dashboard--chart-width)
                        :height el-chronos-dashboard--chart-height))))
                  (el-chronos-dashboard--chart-specs))))
         (expr (mapcar
                (lambda (spec)
                  (etaf-view
                   (etaf-panel :title (plist-get spec :title)
-                    (etaf-table :columns (plist-get spec :columns)
-                                :rows (plist-get spec :rows)
-                                :row-key (lambda (row) (alist-get :key row))
-                                :on-row-press (plist-get spec :on-press))
-                    (expr (unless (plist-get spec :rows)
+                    (expr (mapcar
+                           (lambda (card)
+                             (etaf-view
+                              (el-chronos-dashboard-card
+                               :head (plist-get card :head)
+                               :detail (plist-get card :detail)
+                               :press (lambda ()
+                                        (el-chronos-dashboard--drill
+                                         (plist-get card :kind)
+                                         (plist-get card :source))))))
+                           (plist-get spec :cards)))
+                    (expr (unless (plist-get spec :cards)
                             (etaf-view (etaf-label :text "（无数据）"
                                                    :variant 'muted)))))))
                (el-chronos-dashboard--tables (etaf-value page-state))))
         (etaf-dialog :open (etaf-value selected-state)
                      :title (or (plist-get (etaf-value selected-state) :title) "详情")
-                     :width '(ch 64)
+                     :width (list 'ch (el-chronos-dashboard--dialog-width))
                      :on-close #'el-chronos-dashboard--clear-selection
           (text (expr (or (plist-get (etaf-value selected-state) :body) "")))
           (etaf-label :text (or (plist-get (etaf-value selected-state) :tips) "")
@@ -876,6 +1174,7 @@ RANGE 接受字符串（\"1d\"）或符号（`1d'），**进查询前一律归�
                                    ;; ETAF 会把列表当代码求值（`void-function :title'）
                                    :selected (quote ,(plist-get state :selected))))
                       t))
+    (el-chronos-dashboard--apply-theme-canvas buffer)
     (el-chronos-dashboard--install-keys buffer)
     buffer))
 
