@@ -7,6 +7,8 @@
 ;; 只在 `el-chronos-usage-granularity' 为 `file' 时出现（默认不记，守 I7）。
 ;;
 ;; 归因链：符号 --symbol-file--> 源码文件路径 --路径前缀--> 包名。
+;; 例外：C 原语 / 内置特殊形式 / profiler 伪符号（nil 无源码路径）先经
+;; `el-chronos-attrib--builtin-primitive-p' 判为 built-in，不走路径归因。
 ;; 归因失败一律降级为 "unknown"，绝不向宿主抛错（不变量 I6）；
 ;; 上下文只取项目 basename，绝不落绝对路径（不变量 I7）。
 ;;
@@ -188,6 +190,39 @@ eln-cache 的目录名是 `<版本>-<编译哈希>'、文件名是 `<库名>-<�
    ((string-suffix-p ".eln" path) (el-chronos-attrib--classify-eln path))
    (t (el-chronos-attrib--classify-source path))))
 
+(defun el-chronos-attrib--builtin-primitive-p (symbol)
+  "SYMBOL 是 Emacs 内核实现的 C 原语 / 内置特殊形式 / profiler 伪符号时返回 \"built-in\"，否则 nil。
+`symbol-file' 对 C 原语与特殊形式**恒返回 nil**（Emacs 31.1 实测），故它们无法走
+「符号 → 源码路径 → 包名」的常规归因链，会被误判成 `unknown'（实测占全部样本 37.1%）。
+判据（按顺序，全部 `ignore-errors' 包裹，失败即视为不命中）：
+
+1. **非 fboundp 的 profiler 伪符号**：`redisplay_internal (C function)' 与
+   `Automatic GC' 是 C profiler 自己 mint 的符号（`strings /usr/bin/emacs' 可查到字面串），
+   既不是 fboundp 也没有源码路径。`(not (fboundp SYMBOL))' 是**必需前提**——否则任何
+   名字恰好以 \" (C function)\" 结尾的真实函数会被误判（后缀带前导空格，避免误伤）。
+2. **C 原语 / 特殊形式**：`fboundp' 且 `(subrp (indirect-function SYMBOL))'。
+   排除动态模块函数（`module-function-p' 为 t）：模块来自第三方，归 built-in 会掩盖其来源；
+   `module-function-p' 在 Emacs 29 以下不存在，故用 `fboundp' 守卫，守卫失败时按「非模块」处理
+   （那些版本还没有模块函数这一说）。
+
+注意：`format' 这类能查到 `format.elc' 的也在 `subrp' 之列，归 built-in 与既有
+`--classify-source' 的判定一致，不产生冲突。"
+  (ignore-errors
+    (and (symbolp symbol)
+         (or
+          ;; 1) profiler 伪符号（非 fboundp）
+          (and (not (fboundp symbol))
+               (let ((name (symbol-name symbol)))
+                 (or (string-suffix-p " (C function)" name)
+                     (string= name "Automatic GC"))))
+          ;; 2) C 原语 / 内置特殊形式（排除动态模块）
+          (and (fboundp symbol)
+               (let ((function (indirect-function symbol)))
+                 (and (subrp function)
+                      (not (and (fboundp 'module-function-p)
+                                (module-function-p function)))))))
+         "built-in")))
+
 (defun el-chronos-attrib-file (symbol)
   "返回 SYMBOL 的定义源码文件路径；取不到时返回 nil。
 先按函数定义查 `symbol-file'，失败再查任意定义；两步都失败即 nil。
@@ -217,6 +252,7 @@ eln-cache 的目录名是 `<版本>-<编译哈希>'、文件名是 `<库名>-<�
   "把符号或源码路径归因到包/模块名；任何失败都返回 \"unknown\"。
 参数为符号时先经 `el-chronos-attrib-file' 取源码路径再分类；
 参数为字符串时直接按路径分类。
+符号分支先判 C 原语 / profiler 伪符号（→ \"built-in\"），再走源码路径归因。
 本函数不会向调用方抛错（不变量 I6：采集中归因失败静默降级）。"
   (condition-case nil
       (cond
@@ -224,8 +260,9 @@ eln-cache 的目录名是 `<版本>-<编译哈希>'、文件名是 `<库名>-<�
        ((stringp symbol-or-path)
         (el-chronos-attrib--classify-path symbol-or-path))
        ((symbolp symbol-or-path)
-        (el-chronos-attrib--classify-path
-         (el-chronos-attrib-file symbol-or-path)))
+        (or (el-chronos-attrib--builtin-primitive-p symbol-or-path)
+            (el-chronos-attrib--classify-path
+             (el-chronos-attrib-file symbol-or-path))))
        (t "unknown"))
     (error "unknown")))
 

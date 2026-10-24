@@ -86,18 +86,95 @@
   (should (equal "unknown" (el-chronos-attrib-package nil))))
 
 (ert-deftest el-chronos-attrib-test-cache-hit ()
-  "同一符号第二次归因命中缓存，不再调用 `symbol-file'。"
+  "同一符号第二次归因命中缓存，不再调用 `symbol-file'。
+被测符号必须选**非 C 原语**的 lisp 函数：`el-chronos-attrib--builtin-primitive-p'
+对 subr 与特殊形式在查文件之前短路（见 `-builtin-primitive-skips-symbol-file'），
+用 `save-buffer' 之类的原语测不到缓存，只会测到短路。
+`el-chronos-attrib-file' 自身在本仓库源码里定义，归因结果为 \"unknown\"（路径
+`…/el-chronos/el-chronos-attrib.el' 无 straight / init- / site-lisp / 系统前缀），
+故断言写实际值 —— 本用例要验的是「查一次文件、第二次走缓存」，不是分类结果。"
   (el-chronos-attrib-clear-cache)
+  (should-not (subrp (indirect-function 'el-chronos-attrib-file)))
   (let ((calls 0)
         (original (symbol-function 'symbol-file)))
     (cl-letf (((symbol-function 'symbol-file)
                (lambda (&rest args)
                  (setq calls (1+ calls))
                  (apply original args))))
-      (should (equal "built-in" (el-chronos-attrib-package 'save-buffer)))
-      (should (equal "built-in" (el-chronos-attrib-package 'save-buffer)))
+      (should (equal "unknown" (el-chronos-attrib-package 'el-chronos-attrib-file)))
+      (should (equal "unknown" (el-chronos-attrib-package 'el-chronos-attrib-file)))
       (should (= 1 calls)))
+    ;; 缓存里只有该符号一条，且可被统一清理
     (should (= 1 (el-chronos-attrib-clear-cache)))))
+
+;;; C 原语 / profiler 伪符号短路（T2）
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-skips-symbol-file ()
+  "C 原语走短路分支，完全不查 `symbol-file'（T2 的核心收益：不做无谓 IO）。
+`symbol-file' 对原语恒返回 nil，查了也只会落到 \"unknown\"。"
+  (el-chronos-attrib-clear-cache)
+  (let ((calls 0))
+    (cl-letf (((symbol-function 'symbol-file)
+               (lambda (&rest _) (setq calls (1+ calls)) nil)))
+      (should (equal "built-in" (el-chronos-attrib-package 'kill-buffer)))
+      (should (equal "built-in" (el-chronos-attrib-package 'save-buffer)))
+      (should (= 0 calls)))
+    ;; 短路分支不写缓存（既没查文件，也就没有「无文件」结论要缓存）
+    (should (= 0 (el-chronos-attrib-clear-cache)))))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-subr ()
+  "C 原语与内置特殊形式（含 `let' / `if' 这类特殊形式）一律归 \"built-in\"。"
+  (el-chronos-attrib-clear-cache)
+  (dolist (symbol '(kill-buffer overlay-get car format concat let if))
+    (should (equal "built-in" (el-chronos-attrib-package symbol)))
+    (should (equal "built-in" (el-chronos-attrib--builtin-primitive-p symbol)))))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-profiler-symbols ()
+  "C profiler 自造的伪符号（既非 fboundp 也无源码路径）归 \"built-in\"。
+它们实际出现在采样栈里（实测占全部样本 37.1% 的一部分），不认会全落 \"unknown\"。"
+  (el-chronos-attrib-clear-cache)
+  (dolist (name '("redisplay_internal (C function)" "Automatic GC"))
+    (let ((symbol (intern name)))
+      (should-not (fboundp symbol))
+      (should (equal "built-in" (el-chronos-attrib--builtin-primitive-p symbol)))
+      (should (equal "built-in" (el-chronos-attrib-package symbol))))))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-not-guessing ()
+  "宁缺勿错：非 fboundp 但名字不带伪符号后缀、或带后缀却确实 fboundp 的符号都不判 built-in。"
+  (el-chronos-attrib-clear-cache)
+  ;; 1) 不存在的普通符号 → unknown
+  (should (equal "unknown" (el-chronos-attrib-package (intern "nonexistent-fn-xyz"))))
+  ;; 2) 名字以 " (C function)" 结尾但 fboundp 的符号：后缀判据必须被 fboundp 守卫挡住，
+  ;;    否则任何真实函数只要名字凑巧带这个后缀就会被误判成 built-in。
+  (let* ((fake (intern "el-chronos-test-fake-fn (C function)"))
+         (original (symbol-function 'fboundp)))
+    (should-not (fboundp fake))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (object) (or (eq object fake) (funcall original object)))))
+      (should (equal "unknown" (el-chronos-attrib-package fake))))
+    (should-not (fboundp fake))))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-module-excluded ()
+  "动态模块函数不判 built-in：第三方模块的来源不能被 built-in 掩盖。
+`module-function-p' 在 Emacs 29 以下不存在，故按 `skip-unless' 守卫。"
+  (skip-unless (fboundp 'module-function-p))
+  (el-chronos-attrib-clear-cache)
+  (cl-letf (((symbol-function 'module-function-p) (lambda (_function) t)))
+    (should-not (el-chronos-attrib--builtin-primitive-p 'car))
+    ;; 完整归因链上退化为 unknown（原语无源码路径可查）
+    (should (equal "unknown" (el-chronos-attrib-package 'car))))
+  ;; 清掉上面落的「car 无源码文件」缓存，避免污染其他用例
+  (el-chronos-attrib-clear-cache))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-format-unchanged ()
+  "回归保护：`format' 这类**既有 `format.elc' 又能查到源码**的原语归因结果不变（仍是 built-in）。"
+  (el-chronos-attrib-clear-cache)
+  (should (equal "built-in" (el-chronos-attrib--builtin-primitive-p 'format)))
+  (should (equal "built-in" (el-chronos-attrib-package 'format)))
+  ;; 短路判据与路径判据给出同一答案，不是二选一的巧合
+  (should (equal "built-in"
+                 (el-chronos-attrib--classify-path
+                  "/usr/share/emacs/31.1/lisp/format.elc"))))
 
 ;;; native-comp `.eln' 归因（TD-1）
 

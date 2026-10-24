@@ -48,6 +48,51 @@
     (should (equal [3 3 3] (gethash 'a el-chronos-collect--window-self)))
     (should (equal [0 3 0] (gethash 'b el-chronos-collect--window-self)))))
 
+;;; 窗口聚合：nil 帧口径（T1）
+;; `(symbolp nil)' 为 t → 旧写法会造出一个伪函数 nil（报表里显示成 "unknown"）、
+;; 并把 profiler 的尾部填充算进 total；全 nil 栈还会写进 `hourly_stacks'。
+
+(ert-deftest el-chronos-collect-test-nil-leaf-not-counted ()
+  "全 nil 栈既不出 self 条目，也不写栈表（否则报表多出一个伪热点 \"unknown\"）。"
+  (let ((el-chronos-collect--window-self (make-hash-table :test #'eq))
+        (el-chronos-collect--window-stacks (make-hash-table :test #'equal)))
+    (el-chronos-collect--accumulate-entry (vector nil nil nil) 5)
+    (should (= 0 (hash-table-count el-chronos-collect--window-self)))
+    (should-not (gethash nil el-chronos-collect--window-self))
+    (should (= 0 (hash-table-count el-chronos-collect--window-stacks)))))
+
+(ert-deftest el-chronos-collect-test-nil-frame-not-in-total ()
+  "nil 帧不计 total：`[car nil nil]'×3 时 car 的 self / total / samples 全是 3（不是 6 / 9）。"
+  (let ((el-chronos-collect--window-self (make-hash-table :test #'eq))
+        (el-chronos-collect--window-stacks (make-hash-table :test #'equal)))
+    (el-chronos-collect--accumulate-entry (vector 'car nil nil) 3)
+    (should (= 1 (hash-table-count el-chronos-collect--window-self)))
+    (should (equal [3 3 3] (gethash 'car el-chronos-collect--window-self)))
+    ;; 中间帧只有 total 增长，samples 归 leaf 口径
+    (let ((cell (gethash 'car el-chronos-collect--window-self)))
+      (should (= 3 (aref cell 0)))
+      (should (= 3 (aref cell 1)))
+      (should (= 3 (aref cell 2))))))
+
+(ert-deftest el-chronos-collect-test-trailing-nils-trimmed ()
+  "栈尾 nil 填充在序列化前裁掉：`[car nil nil]' 落成 `[\"car\"]'，不留 \"unknown\" 尾巴。"
+  (let ((el-chronos-collect--window-self (make-hash-table :test #'eq))
+        (el-chronos-collect--window-stacks (make-hash-table :test #'equal)))
+    (el-chronos-collect--accumulate-entry (vector 'car nil nil) 3)
+    (should (equal '("[\"car\"]")
+                   (hash-table-keys el-chronos-collect--window-stacks)))
+    (should (= 3 (gethash "[\"car\"]" el-chronos-collect--window-stacks)))))
+
+(ert-deftest el-chronos-collect-test-middle-nil-kept ()
+  "中间位置的 nil 不是尾部填充：保留为 \"unknown\" 占位，压缩栈结构会误导读者。"
+  (let ((el-chronos-collect--window-self (make-hash-table :test #'eq))
+        (el-chronos-collect--window-stacks (make-hash-table :test #'equal)))
+    (el-chronos-collect--accumulate-entry (vector 'car nil 'cdr) 2)
+    (should (equal '("[\"car\",\"unknown\",\"cdr\"]")
+                   (hash-table-keys el-chronos-collect--window-stacks)))
+    (should (= 2 (gethash "[\"car\",\"unknown\",\"cdr\"]"
+                          el-chronos-collect--window-stacks)))))
+
 (ert-deftest el-chronos-collect-test-accumulate-hash-log ()
   "`profiler-cpu-log' 的 hash table 形态（栈 vector → 样本数）走同一条聚合路径。"
   (let ((el-chronos-collect--window-self (make-hash-table :test #'eq))

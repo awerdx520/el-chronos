@@ -538,33 +538,54 @@ TOTAL 表示「该函数在某条栈里出现过」的样本数（含作为中�
         (aset cell 1 (+ (aref cell 1) count))
       (puthash function (vector 0 count 0) el-chronos-collect--window-self))))
 
+(defun el-chronos-collect--trim-trailing-nils (items)
+  "去掉向量 ITEMS 尾部的 nil，返回新向量（不改原向量）。
+profiler 的栈向量尾部是 nil 填充（实测形如
+`[1+ setq let … normal-top-level nil nil nil]'）：这些空槽既不是函数也没有调用信息。
+原样归一成 \"unknown\" 写进 `hourly_stacks' 后，火焰图与调用链视图会被无意义占位填满，
+`unknown' 也会看起来像热点函数。
+只裁尾部：中间位置若出现 nil（正常不该有）仍保留为 \"unknown\" 占位，
+避免压缩栈结构误导读者。"
+  (let ((end (length items)))
+    (while (and (> end 0) (null (aref items (1- end))))
+      (setq end (1- end)))
+    (if (= end (length items)) items (substring items 0 end))))
+
 (defun el-chronos-collect--accumulate-entry (stack count)
   "把一条采样（STACK 向量 + COUNT 样本）累计到本窗口的两个聚合表。
 STACK 的第 0 个元素是 leaf（实测结论见文件头），口径见文件头 2b：
   - leaf 同时加 SELF 与 SAMPLES 计数（leaf 口径，二者同源、落库形态不同）；
   - 栈中每个**不同**函数各加一次 TOTAL，同一函数在一条栈里出现多次（递归帧）
     只算一次，避免 total 被重复帧放大；TOTAL 不碰 SAMPLES。
+nil 帧（profiler 的尾部填充与未解析帧）**不计入** self / total：
+`(symbolp nil)' 为 t，必须用 `(and X (symbolp X))' 排除，否则会造出一个
+伪函数 \"unknown\"。
+栈序列化前先 `el-chronos-collect--trim-trailing-nils' 去尾；全 nil 栈不写
+`hourly_stacks'。
 单条栈只遍历一遍：栈内去重用 `memq'，代价 O(栈长²)（实测栈长 ≤ 40 帧，可忽略），
 且只在窗口 tick 上发生，不落在命令热路径里。"
   (when (and (vectorp stack) (> (length stack) 0) (numberp count) (> count 0))
     ;; 1) self / samples：只认栈顶帧（leaf），与内置 profiler 报告的自时间归属一致
     (let ((leaf (aref stack 0)))
-      (when (symbolp leaf)
+      (when (and leaf (symbolp leaf))
         (el-chronos-collect--accumulate-self leaf count)))
     ;; 2) total：栈内去重后每个出现过的函数各记一次（不动 samples）
     (let ((seen nil)
           (length (length stack)))
       (dotimes (index length)
         (let ((function (aref stack index)))
-          (when (and (symbolp function) (not (memq function seen)))
+          (when (and function (symbolp function) (not (memq function seen)))
             (push function seen)
             (el-chronos-collect--accumulate-appearance function count)))))
     ;; 栈本身按 JSON 字符串聚合并累加样本数（完整调用链的唯一来源）
+    ;; 先裁掉尾部 nil 填充再归一；全 nil 栈归一后是空向量，直接跳过不写库。
     ;; 帧名统一经 `el-chronos-collect--frame-name' 归一：nil → "unknown"、非符号对象
     ;; （闭包 / 字节码 / 其他）→ "anonymous"。归一后的名字同时充当 hash key，故同一
     ;; 闭包对象不会因 `format' 输出差异被拆成两条栈。
-    (let* ((names (vconcat (mapcar #'el-chronos-collect--frame-name (append stack nil))))
-           (json (condition-case nil (json-serialize names) (error nil))))
+    (let* ((trimmed (el-chronos-collect--trim-trailing-nils stack))
+           (names (vconcat (mapcar #'el-chronos-collect--frame-name (append trimmed nil))))
+           (json (and (> (length names) 0)
+                      (condition-case nil (json-serialize names) (error nil)))))
       (when json
         (puthash json (+ count (gethash json el-chronos-collect--window-stacks 0))
                  el-chronos-collect--window-stacks))))
