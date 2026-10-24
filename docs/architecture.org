@@ -41,9 +41,13 @@
 
 1. =pre-command-hook= ：
    - 若上一命令仍处于"未结算"状态 → 判为 =aborted= （被 =C-g= 中断），补记一条；
-   - 记 =this-command= 名、 =t_start= 、 =gcs-done= / =gc-elapsed= 基线；
+   - 记命令名（=--command-label= ： =real-this-command= 优先，其次 =this-command= ；
+     符号取符号名、键盘宏字符串原样、其他非 nil 对象按类型名）、 =t_start= 、
+     =gcs-done= / =gc-elapsed= 基线；
+   - **命令名两个都取不到（nil）时不开始计时**（旧实现落 =unknown= 无主行）；
 2. 命令执行（本观测器不参与，无 advice）；
-3. =post-command-hook= ：算 =duration_ms= 、 =gc_ms= 、 =outcome= ；
+3. =post-command-hook= ：算 =duration_ms= 、 =gc_ms= 、 =outcome= ；命令名一律用步骤 1
+   存下的值（此阶段 =this-command= 已是**上一条**命令，见实测结论 12）；
 4. =attrib-context= 补 =mode= / =project= ；用法三维计数自增；
 5. 超 =el-chronos-slow-command-threshold-ms= → 追加 =slow_events= 行（含当时栈快照）。
 
@@ -319,6 +323,58 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 ① =profiler-cpu-log= 返回「栈→样本数」hash table，=hash-table-count= 是 **distinct 栈数**
 不是样本数，统计样本必须 =maphash= 求和；② 采样开销类测量必须让 profiler 连续常驻，
 按微块起停会因定时器重置而**静默测空**。
+
+** 12. 命令名采集：=this-command= / =real-this-command= 与 M-x 中间态（2026-10-24）
+
+旧实现直接把 =this-command= 转成字符串，取不到就落 =unknown=。线上库实测：=unknown=
+107 / 10887 = **0.98%**，全部 =outcome='ok'=、duration 0.17–105ms，集中在
+=fundamental-mode=（78 行）、=eca-chat-mode=、=dashboard-mode=，且常**成串**出现
+（107 行里 84 行的前一条也是 =unknown=，另有 8 行紧跟 =ebox--hover-event=）—— 说明是一类
+「事件未解析为具名命令」的触发，而非用户命令漏采。另有 937 行 =anonymous=
+（旧实现「`this-command` 非符号」分支，多为 lambda 绑定）。
+
+实测矩阵（Emacs 31.1，=emacs -Q --batch -l= 用 =recursive-edit= 起**真实命令循环**，
+逐条打印两个 hook 里读到的值）：
+
+| 场景 | pre-command 次数 | pre 阶段 =this-command= | pre 阶段 =real-this-command= | post 阶段读到的值 |
+|---|---|---|---|---|
+| 普通自插入键 | 每键 1 次 | =self-insert-command=（符号） | 同左 | **上一条**命令 |
+| =M-x <cmd> RET=（实际命令由 =command-execute= 跑） | **1 次**（只有 =execute-extended-command=） | =execute-extended-command= | 同左 | 上一条命令 |
+| 外层命令内 =call-interactively= / =command-execute= | 1 次（只有外层命令） | 外层命令 | 同左 | 上一条命令 |
+| 前缀键 =C-c p a= | 1 次（只有最终命令） | =p3-foo=（最终命令） | 同左 | 上一条命令 |
+| lambda 绑定 | 1 次 | =#[nil ...]=（=interpreted-function=，**非符号**） | 同左 | 上一条命令 |
+| 命令内部 =setq this-command= | 不回改本次记录 | 该命令本身 | 同左 | 上一条命令 |
+
+四条可复用结论：
+
+1. **M-x 不会触发两次 =pre-command-hook=**。=execute-extended-command= 内部用
+   =command-execute= 跑实际命令，而 =command-execute= **不走** pre/post hook →
+   M-x 全程只有一次计时机会（名字是 =execute-extended-command=，线上 61 行）。因此
+   **跳过 M-x 中间态 = 让所有经 M-x 触发的命令彻底不被采集**，且 post 阶段补不回来。
+   要把它归到实际命令，唯一途径是给 =execute-extended-command= 加 advice（未实施）。
+2. **=post-command-hook= 时刻读到的 =this-command= / =real-this-command= 是上一条命令**
+   （命令循环在 post 之后才把它们滚进 =last-command=）。故命令名必须在 pre 阶段存下，
+   结算阶段不得回读 —— 回读会把上一条命令的名字安到本条上。
+3. =execute-extended-command= 在 =command-execute= 之前把 =this-command= 与
+   =real-this-command= **双双设成实际命令**（simple.el 原注释：让 =M-x <cmd> RET= 等同于
+   =<cmd>= 的键绑定），但改写发生在 hook 之外 → 采集层读不到。
+4. =real-this-command= 优先于 =this-command= 的意义在于：后者会被命令自身改写
+   （=push-button= 换成回调、=execute-extended-command= 换成实际命令），前者是命令循环
+   记下的「用户真正要求的命令」；普通键路径下两者恒等。
+
+修复后（=el-chronos-collect--command-label=）：=unknown= 不再产生（两个变量都取不到时
+**不开始计时、不落库**）；非符号命令按类型名落库（=interpreted-function= 等），不再统一
+记成 =anonymous=；=commands.name= 恒为可归因的名字。
+
+旧数据（已存在的 =unknown= / =anonymous= 行）**不需要清理**：它们只是分母里的历史噪声，
+不影响新数据的正确性，也不影响查询（=top-N= 排序按耗时 / 频次，无名行不会挤占具名行）。
+确要收敛可用下面两条 SQL（**未执行**，先备份库文件再跑；=hourly_usage= 里同名的聚合键
+也一并清理，否则趋势图仍会画出这两条线）：
+
+#+begin_src sql
+DELETE FROM commands     WHERE name IN ('unknown', 'anonymous');
+DELETE FROM hourly_usage WHERE dimension = 'command' AND key IN ('unknown', 'anonymous');
+#+end_src
 
 * 已知偏差（有意为之，不是 bug）
 

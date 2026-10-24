@@ -93,6 +93,38 @@
 ;;      命令名与本条命令相同、且距 `--command-start' 不足 1ms 时，判为同一命令被重复
 ;;      触发，直接返回，既不结算也不重置计时。
 ;;   第 2 层只兜底「局部值后来被别人改成带 `t'」这类运行时变化，正常路径由第 1 层挡住。
+;;
+;; 命令名归一（2026-10-24）：旧实现直接读 `this-command'，取不到就落 `unknown'，于是
+;; `commands' 里混进一类既不能归因、又污染 top-N 与中断率分母的无主行（实测线上
+;; 107/10887 = 0.98%，全部 `ok'、集中在 `fundamental-mode' / `dashboard-mode' /
+;; `eca-chat-mode'，且常成串出现）。现在改为 `el-chronos-collect--command-label'：
+;;   1. **`real-this-command' 优先**：它是命令循环记下的「用户真正要求的命令」，
+;;      而 `this-command' 可能被命令自身改写（`push-button' 换成回调、
+;;      `execute-extended-command' 在执行前把它换成实际命令）；
+;;   2. 符号 → `symbol-name'；字符串（键绑定为键盘宏）→ 原样；其他非 nil 对象
+;;      （`#[...]' 解释函数 / `closure' / keymap）→ 按 `(type-of CMD)' 落库，
+;;      故 lambda 绑定记作 `interpreted-function' 而不是旧实现里的 `anonymous'；
+;;   3. **两者均为 nil → 返回 nil**，`--pre-command' 据此不开始计时、不落库
+;;      （宁可不记，也不产生无主行），上一条未结算的 pending 仍按 `aborted' 收尾。
+;; 由此 `commands.name' 恒为「可归因的名字」，不再出现 `unknown'。
+;;
+;; 实测事实（2026-10-24，Emacs 31.1，真实命令循环 `recursive-edit' 下逐条打印
+;; `pre-command-hook' / `post-command-hook' 的 `this-command' 与 `real-this-command'）：
+;;  1. **M-x 只触发一次 `pre-command-hook'**（命令名 = `execute-extended-command'）：
+;;     `execute-extended-command' 内部用 `command-execute' 跑实际命令，而
+;;     `command-execute' **不走** pre/post hook —— 「M-x 会触发两次 hook」不成立。
+;;     因此**不能**跳过 M-x 中间态：跳过后经 M-x 触发的命令（当前 61 行）将不再被采集，
+;;     且 post 阶段无法补偿（见下条）。
+;;  2. `post-command-hook' 时刻读到的 `this-command' / `real-this-command' 是**上一条**
+;;     命令（命令循环在 post 之后才把它们滚到 `last-command'）。故结算必须用
+;;     `--pre-command' 存下的 `--command-name'，**不得**在结算时重新读命令名 ——
+;;     那会把上一条命令的名字安到本条上。
+;;  3. 前缀键（`C-c p a'）只对最终命令触发一次 hook；宏录制 / 定时器里
+;;     `call-interactively' / 命令内 `setq this-command' 均给出符号名。
+;;  4. `execute-extended-command' 在 `command-execute' 之前把 `this-command' 与
+;;     `real-this-command' 双双设成实际命令（simple.el 原注释：让 M-x <cmd> RET 等同于
+;;     <cmd> 的键绑定），但这一改写发生在 hook 之外，采集层读不到；要把 M-x 记录归到
+;;     实际命令需给 `execute-extended-command' 加 advice（新采集路径，未实施）。
 
 ;;; Code:
 
@@ -131,7 +163,9 @@
   "当前命令的起点 `float-time'；nil 表示没有计时中的命令。")
 
 (defvar el-chronos-collect--command-name nil
-  "当前命令名（`this-command' 的符号名字符串）。")
+  "当前命令名（由 `el-chronos-collect--command-label' 归一，`real-this-command' 优先）。
+在 `pre-command-hook' 里写入、结算时读取；**结算阶段不回读命令名**，因为那时
+`this-command' / `real-this-command' 已是上一条命令。nil 表示没有计时中的命令。")
 
 (defvar el-chronos-collect--command-gc-done nil
   "当前命令开始时的已完成 GC 次数（`gcs-done'）；诊断留档，口径以 `gc-elapsed' 差值为准。")
@@ -275,16 +309,52 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 该命令会被结算为 `ok'（除非没走到 `post-command-hook'，那时记 `aborted'）——见技术债 TD-8。"
   (setq el-chronos-collect--errored-p t))
 
+(defun el-chronos-collect--command-label ()
+  "返回当前命令的落库名；命令名无法确定时返回 nil。
+读取顺序：`real-this-command' 优先，其次 `this-command'（都用 `bound-and-true-p'
+读取，未绑定或为 nil 时回落）。`real-this-command' 是命令循环记下的「用户真正要求的
+命令」，`this-command' 则可能被命令自身改写 —— 例如 `push-button' 换成按钮回调、
+`execute-extended-command' 在处理完命令名后把它换成实际命令；普通键路径下两者恒等
+（实测 Emacs 31.1）。
+
+归一规则：
+- 符号 → `symbol-name'（绝大多数命令，也是唯一能归因到函数 / 包的形态）；
+- 字符串 → 原样返回（键绑定为键盘宏字符串时）；
+- 其他非 nil 对象 → `(format \"%s\" (type-of CMD))'，即按类型落库（`#[...]'
+  解释函数实测为 `interpreted-function'，闭包 / keymap 同理）；
+- nil → 返回 nil，**由调用方决定跳过**：本函数不提供 `unknown' 之类的兜底名，
+  无主行会污染 top-N 与中断率分母（见 Commentary「命令名归一」）。
+
+栈帧名不走本函数（那是另一维度：`el-chronos-collect--frame-name' 用 `unknown' /
+`anonymous' 表示取不到 / 非符号的函数位）。"
+  (let ((cmd (or (bound-and-true-p real-this-command) this-command)))
+    (cond ((null cmd) nil)
+          ((symbolp cmd) (symbol-name cmd))
+          ((stringp cmd) cmd)
+          (t (format "%s" (type-of cmd))))))
+
 (defun el-chronos-collect--pre-command ()
   "命令开始计时。
 若上一条命令仍未结算，先按 `aborted' 结算。
+
+命令名取 `el-chronos-collect--command-label' 的结果：
+- 为 nil（`this-command' 与 `real-this-command' 都取不到）→ **不开始计时**，清空命令
+  状态后返回。这类触发无法归因，落库只会得到无主行（旧实现记 `unknown'，实测线上占
+  0.98%），故宁可不记；上一条未结算的命令仍按 `aborted' 收尾。
+- 否则记录起点、命令名与 GC 差值基线。
 
 关于 `aborted' 的准确口径：`C-g' 通常**仍会**触发 `post-command-hook'（quit 在命令
 循环里被捕获后照常跑 hook），这类命令会正常结算为 `ok'/`error'，其 duration 含卡顿
 时间 —— 正是目标 #1 要看的数据，不是异常。真正记 `aborted' 的只有
 `post-command-hook' 被彻底跳过的顶层中断（`throw' 到顶层、`top-level' 重启、
 在 hook 自身或深层原生代码里跳出命令循环），此时这条命令无从结算，只能按已耗时间记
-`aborted'。此后记录起点、命令名与 GC 差值基线。
+`aborted'。
+
+**不跳过 M-x 中间态**（实测结论，见 Commentary）：`execute-extended-command' 内部的
+`command-execute' 不走 pre/post hook，故 M-x 全程只有这一次计时机会。若在这里跳过，
+经 M-x 触发的命令将彻底不被采集，且 `post-command-hook' 阶段补不回来（那时读到的
+`this-command' 已是上一条命令）。要让这类记录归到实际命令，需另行 advice
+`execute-extended-command'。
 
 **防御性去重**（D1 第二层防护）：本函数可能被同一个 buffer 的「局部 hook 值 + 全局
 默认值」在同一条命令上调用两次（局部值末尾带 `t' 的语义）。此时第二次调用看到的
@@ -293,11 +363,9 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 `el-chronos-collect--ensure-buffer-hooks' 的补挂判据挡住，本判据只兜底局部值在运行期
 被别人改成带 `t' 的情形。
 命名比较口径：`--command-name' 存的是**字符串**（落库口径），而 `this-command' 是符号，
-故判等用「把 `this-command' 归一后 `equal'」而不是 `eq'（符号与字符串 `eq' 恒为 nil，
+故判等用「把命令名归一后 `equal'」而不是 `eq'（符号与字符串 `eq' 恒为 nil，
 那样判据永远不成立，等于没有防护）。"
-  (let ((name (cond ((null this-command) "unknown")
-                    ((symbolp this-command) (symbol-name this-command))
-                    (t "anonymous"))))
+  (let ((name (el-chronos-collect--command-label)))
     ;; D1 兜底：同一命令被同一 hook 双跑时不结算、不重置（见 docstring）
     (unless (and el-chronos-collect--pending-p
                  (equal name el-chronos-collect--command-name)
@@ -305,12 +373,20 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
                  (< (- (float-time) el-chronos-collect--command-start) 0.001))
       (when el-chronos-collect--pending-p
         (el-chronos-collect--finish 'aborted))
-      (setq el-chronos-collect--command-start (float-time)
-            el-chronos-collect--command-name name
-            el-chronos-collect--command-gc-done gcs-done
-            el-chronos-collect--command-gc-elapsed gc-elapsed
-            el-chronos-collect--errored-p nil
-            el-chronos-collect--pending-p t))))
+      (if (null name)
+          ;; 命令名取不到：清状态、不开始计时（不产生无主行）
+          (setq el-chronos-collect--command-start nil
+                el-chronos-collect--command-name nil
+                el-chronos-collect--command-gc-done nil
+                el-chronos-collect--command-gc-elapsed nil
+                el-chronos-collect--errored-p nil
+                el-chronos-collect--pending-p nil)
+        (setq el-chronos-collect--command-start (float-time)
+              el-chronos-collect--command-name name
+              el-chronos-collect--command-gc-done gcs-done
+              el-chronos-collect--command-gc-elapsed gc-elapsed
+              el-chronos-collect--errored-p nil
+              el-chronos-collect--pending-p t)))))
 
 (defun el-chronos-collect--post-command ()
   "命令结束结算：pending 时按 `el-chronos-collect--errored-p' 记 `ok' 或 `error'。"
@@ -321,9 +397,16 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
   "结算当前命令。OUTCOME 取 `ok' / `error' / `aborted'。
 写四处：命令事件、用法统计（command / mode / project 三维，粒度设为 `file' 时再加一维
 被操作文件路径）、超阈值的慢事件（context 里可能带 `:file'）。
-每步都经 `el-chronos-collect--safe-apply'，失败只限流告警，绝不中断命令循环（I6）。"
+每步都经 `el-chronos-collect--safe-apply'，失败只限流告警，绝不中断命令循环（I6）。
+
+命令名一律用 `--pre-command' 存下的 `--command-name'，**结算时不重新读命令名**：
+实测 `post-command-hook' 时刻的 `this-command' / `real-this-command' 已是**上一条**
+命令（命令循环在 post 之后才把它们滚进 `last-command'），此刻回读会把上一条命令的名字
+安到本条上。`--command-name' 为 nil（无主命令）时整条不落库，也不记 `anonymous' ——
+理由同 `el-chronos-collect--pre-command'：无主行会污染 top-N 与中断率分母，而正常路径
+下 `--command-name' 与 `--command-start' 同时设置，不会出现该状态。"
   (let ((start el-chronos-collect--command-start)
-        (name (or el-chronos-collect--command-name "unknown"))
+        (name el-chronos-collect--command-name)
         (gc-start el-chronos-collect--command-gc-elapsed))
     ;; 先清状态再干活：即使下面的记录失败（已被吞掉），也不会留下粘住的 pending
     (setq el-chronos-collect--pending-p nil
@@ -332,7 +415,7 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
           el-chronos-collect--command-gc-done nil
           el-chronos-collect--command-gc-elapsed nil
           el-chronos-collect--errored-p nil)
-    (when (numberp start)
+    (when (and (numberp start) name)
       (let* ((duration-ms (* 1000 (- (float-time) start)))
              ;; 极端情况下 gc-elapsed 被重置，差值会为负，按 0 处理
              (gc-ms (when (numberp gc-start)

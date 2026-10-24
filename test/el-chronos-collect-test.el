@@ -350,6 +350,156 @@
               el-chronos-collect--command-name nil
               el-chronos-collect--errored-p nil)))))
 
+(ert-deftest el-chronos-collect-test-command-label-prefers-real-this-command ()
+  "`real-this-command' 优先于 `this-command'：M-x 场景下 `this-command' 会被改写成中间态。
+同时断言 `--pre-command' 落库用的是归一后的名字（而不是 `execute-extended-command'）。"
+  (should (equal "foo" (let ((this-command 'execute-extended-command)
+                             (real-this-command 'foo))
+                         (el-chronos-collect--command-label))))
+  (let ((names nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-command)
+               (lambda (event) (push (plist-get event :name) names)))
+              ((symbol-function 'el-chronos-store-record-usage)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (&rest _args) nil)))
+      (unwind-protect
+          (progn
+            (setq el-chronos-collect--pending-p nil
+                  el-chronos-collect--command-start nil
+                  el-chronos-collect--command-name nil)
+            (let ((this-command 'execute-extended-command)
+                  (real-this-command 'foo))
+              (el-chronos-collect--pre-command))
+            (should (equal "foo" el-chronos-collect--command-name))
+            (el-chronos-collect--post-command)
+            (should (equal '("foo") names)))
+        (setq el-chronos-collect--pending-p nil
+              el-chronos-collect--command-start nil
+              el-chronos-collect--command-name nil
+              el-chronos-collect--errored-p nil)))))
+
+(ert-deftest el-chronos-collect-test-command-label-normalization ()
+  "符号 → 符号名；字符串（键盘宏绑定）→ 原样；非符号对象 → 类型名（旧实现记 anonymous）。"
+  (should (equal "self-insert-command"
+                 (let ((this-command 'self-insert-command)
+                       (real-this-command nil))
+                   (el-chronos-collect--command-label))))
+  (should (equal "ab"
+                 (let ((this-command "ab")
+                       (real-this-command nil))
+                   (el-chronos-collect--command-label))))
+  (should (equal "interpreted-function"
+                 (let ((this-command (lambda (x) x))
+                       (real-this-command nil))
+                   (el-chronos-collect--command-label))))
+  ;; 键盘宏字符串优先于 `real-this-command' 的 nil
+  (should (equal "ab"
+                 (let ((this-command "ab")
+                       (real-this-command nil))
+                   (el-chronos-collect--command-label)))))
+
+(ert-deftest el-chronos-collect-test-pre-command-nil-label-skips ()
+  "`this-command' 与 `real-this-command' 均为 nil → 不开始计时、不落任何行（无 unknown）。"
+  (let ((events nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-command)
+               (lambda (event) (push (plist-get event :name) events)))
+              ((symbol-function 'el-chronos-store-record-usage)
+               (lambda (&rest _args) (push 'usage events)))
+              ((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (&rest _args) (push 'slow events))))
+      (unwind-protect
+          (progn
+            (setq el-chronos-collect--pending-p nil
+                  el-chronos-collect--command-start nil
+                  el-chronos-collect--command-name nil)
+            (let ((this-command nil)
+                  (real-this-command nil))
+              (el-chronos-collect--pre-command))
+            (should-not el-chronos-collect--pending-p)
+            (should-not el-chronos-collect--command-start)
+            (should-not el-chronos-collect--command-name)
+            ;; 后续 post 不会结算出一条无主行
+            (el-chronos-collect--post-command)
+            (should-not events))
+        (setq el-chronos-collect--pending-p nil
+              el-chronos-collect--command-start nil
+              el-chronos-collect--command-name nil
+              el-chronos-collect--errored-p nil)))))
+
+(ert-deftest el-chronos-collect-test-pre-command-nil-label-still-settles-pending ()
+  "命令名取不到时不开始计时，但不吞掉上一条未结算命令（仍按 aborted 结算）。"
+  (let ((outcomes nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-command)
+               (lambda (event) (push (plist-get event :outcome) outcomes)))
+              ((symbol-function 'el-chronos-store-record-usage)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (&rest _args) nil)))
+      (unwind-protect
+          (progn
+            (setq el-chronos-collect--pending-p t
+                  el-chronos-collect--command-start (- (float-time) 0.1)
+                  el-chronos-collect--command-name "previous-cmd")
+            (let ((this-command nil)
+                  (real-this-command nil))
+              (el-chronos-collect--pre-command))
+            (should (equal '("aborted") outcomes))
+            (should-not el-chronos-collect--pending-p))
+        (setq el-chronos-collect--pending-p nil
+              el-chronos-collect--command-start nil
+              el-chronos-collect--command-name nil
+              el-chronos-collect--errored-p nil)))))
+
+(ert-deftest el-chronos-collect-test-finish-without-name-skips-write ()
+  "`--command-name' 为 nil 时整条不落库（命令 / 用法 / 慢事件都不写），只清状态。
+理由：无主行会污染 top-N 与中断率分母；正常路径下名字与起点同时设置，不会出现该状态。"
+  (let ((events nil)
+        (el-chronos-slow-command-threshold-ms 10))
+    (cl-letf (((symbol-function 'el-chronos-store-record-command)
+               (lambda (event) (push (cons 'command event) events)))
+              ((symbol-function 'el-chronos-store-record-usage)
+               (lambda (&rest args) (push (cons 'usage args) events)))
+              ((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (event) (push (cons 'slow event) events))))
+      (setq el-chronos-collect--pending-p t
+            el-chronos-collect--command-start (- (float-time) 0.5)
+            el-chronos-collect--command-name nil
+            el-chronos-collect--command-gc-elapsed gc-elapsed)
+      (el-chronos-collect--finish 'ok))
+    (should-not events)
+    (should-not el-chronos-collect--pending-p)
+    (should-not el-chronos-collect--command-start)))
+
+(ert-deftest el-chronos-collect-test-mx-intermediate-is-recorded-once ()
+  "M-x 中间态（`execute-extended-command'）记录**一条**，不跳过。
+实测（Emacs 31.1，真实命令循环）：M-x 只触发一次 `pre-command-hook'（名字为
+`execute-extended-command'），实际命令由 `command-execute' 执行且**不走** hook；
+因此跳过中间态会让经 M-x 触发的命令彻底不被采集。要把这类记录归到实际命令，
+需另行 advice `execute-extended-command'（未实施）。本用例锁定该结论，防止误改成「跳过」。"
+  (let ((names nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-command)
+               (lambda (event) (push (plist-get event :name) names)))
+              ((symbol-function 'el-chronos-store-record-usage)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (&rest _args) nil)))
+      (unwind-protect
+          (progn
+            (setq el-chronos-collect--pending-p nil
+                  el-chronos-collect--command-start nil
+                  el-chronos-collect--command-name nil)
+            (let ((this-command 'execute-extended-command)
+                  (real-this-command 'execute-extended-command))
+              (el-chronos-collect--pre-command))
+            (should el-chronos-collect--pending-p)
+            (el-chronos-collect--post-command)
+            (should (equal '("execute-extended-command") names)))
+        (setq el-chronos-collect--pending-p nil
+              el-chronos-collect--command-start nil
+              el-chronos-collect--command-name nil
+              el-chronos-collect--errored-p nil)))))
+
 (ert-deftest el-chronos-collect-test-frame-name-normalization ()
   "栈帧归一：nil → \"unknown\"、非符号对象 → \"anonymous\"、符号 → 符号名（D2）。
 归一作用于 `--current-stack' 与窗口聚合的栈序列化，故 JSON 里不出现 null。"
