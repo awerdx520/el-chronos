@@ -220,6 +220,29 @@
       (el-chronos-collect--heartbeat))
     (should-not events)))
 
+(ert-deftest el-chronos-collect-test-heartbeat-suppressed-skips-block ()
+  "绑定 `--suppress-block-p' 为 t 时，同样的 3s gap 不记阻塞事件，但基线被推进到 ≈now。
+对照组（不绑定）在同档 gap 下会记一条 block，证明抑制确实起作用而非 gap 未达阈值。"
+  (let ((events nil)
+        (el-chronos-collect-notify-blocks nil)
+        (el-chronos-block-threshold-ms 2000)
+        (age 0.0))
+    (cl-letf (((symbol-function 'el-chronos-store-record-slow-event)
+               (lambda (event) (push event events))))
+      ;; 抑制组：大 gap 但抑制变量为 t → 不记事件，基线推进
+      (let ((el-chronos-collect--suppress-block-p t)
+            (el-chronos-collect--last-heartbeat (- (float-time) 3.0)))
+        (el-chronos-collect--heartbeat)
+        (setq age (- (float-time) el-chronos-collect--last-heartbeat)))
+      (should-not events)
+      (should (< age 0.5))
+      ;; 对照组：不绑定抑制变量，同样 3s gap → 记一条 block
+      (let ((el-chronos-collect--suppress-block-p nil)
+            (el-chronos-collect--last-heartbeat (- (float-time) 3.0)))
+        (el-chronos-collect--heartbeat))
+      (should (= 1 (length events)))
+      (should (equal "block" (plist-get (car events) :kind))))))
+
 ;;; 启停幂等与零残留
 
 (ert-deftest el-chronos-collect-test-start-stop-idempotent ()

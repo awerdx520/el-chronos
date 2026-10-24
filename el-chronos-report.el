@@ -61,8 +61,10 @@
 
 (defvar el-chronos-collect--suppress-block-p nil
   "非 nil 时采集层心跳跳过阻塞判定。
-由报告层在重查询（报告 / 周报 / 导出）期间 `let' 绑定为 t，`el-chronos-collect' 的
-心跳负责读取；报告层本身不读它。")
+由报告层在重查询（报告 / 周报 / 导出）期间 `let' 绑定为 t；**读取方在
+`el-chronos-collect'（心跳里 `bound-and-true-p' 判断并推进基线）**，报告层本身不读它。
+此处仅声明以避免跨模块 `let' 绑定未声明变量报 `void-variable'；与 collect 侧同名同义，
+重复声明无副作用。")
 
 (defvar el-chronos-collect--last-heartbeat nil
   "上一次心跳的实际触发时刻（`float-time'），采集层持有。

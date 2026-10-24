@@ -145,6 +145,15 @@
 (defvar el-chronos-collect--last-heartbeat nil
   "上一次心跳的实际触发时刻（`float-time'）；nil 表示尚无基线。")
 
+(defvar el-chronos-collect--suppress-block-p nil
+  "非 nil 时心跳跳过阻塞判定，只推进基线（抑制自观测假阳性）。
+由 `el-chronos-report' 与 `el-chronos-dashboard' 在渲染期间 `let' 绑定为 t；
+`el-chronos-collect--heartbeat' 用 `bound-and-true-p' 读取并据此跳过阻塞判定，
+同时把 `el-chronos-collect--last-heartbeat' 推进到当前时刻 —— 否则解除绑定后
+那一次补跑的心跳会把整段渲染耗时算成一条巨型阻塞（I2 只认时间差，无法事后区分）。
+两个可视化模块各自 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量报
+`void-variable'；同义重复声明无副作用。")
+
 (defvar el-chronos-collect--timers nil
   "本模块创建的 timer 列表（心跳 + 采样窗口），停止时逐个 cancel 并摘除登记（I5）。")
 
@@ -368,22 +377,26 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 (defun el-chronos-collect--heartbeat ()
   "心跳：比较相邻两次触发的实际间隔，漂移超阈值即记一条阻塞事件。
 心跳迟到说明主线程在两次触发之间被占住（原生代码、未分批 IO、长 timer 回调）；
-阻塞期间无可靠 Lisp 回调，只能事后按时间差反推（I2）。自身 `condition-case'。"
+阻塞期间无可靠 Lisp 回调，只能事后按时间差反推（I2）。自身 `condition-case'。
+
+`el-chronos-collect--suppress-block-p' 非 nil 时不判定阻塞，只推进基线 ——
+报告 / 页面渲染是用户主动触发的重查询，其耗时不该混进「待排查的卡顿」（自观测抑制）。"
   (condition-case err
       (let* ((now (float-time))
-             (last el-chronos-collect--last-heartbeat)
-             (gap-ms (when (numberp last) (* 1000 (- now last)))))
+             (last el-chronos-collect--last-heartbeat))
         (setq el-chronos-collect--last-heartbeat now)
-        (when (and gap-ms (> gap-ms el-chronos-block-threshold-ms))
-          (let ((context (or (el-chronos-collect--safe-funcall
-                              #'el-chronos-attrib-context)
-                             (list :mode nil :project nil))))
-            (el-chronos-collect--safe-apply
-             #'el-chronos-store-record-slow-event
-             (list (list :duration-ms gap-ms :kind "block" :command nil
-                         :stack nil :context context)))
-            (when el-chronos-collect-notify-blocks
-              (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms)))))
+        (unless (bound-and-true-p el-chronos-collect--suppress-block-p)
+          (when-let* ((gap-ms (and (numberp last) (* 1000 (- now last))))
+                      ((> gap-ms el-chronos-block-threshold-ms)))
+            (let ((context (or (el-chronos-collect--safe-funcall
+                                #'el-chronos-attrib-context)
+                               (list :mode nil :project nil))))
+              (el-chronos-collect--safe-apply
+               #'el-chronos-store-record-slow-event
+               (list (list :duration-ms gap-ms :kind "block" :command nil
+                           :stack nil :context context)))
+              (when el-chronos-collect-notify-blocks
+                (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms))))))
     (error (el-chronos-collect--warn "心跳检测失败：%S" err)))
   nil)
 
