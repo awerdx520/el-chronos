@@ -41,7 +41,7 @@
 
 ### 移除
 
-- **dashboard 模块与 ETAF 依赖移除**：删除 `el-chronos-dashboard.el`（1382 行：ETAF 组件树 + tabulated-list 降级页）与 `etaf` / `etaf-ui` 软依赖，可视化收敛为「浏览器 Web dashboard + org 报告」两形态（共享同一 `el-chronos-analysis` 查询层）。同时移除 5 个 defcustom（`el-chronos-dashboard-page-size` / `-max-rows` / `-chart-points` / `-chart-width` / `-refresh-seconds`）、24 个 dashboard ERT 用例与 5 项专用夹具；`test/el-chronos-ui-test.el` 更名为 `test/el-chronos-web-test.el`（9 个 Web 用例保留并改名为 `el-chronos-web-test-*`）。补 2 个 `el-chronos-show-event` 用例（该命令保留，原覆盖来自被删用例），用例总数 107 → **109**。不变量 I9 改写为「ETAF 已完全移除，可视化层不引入 ETAF」、I11 去掉 ETAF/SVG 降级子项；技术债 TD-5（ETAF 重绘性能）关闭。见 ADR-0003。
+- **dashboard 模块与 ETAF 依赖移除**：删除 `el-chronos-dashboard.el`（1382 行：ETAF 组件树 + tabulated-list 降级页）与 `etaf` / `etaf-ui` 软依赖，可视化收敛为「浏览器 Web dashboard + org 报告」两形态（共享同一 `el-chronos-analysis` 查询层）。同时移除 5 个 defcustom（`el-chronos-dashboard-page-size` / `-max-rows` / `-chart-points` / `-chart-width` / `-refresh-seconds`）、24 个 dashboard ERT 用例与 5 项专用夹具；`test/el-chronos-ui-test.el` 更名为 `test/el-chronos-web-test.el`（9 个 Web 用例保留并改名为 `el-chronos-web-test-*`）。补 2 个 `el-chronos-show-event` 用例（该命令保留，原覆盖来自被删用例），用例总数 107 → **109**。不变量 I9 改写为「ETAF 已完全移除，可视化层不引入 ETAF」、I11 去掉 ETAF/SVG 降级子项；技术债 TD-5（ETAF 重绘性能）关闭。测试辅助函数同步更名为 `el-chronos-web-test--*`（不含用户可感知行为变化）。见 ADR-0003。
 
 ### 新增
 

@@ -314,7 +314,9 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 107 / 10887 = **0.98%**，全部 =outcome='ok'=、duration 0.17–105ms，集中在
 =fundamental-mode=（78 行）、=eca-chat-mode=、=dashboard-mode=，且常**成串**出现
 （107 行里 84 行的前一条也是 =unknown=，另有 8 行紧跟 =ebox--hover-event=）—— 说明是一类
-「事件未解析为具名命令」的触发，而非用户命令漏采。另有 937 行 =anonymous=
+「事件未解析为具名命令」的触发，而非用户命令漏采。（注：=ebox--hover-event= 与
+=dashboard-mode= 均为 2026-10-24 历史实测采集到的第三方包命令 / major-mode 名，属实测数据
+快照，与本仓库可视化层已无 ETAF 依赖无关，见 ADR-0003。）另有 937 行 =anonymous=
 （旧实现「`this-command` 非符号」分支，多为 lambda 绑定）。
 
 实测矩阵（Emacs 31.1，=emacs -Q --batch -l= 用 =recursive-edit= 起**真实命令循环**，
