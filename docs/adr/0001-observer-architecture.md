@@ -66,9 +66,9 @@ Emacs 配置（thomas-emacs）长期存在"偶尔卡一下但定位不到原因"
 **负面 / 代价**
 
 - 采样是概率性的：短于 10ms 的函数可能采不到，`self_ms` 有统计噪声，需靠多窗口累积；
-- 归因依赖 `symbol-file`，native-comp 下可能命中 `.eln`（已记 TD-1）；
-- 无命令上下文的阻塞（timer / 进程过滤器 / redisplay）只能靠心跳识别"停转了"，栈归因质量待实测（TD-2）；
-- 常驻采样本身的 CPU 占比需实测，超 0.5% 须退到 20/50ms（TD-3）；
+- 归因依赖 `symbol-file`，native-comp 下可能命中 `.eln`（**TD-1 已关闭**：`.eln` 路径可从文件名反查库名与源码，实测 844 个真实 `.eln` 中 96.6% 反查成功、仅 1.1% 归 `unknown`）；
+- 无命令上下文的阻塞（timer / 进程过滤器 / redisplay）只能靠心跳识别"停转了"，栈归因质量待实测（**TD-2 已实测**：≥2s 停转 5/5 捕获，记录值恒高估 ≤1 心跳间隔；残余缺口转 TD-11）；
+- 常驻采样本身的 CPU 占比需实测，超 0.5% 须退到 20/50ms（**TD-3 已实测关闭**：10ms 默认开销在噪声地板下不可分辨，上限约 0.2%，保持 10ms）；
 - 行级需求无法由常驻能力满足，只能人工下钻。
 
 **约束（进入不变量）**
@@ -96,4 +96,4 @@ I8（Web 只绑 loopback、无鉴权、只读）。
 - 决策表：`openspec/decisions.md`（本 ADR 的四条对应行）
 - 数据模型：`docs/schema.org`
 - 时序与数据流：`docs/architecture.org`
-- 技术债：`openspec/tech-debt.md`（TD-1 native-comp 归因、TD-2 阻塞覆盖率、TD-3 采样开销、TD-4 CI 空跑、TD-5 ETAF 重绘性能、TD-6 Web 无鉴权边界、TD-7 P95 近似精度）
+- 技术债：`openspec/tech-debt.md`（TD-1 native-comp 归因、TD-2 阻塞捕获覆盖率、TD-3 采样开销——均已关闭；TD-4 CI 空跑、TD-5 ETAF 重绘性能、TD-6 Web 无鉴权边界、TD-7 P95 近似精度、TD-11 阻塞捕获残余缺口）

@@ -180,7 +180,8 @@ ss -lntH "sport = :8787"
 | `total_ms` 口径 | 按栈内去重，与内置 `profiler-report` 的 total **不完全相等**；占比与回归判定一律 self 口径（TD-10） | `docs/architecture.org`「已知偏差」 |
 | **`pre-command-hook` 双跑陷阱（D1）** | Emacs 31 起 `pre-command-hook` auto-buffer-local：局部值是列表时**整体遮蔽**全局值，但列表中含 `t` 标记时 `run-hooks` 会**连跑**全局默认值 → 与「全局 + 局部补挂」叠加后每条命令被记两次（`ok` + `aborted`），计数/频次/中断率翻倍。修复后**只在局部值不含 `t` 时补挂**（不含 `t` 的局部值才是完整遮蔽值），并加 **1ms 去重兜底**（同 `(命令 . 时间)` 只记一次） | `docs/architecture.org`「hook 双跑陷阱（D1）」 |
 | **报告 / dashboard 自观测抑制（三层 + 心跳侧感知）** | 观测者会观测到自己的重查询 / 渲染，必须抑制。**机制**：`el-chronos-collect--heartbeat` 用 `bound-and-true-p` 读取 `el-chronos-collect--suppress-block-p`——抑制期间**推进 `--last-heartbeat` 基线并跳过判定**；report（`--without-block-events`）与 dashboard（`--without-block-events`）在渲染前绑定该抑制变量、把 `el-chronos-block-threshold-ms` 临时抬到 60s，并在 `unwind-protect` 清理段**再重置基线**。**结论**：抑制期间不产生 block 事件，解除绑定后也不补记整段 gap。**取舍**：抑制期间若真发生阻塞同样不记（有意接受——用户主动触发的重查询耗时不属待排查卡顿）。**局限**：第①层（抑制变量）依赖 collect 侧读取，已实现（2026-10-24）；dashboard 首次渲染（ETAF 组件初始化）同样走这套抑制 | `docs/architecture.org`「报告自观测抑制」 |
-| 仍待实测 | 采样开销（TD-3）、阻塞覆盖率（TD-2）、ETAF 重绘性能（TD-5）、P95 精度（TD-7）、`.eln` 归因（TD-1） | `openspec/tech-debt.md` |
+| 仍待实测 | ETAF 重绘性能（TD-5）、P95 精度（TD-7）、阻塞捕获残余缺口（TD-11） | `openspec/tech-debt.md` |
+| 采样开销 | 10ms 默认间隔的常驻开销**低于本机测量分辨率**（噪声地板 ±0.7–1.1%）：1ms 间隔（采样率约 10×）实测 +0.46%，按单样本成本外推 10ms ≈ 0.02–0.2%，**远低于 0.5% 阈值**，保持 10ms 默认（TD-3 已关闭） | `docs/architecture.org`「实测结论 11」 |
 
 ## 文档治理
 

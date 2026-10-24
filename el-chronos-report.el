@@ -636,7 +636,7 @@ INTERVAL 是折算 self 时间的每样本毫秒数。"
 
 (defun el-chronos-profile--suggestions (rows gc-pct)
   "按规则生成「优化建议」文本行列表。
-规则（顺序即优先级，命中即止）：归因失败（TOP 包 unknown）→ 检查 `.eln' 路径（TD-1）；
+规则（顺序即优先级，命中即止）：归因失败（TOP 包 unknown）→ 排查已删包/临时 snippet（TD-1 已关闭）；
 TOP 函数属 eldoc/font-lock/jit-lock → 调 idle delay；GC 占比超阈值 → 调
 `gc-cons-threshold'；否则建议对 TOP 函数做二分注释定位。无样本时给出样本不足提示。"
   (let* ((top-function (caar (el-chronos-profile--self-ranking rows)))
@@ -647,7 +647,7 @@ TOP 函数属 eldoc/font-lock/jit-lock → 调 idle delay；GC 占比超阈值 �
       (list (format "未采到样本（间隔 %s）：命令太快或采样不可用，换更耗时的命令或加大样本量再试"
                     (el-chronos-report--ms->human (el-chronos-profile--interval-ms)))))
      ((equal top-package el-chronos-analysis--unknown)
-      (list "归因失败（TOP 包为 unknown）：检查 native-comp 的 `.eln' 路径是否落在 eln-cache（技术债 TD-1）"))
+      (list "归因失败（TOP 包为 unknown）：通常来自已删除包的残留 .eln 或临时 snippet（.eln 已支持反查，TD-1 已关闭）"))
      ((string-match-p el-chronos-profile--idle-functions top-name)
       (list (format "热点在 `%s'（idle 类机制）：考虑调大对应 idle delay 或收窄启用范围" top-name)))
      ((> (or gc-pct 0.0) el-chronos-profile--gc-warn-pct)

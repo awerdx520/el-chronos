@@ -154,7 +154,7 @@ make full-check     # check-parens + test
   归因、13 个分析查询、org 报告、ETAF 页面、Web dashboard、单命令剖析、ERT 103 用例、文档全集。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
 - 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化]]
-- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]（含仍待实测项：采样开销 TD-3、阻塞覆盖率 TD-2、ETAF 重绘性能 TD-5、P95 精度 TD-7）
+- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]（含仍待实测项：ETAF 重绘性能 TD-5、P95 精度 TD-7、阻塞捕获残余缺口 TD-11；采样开销 TD-3、阻塞覆盖率 TD-2、`.eln` 归因 TD-1 已关闭）
 - 文档：[[file:docs/architecture.org][架构与实测结论]]、[[file:docs/schema.org][数据模型]]、[[file:docs/ui.org][界面与路由]]、[[file:docs/api.org][接口索引]]、[[file:docs/operations.org][运维手册]]
 
 * 许可证

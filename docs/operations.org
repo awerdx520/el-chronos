@@ -116,7 +116,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | =*el-chronos*= 页面显示表格而非卡片 + 图表 | **ETAF 缺失或 require 失败**（=display-warning= 提示安装） | =M-: (el-chronos-dashboard-etaf-available-p)= 确认；按「安装 · 方式 C」装 =etaf= + =etaf-ui=；不装也能用简版（2 张表 + =1/7/3= 切范围） |
 | 启动即告警「SQLite 不可用」，采集被禁用 | Emacs < 29 或编译时缺 sqlite | =M-: (and (fboundp 'sqlite-open) (sqlite-available-p))=；换带 SQLite 支持的 Emacs 构建；观测器本身不阻断 Emacs 启动 |
 | =el-chronos-web-start= 抛 =user-error=「端口被占用」 | 8787 已被占用（可能是别的实例或 Windows 侧进程） | =ss -lntH "sport = :8787"= 查监听者；改 =el-chronos-web-port= 后重试。**不自动换端口**是设计（I11：可见失败优于静默漂移） |
-| 热点函数里一堆 =unknown= 包 | native-comp 下 =symbol-file= 命中 =.eln=（TD-1），或函数是 =eval= 即时定义的（无源码文件） | 看 =el-chronos-attrib-file= 对该符号的返回值：返回 =.eln= 路径说明是编译产物；兜底失败按设计降级 =unknown=，不影响其他统计。需要源码级结论时用 =el-chronos-profile-command= 对单条命令剖析 |
+| 热点函数里一堆 =unknown= 包 | 函数来自**已删除包的残留 =.eln=**、=eval= 即时定义的临时 snippet（=.yas-setup-*=），或 =symbol-file= 确实取不到源码 | native-comp 的 =.eln= 路径已能反查源码（TD-1 已关闭，实测 96.6% 反查成功），故 =unknown= 现在**只剩这两类边界**。看 =el-chronos-attrib-file= 对该符号的返回值：返回 =.eln= 路径说明反查失败（多半是包已删）；不影响其他统计。需要源码级结论时用 =el-chronos-profile-command= 对单条命令剖析 |
 | 采样数一直是 0 / 热点表空 | ① 采样器启动失败（=display-warning=）；② 观测期间**没有真实操作**——纯 =sleep= 不产生 CPU 样本 | ① 查 =*Messages*= 与 =el-chronos-status=；② 正常敲命令 1 分钟后再看（采样是 CPU 采样，阻塞等待期没有 leaf 样本，阻塞要靠心跳 =slow_events(kind='block')= 体现） |
 | DB 体积显示得比预期小 | =el-chronos-analysis-db-size= **只统计主文件**，不含 =-wal= / =-shm=；WAL 未 checkpoint 时数据还在 wal 里 | 看总占用：=ls -l ~/.emacs.d/.local/state/chronos/=；随 checkpoint 主文件会长上来；需要立刻收敛就跑 =M-x el-chronos-store-vacuum= |
 | 某些 buffer 里的命令完全没被计时 | TD-9 类问题（=pre-command-hook= / =post-command-hook= 在 Emacs 31 起 auto-buffer-local） | 已修复：启动时遍历 =buffer-list= 补挂局部 hook 并由 =buffer-list-update-hook= 增量覆盖；若自造 buffer 仍漏采，确认没有在 =kill-all-local-variables= 之后手动覆盖这两个 hook |
@@ -192,5 +192,5 @@ Windows 侧进程可直连该端口）。定位是「本机自用的只读视图
 - 界面 / 路由 / ETAF 踩坑：[[file:ui.org][docs/ui.org]]
 - 数据模型与保留策略：[[file:schema.org][docs/schema.org]]
 - 架构与实测结论：[[file:architecture.org][docs/architecture.org]]
-- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-1 / TD-5 / TD-6 / TD-9 / TD-10）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-1 / TD-2 / TD-3 已关闭；未关闭：TD-4 / TD-5 / TD-6 / TD-7 / TD-9 / TD-10 / TD-11）
 - 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
