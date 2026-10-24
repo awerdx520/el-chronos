@@ -105,7 +105,7 @@
 |---|---|---|---|
 | =el-chronos-collect-start= | =()= | =t= / =nil= | 启动采集：命令计时 hook（全局 + 每 buffer 局部补挂，TD-9）、错误标记 advice、心跳 timer、采样 timer 与 profiler。幂等。 |
 | =el-chronos-collect-stop= | =()= | =t= / =nil= | 停止采集并清空全部状态，保证零残留（I5）。幂等。 |
-| =el-chronos-collect-notify-blocks= | defcustom，默认 =t= | boolean | 心跳检测到阻塞时是否在 echo area 提示一句。 |
+| =el-chronos-collect-notify-blocks= | defcustom，默认 =nil= | =(choice (const nil) (const messages) (const t))= | 心跳检测到阻塞时**如何提示**（不影响采集与记录：=slow_events(kind="block")= 恒照记）。=nil= 静默；=messages= 只写 =*Messages*=（=(let ((inhibit-message t)) (message ...))=，不占 echo area）；=t= 在 echo area 提示（旧语义）。详见 [[file:operations.org][docs/operations.org]]「阻塞提示」。 |
 | =el-chronos-collect--suppress-block-p= | defvar，默认 =nil= | boolean | **跨模块控制变量**：声明在 collect 侧（=el-chronos-collect.el=），**report 与 dashboard 侧绑定**（=el-chronos-report--without-block-events= / =el-chronos-dashboard--without-block-events= 在重查询 / 渲染期间 =let= 为 =t=），**collect 侧读取**（=el-chronos-collect--heartbeat= 用 =bound-and-true-p= 判断：非 =nil= 时跳过阻塞判定，只把 =--last-heartbeat= 推进到当前时刻，故解除绑定后不会补记整段 gap）。两个可视化模块必须先 =defvar= 同名声明，否则跨模块 =let= 绑定未声明变量会 =void-variable=；两侧同名同义，重复声明无副作用。语义上它只抑制「重查询 / 渲染耗时的假阻塞」——其间真实发生的阻塞同样不记，属有意取舍。 |
 | =el-chronos-collect--last-heartbeat= | defvar，默认 =nil= | 浮点秒 | 上一次心跳的实际触发时刻。**跨模块写入点**有三个：report 侧与 dashboard 侧在重查询 / 渲染结束（=unwind-protect= 清理段）重设基线，以及 collect 心跳自身在抑制期间推进基线；目的都是避免补跑的心跳把整段非采集耗时记成阻塞（详见 [[file:architecture.org][docs/architecture.org]]「报告自观测抑制」）。 |
 

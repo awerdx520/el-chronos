@@ -147,10 +147,23 @@
 
 ;;; 自定义项
 
-(defcustom el-chronos-collect-notify-blocks t
-  "心跳检测到主线程阻塞时是否在 echo area 提示一句。
-置 nil 则只记 `slow_events'，不打扰正在编辑的用户。"
-  :type 'boolean
+(defcustom el-chronos-collect-notify-blocks nil
+  "心跳检测到主线程阻塞时如何提示。
+阻塞事件**始终**记入 `slow_events'（`kind' = \"block\"）并出现在报告与 dashboard 里，
+本开关只控制「提示」这一层，取任何值都不影响采集与记录。
+
+取值：
+- nil      —— 默认，完全不提示（既不占 echo area，也不写 `*Messages*'）。
+- messages —— 只写 `*Messages*'：`message' 被 `inhibit-message' 包住，
+              不占用 echo area，不打断正在进行的 minibuffer 输入与补全。
+- t        —— 在 echo area 提示一句（旧语义，兼容既有配置）。
+
+为什么默认静默：这条提示落在 echo area，用户输入中途出现会盖住 minibuffer 候选、
+干扰正常输入；而阻塞本身事后在报告 / dashboard 里可查。需要即时可见性时再显式
+改成 `messages'（只进日志）或 `t'（真 echo）。"
+  :type '(choice (const :tag "静默（只记录，不提示）" nil)
+                 (const :tag "只写 *Messages*" messages)
+                 (const :tag "echo area 提示" t))
   :group 'el-chronos)
 
 ;;; 运行时状态
@@ -478,8 +491,11 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
                #'el-chronos-store-record-slow-event
                (list (list :duration-ms gap-ms :kind "block" :command nil
                            :stack nil :context context)))
-              (when el-chronos-collect-notify-blocks
-                (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms))))))
+              ;; 提示开关只管「提示」这一层：上面已落库，三种取值都不影响记录。
+              ;; `messages' 用 `inhibit-message' 只写 `*Messages*'，不占 echo area。
+              (when-let* ((notify el-chronos-collect-notify-blocks))
+                (let ((inhibit-message (eq notify 'messages)))
+                  (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms)))))))
     (error (el-chronos-collect--warn "心跳检测失败：%S" err)))
   nil)
 

@@ -24,6 +24,12 @@
 
 ### 变更
 
+- **阻塞提示默认静默**：`el-chronos-collect-notify-blocks` 默认由 `t` 改为 `nil`——心跳检测到主线程
+  阻塞后不再往 echo area 打「el-chronos：主线程阻塞约 N ms（已记录）」，因为该行会盖住 minibuffer
+  候选、打断正在进行的输入与补全。**事件仍然照记**：三种取值下 `slow_events(kind="block")` 都照旧
+  落库并出现在报告 / dashboard 里，开关只控制提示层（`nil` 静默 / `messages` 用
+  `(let ((inhibit-message t)) (message ...))` 只写 `*Messages*` / `t` 保持旧语义真 echo）。
+  同步更新 `AGENTS.md`「已知边界」、`docs/operations.org`「阻塞提示」与 `docs/api.org` 的 defcustom 表。
 - **TD-1 关闭**（native-comp `.eln` 归因）：实测 Emacs 31.1 下 `symbol-file` 对原生编译函数返回 `eln-cache` 内的 `.eln` 路径；落地「文件名剪哈希 + `locate-library` 反查」方案，真实 844 个 `.eln` 中 **815 个反查成功（96.6%）**、加 trampoline 判 `built-in` 后**仅 9 个 `unknown`（1.1%）**，共归因到 162 个包；未采用代价更高的 `comp-el-to-eln-filename` 遍历方案。
 - **TD-2 关闭**（非命令型阻塞覆盖率）：命令外 ≥2s 计算型停转 **5/5 捕获**（命令内忙等、timer 回调、进程过滤器、`font-lock-fontify-buffer`），记录值恒高估 ≤1 心跳间隔（实测 1.6s 被记成 2.58s，+61%）；`<2s` 停转与等待型调用仍零覆盖，残余缺口转 TD-11 并写入 `docs/architecture.org`「实测结论 10」。
 - **TD-3 关闭**（10ms 采样开销）：改用 CPU 时间（`get-internal-run-time`）+ 相位级 ABBA 重测（上次墙钟 ±9% 抖动导致失败）。噪声地板 ±0.7–1.1% 内 10ms 档读数 +0.98%、20ms 档 −1.11%，与采样率无单调关系；以 1ms 档实测 +0.46% 为锚点外推，**10ms 开销 ≈ 0.02–0.2%，远低于 0.5% 阈值 → 保持默认 10ms**。附带两条方法论：`profiler-cpu-log` 需 `maphash` 求样本总数（`hash-table-count` 是 distinct 栈数）；按微块起停 profiler 会因定时器重置而测空，必须相位级常驻。数据见 `docs/architecture.org`「实测结论 11」。
