@@ -231,13 +231,61 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 取舍：抑制期间若真发生阻塞也不会被记录。有意接受——报告 / 首次渲染是用户主动触发的重操作，
 其耗时属预期行为，不该混进「待排查的卡顿」。
 
+** 10. 阻塞捕获覆盖率（TD-2，2026-10-24 实测）
+
+方法：=emacs -Q --batch -L .= + 独立临时库，=el-chronos-mode 1=，=el-chronos-sample-window-seconds=
+调到 1 小时（仅 F 场景用 2 秒）以排除采样 tick 干扰，=el-chronos-heartbeat-seconds= 1、
+=el-chronos-block-threshold-ms= 2000（均为默认值）。
+
+**关键方法论**：=sleep-for= / =sit-for= 都会进入 =wait_reading_process_output=，**期间 timer 照常运行** →
+用它们注入延迟根本不会让心跳停摆，测不出任何覆盖率（早期用 =sleep-for= 造「阻塞」得到的是全 miss 的
+假结论）。真阻塞必须用**纯 Lisp 忙等**（=while= 空转 + =float-time= 判时，不进入任何等待点），
+它才是「主线程停转」的等价物；同理真实世界里 =sleep-for= / 同步进程 IO 型「慢」不产生 block 事件。
+
+| 场景 | 真实停转 | 是否捕获 | 记录值 | 误差 | 说明 |
+|------|---------|---------|--------|------|------|
+| A 命令内忙等 0.3s | 312.7ms（含 hook 开销） | 是 / =commands= 1 行 + =slow_events(kind='command')= | 300.0ms | ≈0（差值即 hook 开销） | 命令计时精确 |
+| A0 命令内 =sleep-for= 0.3s | 303.7ms | 是 / 慢命令 | 303.7ms | ≈0 | 对照：=sleep-for= 不是真停转，期间心跳照常触发，无 block 事件 |
+| A3 命令内忙等 3.0s | 3020.8ms | 是 / **双记**：command 3000.0 + block 3371.5 | — | block 高估 350.7ms | 同一段卡顿在两种口径里各记一次（见下「双记」） |
+| B2 timer 回调忙等 1.5s | 1500.0ms | **否** | — | — | 低于检出下界（本相位偏移 450ms → gap 1950 < 2000） |
+| B3 timer 回调忙等 2.5s | 2500.0ms | 是 / block | 2950.5ms | +450.4ms | 预测 2950.4ms |
+| B timer 回调忙等 3.0s | 3000.0ms | 是 / block | 3450.6ms | +450.6ms | 预测 3450.6ms（真实 + 上次心跳到阻塞开始的偏移） |
+| G 相位实验：1.6s 忙等，从距上次心跳 973.7ms 处开始 | 1602.5ms | 是 / block | 2576.4ms | **+973.9ms（+61%）** | 误差上界实证：偏移越接近一个心跳间隔，高估越大 |
+| C 进程过滤器忙等 3.0s | 3000.0ms | 是 / block | 3852.9ms | +852.9ms | filter 在 C 层同步执行，心跳被饿死 |
+| D =font-lock-fontify-buffer=（elisp-mode，10 万行） | 2434.2ms | 是 / block | 2866.9ms | +432.7ms | 最贴近真实卡顿（jit-lock 大 buffer） |
+| D2 =redisplay t=（batch） | 0.0ms | 否（无法复现） | — | — | batch 无真实 frame，redisplay 空跑；GUI 侧未实测（TD-11） |
+| E =garbage-collect=（3M cons 存活） | 92.0ms | 否 | — | — | 环境 GC 停顿在 100ms 量级，远低于 2s 阈值 |
+| F 1.5s 停转 + 采样窗口 2s | 1500.0ms | 否 / block；**是** / 采样 | =hourly_functions= 记到 1090ms（109 样本） | — | 亚阈值停转不进 =slow_events=，但 profiler 样本仍能说明「谁在耗 CPU」 |
+
+**误差模型**（用 B / G 的「预测值 vs 实测值」对齐验证，误差 ≤0.2ms）：
+记录值 = 真实停转 + 偏移，偏移 = 阻塞开始时刻 − **上一次成功心跳**时刻，取值 [0, 1 心跳间隔 + 抖动]。
+因此：
+1. 记录值**系统性高估**，上界 ≈ 一个心跳间隔（默认 1s）；最短可高估 61%（G：1.6s → 2.58s）；
+2. 检出下界 = 阈值 − 偏移：最差相位（阻塞紧接一次心跳之后开始）需真实停转 > 2s，最好相位约 0.95s；
+3. 心跳只能证明「主线程停了 N 秒」：事件里 =command= 与 =stack_json= 恒为 NULL，
+   定位靠同一时间窗的 =hourly_functions= / =hourly_stacks= 采样（见实测结论 1 与 F 场景）。
+
+**双记**：命令内停转 ≥ 2s 时既记 =kind='command'=（精确）又记 =kind='block'=（高估 ≤1s）。
+两者是不同口径（「这条命令慢」vs「主线程停转」），单看一类不算错；但**把两列相加**当总卡顿时长会重复计数。
+
+**覆盖不到的三类**：
+1. 亚阈值停转（<2s，最常见：GC、单次大 buffer font-lock 的一段、短同步 IO）——=slow_events= 里没有痕迹，
+   只能从采样表的小时聚合看出来；
+2. 真正的**等待型**调用（=sleep-for= / =accept-process-output= / 同步网络）不算停转，心跳照跑，
+   因此永远不产生 block 事件（也不该产生——主线程在让出 CPU）；
+3. GUI =redisplay= 阻塞在 batch 无法复现，未实测（真实卡顿源通常是 jit-lock / font-lock，已由 D 覆盖）。
+
+**结论**：心跳方案对「≥2s 的纯计算型停转」覆盖率 5/5（A3、B、B3、C、D 全部捕获）；
+对「1–2s 区间的停转」是相位相关的部分覆盖（B2 漏、G 捕获）；对「<1s 停转」与「等待型调用」零覆盖。
+时长精度为 0…1 个心跳间隔，且恒为高估。
+
 * 已知偏差（有意为之，不是 bug）
 
 | 偏差 | 具体表现 | 原因 / 处置 |
 |---|---|---|
 | =total_ms= ≠ =profiler-report= 的 total 列 | 本模块 total 按**栈内去重**（同一函数在一条栈里出现多次只算一次），内置报告按每帧累加 | TD-10。去重口径才符合「经过该函数的样本数」语义，避免深递归函数的 total 被重复帧放大。**不打算对齐**；跨工具对比时以 self 为准 |
 | =samples= 是 self 口径 | =samples= = 该函数作为 **leaf** 被采样的次数；只作中间帧出现的函数 =samples= 恒为 0 而 =total_ms= > 0 | 有意如此：占比与回归判定都按 self 口径，避免「出现得多但自己不耗时」的函数虚高。恒有 =self_ms = samples × 采样间隔=，全表 =samples= 求和 = 窗口内真实样本总数（可直接作分母） |
-| 阻塞事件的栈证据是「事后」的 | 主线程停转期间没有可靠 Lisp 回调，=slow_events(kind='block')= 的栈来自 SIGPROF 样本回溯 | I2 的必然结果。心跳只能证明「停转了 N 秒」，栈归因依赖采样，覆盖率待实测（TD-2） |
+| 阻塞事件没有栈、也没有命令 | =slow_events(kind='block')= 的 =stack_json= 与 =command= 一律为 NULL，只有 =context_json= 里的 mode / project | I2 的必然结果（停转期间没有可靠 Lisp 回调）。心跳只能证明「停了 N 秒」；定位要靠同一时间窗的 =hourly_functions= / =hourly_stacks= 采样。覆盖率与误差已实测（TD-2，见实测结论 10） |
 | 剖析期间会取走一个采集窗口的样本 | =el-chronos-profile-command= 在观测器运行时复用共享 profiler：先取走当前窗口（该窗口样本归剖析），跑完命令再取差分 | 共享模式下不能重入 =profiler-cpu-start=（见实测结论 2）。代价是剖析期间的那一个采集窗口在 =hourly_functions= 上偏少甚至为空；单命令剖析是低频手动操作，接受此偏差 |
 | 回归判定窗口与显示范围无关 | =el-chronos-analysis-regressions= 忽略 =RANGE=，窗口由 =el-chronos-regression-window-days= 决定 | 报告节标题动态标注真实天数（=回归（近 N 天）=），避免误读；dashboard 的表格标题写死「近 7 天 vs 前 7 天」同理 |
 | =db-size= 只看主文件 | 不含 =-wal= / =-shm=，WAL 未 checkpoint 时主文件偏小 | 见 [[file:operations.org][docs/operations.org]]「排障」；要收敛体积跑 =el-chronos-store-vacuum= |
@@ -257,7 +305,9 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
       每页行数（=el-chronos-dashboard-page-size=）与图表采样点（=el-chronos-dashboard-chart-points=），
       必要时改按需渲染。terminal 文本字符图的可读性同样待人工过一遍
 - [ ] 采样开销实测（TD-3）：10ms 常驻的 CPU 占比，是否需退到 20/50ms
-- [ ] 阻塞捕获覆盖率实测（TD-2）：timer / 进程过滤器 / redisplay 三类召回率
+- [x] 阻塞捕获覆盖率实测（TD-2）：5 个 ≥2s 停转场景 100% 捕获（命令内 / timer 回调 / 进程过滤器 /
+      font-lock / 混合），1–2s 区间相位相关，<1s 与等待型调用零覆盖；误差恒为高估且 ≤1 心跳间隔。
+      见实测结论 10，残余项转 TD-11
 - [ ] native-comp 下 =symbol-file= 的 =.eln= 归因链路实测（TD-1）
 - [ ] 实际采集一次真实使用日的行数统计，校验「86 万行/天」估算
 - [ ] 最终时序图（含真实 hook 执行顺序与 timer 抖动数据）
