@@ -1,9 +1,10 @@
 # 移除 dashboard，只保留 Web 形态可视化
 
 ## 当前状态
-- 阶段：Phase 3（Implement）· 进行中
-- 已确认：方案 ✅（用户 2026-10-24 确认）、计划 ✅（用户 2026-10-24 确认）、独立审查 ✅（plan-reviewer 2026-10-24 通过；经 3 轮修订，4 个 blocking 全部消除）
-- 下一步：T1 → T2 → T2b → T3/T4/T5 并行 → T6 → T7 全量验证与归档
+- 阶段：Phase 4（Review & Document）已完成，计划已归档
+- 已确认：方案 ✅（用户 2026-10-24 确认）、计划 ✅（用户 2026-10-24 确认）、独立审查 ✅（plan-reviewer 2026-10-24 通过，3 轮修订消除 4 个 blocking）
+- 结果：T1–T6 全部完成；`make check-parens` 全绿、`make test` 109 全绿（0 skipped）、`make lint` 零告警
+- 提交：代码+测试 `c30e32c`；文档见归档提交
 
 ## 目标
 
@@ -53,28 +54,28 @@
 
 ## 任务
 
-- [ ] **T1 代码层：删除 dashboard 模块 + 清理采集层交叉引用**
+- [x] **T1 代码层：删除 dashboard 模块 + 清理采集层交叉引用**
   删除 `el-chronos-dashboard.el`；修改 `el-chronos-collect.el` 三处文案：① `el-chronos-collect--suppress-block-p` 的 docstring（约 193–201 行）把「由 `el-chronos-report` 与 `el-chronos-dashboard` 在渲染期间 `let` 绑定」改为只提 `el-chronos-report`，并把「两个可视化模块各自 `defvar` 同名声明」改为「report 侧 `defvar` 同名声明」；② 约 152 行「出现在报告与 dashboard 里」→「出现在报告与 Web 页面里」；③ 约 162 行「报告 / dashboard 里可查」→「报告 / Web 页面里可查」。④ `el-chronos-analysis.el:12`「供 org 报告（T7）、ETAF 页面（T8）、Web API（T9）三方共用」→「供 org 报告（T7）、Web API（T9）两方共用」；⑤ `el-chronos-collect.el:655` 的 `--internal-buffer-p` docstring「这类 buffer（ETAF 挂载用的 ` *work*`、`with-temp-buffer` 的临时 buffer 等）」→「这类 buffer（渲染层挂载用的 ` *work*`、`with-temp-buffer` 的临时 buffer 等）」；⑥ `el-chronos-collect.el:673`「跳过**内部 buffer**（名字以空格开头，见 `--internal-buffer-p`）：ETAF 挂载、`with-temp-buffer` 等每次渲染都会新建这类 buffer」→ 去掉「ETAF 挂载、」，把 `el-chronos-collect.el:674` 的「（「打开 dashboard 要碰全部 buffer」的观感来源）」改为「（「每次渲染要碰全部 buffer」的观感来源）」。
   验收标准：`grep -rn "el-chronos-dashboard" --include=*.el /home/thomas/Workspace/el-chronos` 只剩 `test/el-chronos-ui-test.el`（T2 再清）；`emacs -Q --batch -L /home/thomas/Workspace/el-chronos -l el-chronos-web.el --eval '(princ "loaded ok")'` 退出码 0；并确认 `grep -rn "ETAF\|dashboard" --include=*.el /home/thomas/Workspace/el-chronos` 的剩余命中只有四类：① `test/el-chronos-ui-test.el`（T2 再清）；② `el-chronos-attrib.el:72` 与 `test/el-chronos-attrib-test.el:109–179` 的 `etaf-runtime` 归因示例（白名单，`.eln` 文件名与包名 fixture，与 ETAF 可视化无关）；③ `el-chronos.el:137/143` 的「Web dashboard」defcustom docstring 文案（白名单，Web 形态保留，必须保留）；④ `el-chronos-collect.el:99` 的 `dashboard-mode`（白名单，第三方 Emacs dashboard 包的 major-mode 名，属命令名归一的实测数据注释，与本模块 dashboard 无关）。
   （依赖：无）
 
-- [ ] **T2 测试层：删除 dashboard 用例并重命名测试文件**
+- [x] **T2 测试层：删除 dashboard 用例并重命名测试文件**
   在 `test/el-chronos-ui-test.el` 中按**节标题**定位（不要依赖固定行号）：删除「;;; dashboard：形态与内容（降级路径）」「;;; dashboard：`d` 键回归」「;;; dashboard：每页行数上限与重复打开不增长」「;;; dashboard 宽度策略与主题配色」四整节（共 24 个 `ert-deftest`）；删除 dashboard 专用夹具与辅助 `el-chronos-ui-test--with-fallback`、`el-chronos-ui-test--insert-block-event`、`el-chronos-ui-test--count-block-events`、`el-chronos-ui-test--event-buffer-name`、`(require 'el-chronos-dashboard)`，以及 `declare-function etaf-mount/-unmount/-runtime-for-buffer` 与 `ebox-buffer-mount/-mount-root/-node-children/-node-geometry/-node-classes` 共 8 行；**另外删除 `el-chronos-ui-test--walk-nodes` 辅助函数**（依赖 `ebox-node-children`，仅被 `dashboard-render-no-truncation` 用例调用，残留会导致 `make lint` 告警）；保留 9 个 web 用例与 `--with-temp-db` / `--with-server` / `--http` / `--parse-response` / `--json`；文件头注释改为「可视化层测试（内嵌 Web）」；最后 `git mv test/el-chronos-ui-test.el test/el-chronos-web-test.el`。
   验收标准：`make test` 输出 `Ran 107 tests, 107 results as expected, 0 unexpected, 0 skipped`（T2b 补 2 个用例后升到 109）；`make lint` 零告警；`grep -rn "dashboard" test/` 零命中；`grep -rn "etaf" test/` 仅剩 `test/el-chronos-attrib-test.el` 的 `etaf-runtime` 归因 fixture（白名单：那是 `.eln` 文件名示例，与 ETAF 可视化无关，不得删除）。
   （依赖：T1）
 
-- [ ] **T2b 补测试：`el-chronos-show-event` 的覆盖**
+- [x] **T2b 补测试：`el-chronos-show-event` 的覆盖**
   该命令保留在 `el-chronos-report.el`（公共 interactive 命令，`docs/api.org` 有记录），但其现有测试覆盖只来自被删的 dashboard 用例（`ui-test.el` 的 `dashboard-show-event-blocker` / `-requires-blocker`）。在 `test/el-chronos-report-test.el` 末尾（`;;; Web：500 分支与端口显示` 节之前或文件末尾均可）新增 2 个用例：① 事件存在 → `el-chronos-show-event` 渲染出 `*el-chronos-event*` buffer，内容包含 fixture 栈帧名；② 事件 id 不存在 → 抛 `user-error`。fixture 用 `el-chronos-test--insert-slow-event`（test-helper.el:130，插入后**不返回 id**），随后用 `el-chronos-test--scalar "SELECT last_insert_rowid()"` 取事件 id（report-test.el:90 已有同类用法）；`el-chronos-show-event` 的签名是 `(ID)`，事件不存在时需断言 `user-error`（核对 report.el:457 的实际行为再写断言）。
   验收标准：`make test` 总数由 107 变 **109**（这 2 个用例计入 T2 之后的基线）；两个用例名不以 `dashboard` 开头（用 `el-chronos-report-test-show-event-*`）；`make lint` 零告警。
   （依赖：T2）
 
-- [ ] **T3 用户文档同步：Readme.org + CHANGELOG.md**
+- [x] **T3 用户文档同步：Readme.org + CHANGELOG.md**
   `Readme.org`：删「可选：装 ETAF（要 Emacs 内可视化页面时）」整节；「使用（三种形态）」→「使用（两种形态）」并删 Emacs 内页面表格行；「常用快捷键（页面 buffer 内）」段落删除；「三种形态的约束一致」→「两种形态的约束一致」并删 ETAF 降级子项；依赖表删「Emacs 内页面」行；「当前状态」删 ETAF 页面字样并更新用例数；「它回答的 6 条目标」第 6 条改「两种形态：org 报告 / 浏览器 Web dashboard」。另外：「当前状态」节把「ETAF 页面」字样删除、把「ERT 103 用例」更新为「ERT 109 用例」；「技术债」那条删掉「仍待实测项：**ETAF 重绘性能 TD-5**」（保留 TD-7、TD-11）；「决策」那行去掉「ADR-0002 双形态可视化」或改指 ADR-0003（二选一，取更简单的一处改动），并把 ADR-0003 加入链接列表。
   `CHANGELOG.md`：在 `## [Unreleased]` 下新增 `### 移除` 段，记录：删除 `el-chronos-dashboard.el`（1382 行）与 ETAF 软依赖、5 个 dashboard defcustom（`page-size` / `max-rows` / `chart-points` / `chart-width` / `refresh-seconds`，已核实 dashboard.el:144/150/156/158/160）、24 个 ERT 用例、I9/I11 改写、测试文件更名为 `test/el-chronos-web-test.el`、技术债 TD-5 关闭。**历史条目一字不改**。
   验收标准：`grep -n "dashboard\|etaf\|ETAF" Readme.org` 仅剩 Web dashboard 相关表述；CHANGELOG 新增段存在且历史段未变。
   （依赖：T2）
 
-- [ ] **T4 技术文档同步：docs/ui.org + api.org + architecture.org + operations.org**
+- [x] **T4 技术文档同步：docs/ui.org + api.org + architecture.org + operations.org**
   `docs/ui.org`：删「ETAF 页面（`M-x el-chronos-dashboard`）」整节（含组件树、10 项能力、快捷键、主题配色、宽度策略、降级规则、ETAF 实测踩坑清单）；「三形态总览」→「两形态总览」；「性能注意」节删 ETAF 重绘相关段与外链引用；「关联」节去掉 ETAF/ADR-0002 双形态表述。
   `docs/api.org`：概览「8 个模块」→「7 个模块」并删页面模块表格行；删「页面模块（`el-chronos-dashboard.el`）」整节（命令、可测纯函数、defcustom 三张表）；「内部函数约定」「关联」节去 dashboard 引用。
   `docs/architecture.org`：分层表删「可视化 dashboard」行；「数据流」句改为「report / web（两种呈现形态）」；重写「可视化数据流」节（删 Emacs 侧 ETAF 段，保留公共前半段 + Web 侧）；「降级矩阵（I11）」删 ETAF 行；「实测结论 9」把「报告生成 / dashboard 渲染」改成只提报告生成，并删 `el-chronos-dashboard--without-block-events` 表述（保留 report 侧三层防护描述）；「已知偏差」表中 dashboard 表格标题那条改为只提 Web/报告口径；「待补」节删 ETAF 性能与 dashboard 每页行数相关行。
@@ -82,7 +83,7 @@
   验收标准：四个文件 `grep -c "el-chronos-dashboard"` 均为 0；`grep -n "ETAF" docs/*.org` 零命中；`grep -n "dashboard" docs/ui.org docs/api.org docs/architecture.org docs/operations.org` 的剩余命中**只能是「Web dashboard」这一合法表述**（不得残留「dashboard 侧」「打开 dashboard」这类指代 Emacs 页面的写法）。
   （依赖：T2）
 
-- [ ] **T5 决策工件：ADR + decisions.md + tech-debt.md**
+- [x] **T5 决策工件：ADR + decisions.md + tech-debt.md**
   新增 `docs/adr/0003-web-only-visualization.md`：状态 Accepted、日期 2026-10-24；背景（dashboard 的成本：ETAF 软依赖 + 双渲染路径 + 10 条踩坑 + 内存/重绘风险 TD-5 + 24 用例）；决策（只保留 Web + org 报告两形态，删除 dashboard 模块与 ETAF 依赖）；后果（正/负）；被否决替代方案表（保留 dashboard 双形态、保留 dashboard 但不再维护、把 ETAF 知识迁到本仓库附录）；关联 ADR-0002（Superseded）。
   `docs/adr/0002-dual-visualization.md`：仅改标题下「状态」行为 `**状态**：Superseded by ADR-0003（2026-10-24）`，正文一字不改。
   `docs/adr/0001-observer-architecture.md`：**保留原文不改**（其「技术债」清单是时点快照，TD-5 的关闭由 ADR-0003 与 `tech-debt.md` 承载）；在 ADR-0003 的「关联」节注明这一点。
@@ -91,10 +92,21 @@
   验收标准：三个 ADR 文件存在且状态正确；`decisions.md` 新增行在表内；`tech-debt.md` 中 TD-5 标注已关闭且无残留「T8 完成后…实测」的未完成措辞。
   （依赖：T2）
 
-- [ ] **T6 AGENTS.md 全量同步（含实测基线回填）**
+- [x] **T6 AGENTS.md 全量同步（含实测基线回填）**
   项目概述：8 个源码模块 → 7 个；「ETAF 可视化页面」相关描述删除。目录结构表：删 `el-chronos-dashboard.el` 行；测试表把 `el-chronos-ui-test.el` 改为 `test/el-chronos-web-test.el` 并更新用例数（web 9；总数 109）；总行数 8289 → 实测值。编码约定：删「`el-chronos-dashboard.el` 软依赖 `etaf` + `etaf-ui`」整段，只留核心模块零第三方 + web 零依赖两档；注释与降级说明去 ETAF。不变量清单：I9 / I11 按本计划「不变量改写」表逐字改写；I8 / I10 不动。已知边界表：删「dashboard 体量」行与「ETAF 有 10 条坑」行；「报告 / dashboard 自观测抑制」行改为只提报告与 Web；「仍待实测」行去掉 TD-5。验证入口：「可视化验收（T8 / T9）」节删 dashboard 的 `emacs -Q --batch -l el-chronos-dashboard.el` 命令，只留 Web 两条；基线段落改为实测的 109 用例并重算分布（report 24 / web 9 / collect 26 / analysis 15 / store 14 / attrib 21 = 109）。
   验收标准：`grep -c "dashboard" AGENTS.md` 只剩 Web dashboard 相关表述（`el-chronos-dashboard` 为 0）；不变量 I9/I11 与 decisions.md / ADR-0003 口径一致；用例数与 `make test` 实测一致。
   （依赖：T2，需 T2 实测结果）
+
+## 执行记录与偏差
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| T4 拆分 | 单个 T4（4 份文档） | T4a（ui.org + api.org）与 T4b（architecture.org + operations.org）并行 | 单任务编辑量 >25 步，按粒度规则拆分 |
+| T2 用例数 | 107 | 107 | 与预期一致（131 − 24） |
+| T2b | 新增 2 个 `el-chronos-show-event` 用例 | 完成；额外覆盖「非法 id 非数字」分支 | 该分支真实存在（`(numberp id)` 判定） |
+| T6 白名单 | `grep el-chronos-dashboard` 应 = 0 | 实际命中 1 行（I9 禁令原文） | **计划自相矛盾**：I9 改写文本必须指名 ETAF 与旧模块名才能构成禁令，故白名单化处理 |
+| 新增 TD-12 | 计划未含 | 已补 | T4b 核查发现 `el-chronos-web.el` 从未绑定抑制变量，Web 重查询可能被心跳记为 block 事件（既有缺口，非本次引入） |
+| 额外修正 | 计划未含 | AGENTS.md 内置库清单删 `tabulated-list`、补 web 的 `json`/`url-util`；operations.org 技术债清单更新（TD-5/TD-9 移入已关闭，补 TD-8） | 文档与代码同步（doc-code 一致性） |
 
 ## 文档清单
 

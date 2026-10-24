@@ -1,6 +1,6 @@
 # ADR-0002：双形态可视化（Emacs 内 ETAF 页面 + 浏览器 Web dashboard）
 
-- **状态**：Accepted（实施完成，2026-10-24）
+- **状态**：Superseded by [ADR-0003](0003-web-only-visualization.md)（2026-10-24）
 - **日期**：2026-10-24（决策）；2026-10-24（实施结果回填）
 - **决策者**：用户（方案追加确认）
 - **关联**：`openspec/completed/el-chronos-core.md`「可视化设计」节与不变量 I8–I11；`openspec/decisions.md` 对应行；`docs/architecture.org`「可视化数据流」「实测结论」；`docs/schema.org`（`hourly_stacks`）；`docs/ui.org`（ETAF 踩坑清单、13 条路由）；`docs/api.org`（对外接口）

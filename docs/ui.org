@@ -1,281 +1,28 @@
-#+TITLE: el-chronos 可视化界面（ETAF 页面 / Web dashboard / org 报告）
+#+TITLE: el-chronos 可视化界面（浏览器 Web dashboard / org 报告）
 #+AUTHOR: thomas
 #+LANGUAGE: zh-CN
 #+OPTIONS: toc:3 num:nil
 
 #+BEGIN_QUOTE
-本文件描述三种呈现形态的结构、数据来源、交互、降级规则与实测踩坑清单。
+本文件描述两种呈现形态的结构、数据来源、交互与降级规则。
 数据口径与字段定义以 [[file:../docs/schema.org][docs/schema.org]] 为准，分层与时序以
 [[file:architecture.org][docs/architecture.org]] 为准，对外函数签名以 [[file:api.org][docs/api.org]] 为准。
 所有形态都只调 =el-chronos-analysis= 的查询层（本层 SQL 只写在 =el-chronos-analysis.el=），
 **呈现层不写 SQL、不写库、不改采集行为**。
 #+END_QUOTE
 
-* 三形态总览
+* 两形态总览
 
 | 形态 | 入口 | 产物 | 定位 | 依赖 |
 |---|---|---|---|---|
 | org 报告 | =M-x el-chronos-report= / =el-chronos-weekly-report= | =*el-chronos-report*= buffer / org 文件 | 归档、版本间 diff、导出 CSV/JSON | 零第三方 |
-| Emacs 内页面 | =M-x el-chronos-dashboard= | =*el-chronos*= buffer（ETAF 挂载） | 日常顺手看一眼、快捷键切范围、行级下钻 | 软依赖 =etaf= + =etaf-ui= |
 | 浏览器 Web dashboard | =M-x el-chronos-web-start= | =http://127.0.0.1:8787/= | 深度分析：多图表、搜索排序分页、火焰图、多会话对比 | 零第三方（内置 =make-network-process=） |
 
 共同约束：
 
-- **只读**：三者都只查库。Web 路由表里没有任何写入 / 执行入口（I8）。
+- **只读**：两者都只查库。Web 路由表里没有任何写入 / 执行入口（I8）。
 - **数据同源**：数字必然一致，不存在「两边对不上」；新增一种形态不需要改采集与存储。
-- **降级可见**（I11）：ETAF 缺失 → =tabulated-list= 简版；terminal frame → 文本字符图；
-  端口占用 → =user-error= 且不换端口。任何一种失败都不影响采集与其他形态。
-
-* ETAF 页面（=M-x el-chronos-dashboard=）
-
-** 组件树
-
-#+BEGIN_SRC text
-etaf-mount  buffer *el-chronos*
-└── el-chronos-dashboard-app            ; 根组件：:setup 提供主题调色板，
-    │                                   ; :bindings 持有 range / page / selected，
-    │                                   ; 根 column 带 :background-color / :color（主题色）
-    ├── etaf-panel "el-chronos · 性能与用法观测器"
-    │   ├── row.el-chronos-toolbar
-    │   │   ├── etaf-button "1 天" / "7 天" / "30 天"   ; :on-press → --range-1d/-7d/-30d
-    │   │   ├── etaf-button "刷新"                      ; :on-press → el-chronos-dashboard-refresh
-    │   │   └── etaf-button "上一页" / "下一页"          ; → --previous-page / --next-page
-    │   └── etaf-label  ; --status-line：范围 · DB 大小 · 采集状态 · 采样间隔 · 更新时间
-    ├── etaf-panel "概览（6 指标）"
-    │   └── etaf-tile-grid :rows 2 :columns 3 :cell-width 24 :cell-height 3
-    │       ├── :cell-text  → --metric-text   ; 非图形 frame
-    │       └── :cell-image → --metric-image  ; 图形 frame：etaf-ui-svg-rect + -text
-    ├── etaf-panel "图表"
-    │   └── (3 × el-chronos-dashboard-chart)   ; 自定义图表组件
-    │       ├── kind=trend   → --trend-body   ; 多折线（etaf-ui-svg-path）
-    │       ├── kind=bars    → --bar-chart    ; 横向条形（etaf-ui-svg-rect）
-    │       └── kind=heatmap → --heatmap      ; 热力格（etaf-ui-svg-rect + -text）
-    │       图形 frame：etaf-ui-svg-image 包成 (image :type svg …) → image Host
-    │       非图形 frame：(text (expr (--to-text-bars …))) → 字符图
-    ├── 5 × etaf-panel（数据区，由 --tables 逐节生成）
-    │   └── N × el-chronos-dashboard-card           ; 卡片列表，:on-press → --drill
-    │       ├── box  第一行：主键全文本（命令名 / 函数名 / 阻塞命令，加粗）
-    │       └── box  第二行：其余字段「标签 值」串联（次要色）
-    │       两行都是 :wrap-mode word + :width stretch → 按窗口宽度折行，不截断
-    │       慢命令 TOP / 热点函数 TOP（含包归属）  → 分页（el-chronos-dashboard-page-size，默认 20 行）
-    │       阻塞事件 / 回归 / 会话                 → 不分页
-    └── etaf-dialog :open (etaf-value selected-state) :on-close --clear-selection
-        ├── text    : --drill 生成的详情正文
-        └── etaf-label : 优化建议（--suggestions）
-#+END_SRC
-
-组件定义式（=el-chronos-dashboard--component-forms=）是**数据**，由 =--define-components= 在
-ETAF 可用时 =eval= 一次；挂载形式同样走 =eval=。原因见下文踩坑清单第 9 条。
-
-** 10 项能力与数据来源
-
-| # | 能力 | 数据来源（analysis 函数） | 渲染载体 |
-|---|---|---|---|
-| ① | 概览卡片 6 指标（命令数、阻塞总时长、慢命令数、采样数、DB 大小、启动耗时） | =el-chronos-analysis-overview= + =el-chronos-analysis-db-size= | =etaf-tile-grid= 2×3 |
-| ② | 慢命令排行 | =el-chronos-analysis-slow-commands= RANGE 60 | 卡片列表（=el-chronos-dashboard-card=，分页 20） |
-| ③ | 热点函数排行（含包归属） | =el-chronos-analysis-top-functions= RANGE 60 | 卡片列表（分页 20） |
-| ④ | 包 / 模块占比条形图 | =el-chronos-analysis-package-breakdown= RANGE 12 | =etaf-ui-svg-rect= + =etaf-ui-svg-image= |
-| ⑤ | 趋势折线（样本量 / 慢命令 / 阻塞事件） | =el-chronos-analysis-trend= RANGE | =etaf-ui-svg-path= + =etaf-ui-svg-image= |
-| ⑥ | 阻塞事件列表与详情 | =el-chronos-analysis-blocking-events= RANGE 20 + =el-chronos-analysis-event= ID | 卡片列表 + =etaf-dialog=（=d= 键看完整栈） |
-| ⑦ | 用法热力图（命令 × 时间桶） | =el-chronos-analysis-heatmap= RANGE 8 | =etaf-ui-svg-rect= 网格 |
-| ⑧ | 回归列表（近 N 天 vs 前 N 天） | =el-chronos-analysis-regressions= RANGE 20 | 卡片列表 |
-| ⑨ | 会话列表与启动耗时 | =el-chronos-analysis-sessions= RANGE | 卡片列表 |
-| ⑩ | 时间范围切换与下钻 | 上述全部 + =el-chronos-dashboard--drill= | =etaf-button= + =etaf-dialog= |
-
-数据快照在 =--load-snapshot= 里一次取齐（=:overview= =:slow= =:functions= =:packages= =:trend=
-=:heatmap= =:blockers= =:regressions= =:sessions=），切范围 / 翻页 / 下钻都只重绘、不重复查库；
-刷新（=g=）才重新取快照。
-
-** 快捷键
-
-| 键 | 命令 | 行为 |
-|---|---|---|
-| =1= | =el-chronos-dashboard-range-1d= | 切最近 1 天（页码归零、关闭弹窗） |
-| =7= | =el-chronos-dashboard-range-7d= | 切最近 7 天 |
-| =3= | =el-chronos-dashboard-range-30d= | 切最近 30 天 |
-| =g= | =el-chronos-dashboard-refresh= | 重新取数并重绘 |
-| =r= | =el-chronos-dashboard-toggle-auto-refresh= | 切换自动刷新（间隔 =el-chronos-dashboard-refresh-seconds=，默认 30s） |
-| =d= | =el-chronos-dashboard-show-event= | 在当前下钻选中项是阻塞事件时，于 =*el-chronos-event*= 显示完整栈 |
-| =q= | =el-chronos-dashboard-quit= | 取消自动刷新并关闭页面 |
-
-键位在 =--install-keys= 里用 =local-set-key= 装到页面 buffer 上；ETAF 组件内的按钮用
-=:on-press= 调同一批命令。翻页走顶栏按钮，不占快捷键。
-
-** 主题与配色（跟随当前 Emacs 主题）
-
-页面**不使用固定配色**：所有颜色来自「当前 Emacs 主题」的两条通道，界面在深色 / 浅色主题
-下自动换色（实测 2026-10-24，Emacs 31.1，ETAF 已装）。
-
-| 通道 | 实现 | 覆盖范围 | 依据 |
-|---|---|---|---|
-| ① ETAF Theme（主通道） | 根组件 =:setup= 调 =(etaf-theme-provide (--theme-palette))= | 面板、按钮、表格边框、文字色等**所有内置组件**的语义 token | =etaf-ui= 每个组件都从继承的 Theme 取 =:ui-panel-bg= / =:ui-fg= / =:ui-table-border= 等 token，取不到才回落到包内固定浅色调色板（=#FFFDF8= 等） |
-| ② 根节点属性 + face remap | 根 =column= 带 =:background-color (--theme-background)= / =:color (--theme-foreground)=；挂载后 =--apply-theme-canvas= 调 =face-remap-set-base 'default= | 面板之外的行尾空白、buffer 未被文字覆盖的列、默认文字色 | =etaf-mount= **只接受** =:viewport-width= / =:viewport-height= / =:observer=，没有 =:background= / =:foreground=；=etaf-app-open= 虽有这两个参数，但它自带 buffer / 窗口 / 模式行整套语义，与本页面的挂载方式不兼容 |
-
-=--theme-palette= 的取值映射（全部经 =face-attribute … nil t= 读，主题未定义则跳过该键）：
-
-| ETAF token | 取自 |
-|---|---|
-| =:ui-bg= / =:ui-fg= | =default= face 的 :background / :foreground |
-| =:ui-panel-bg= | =default= 背景往对比方向偏移 4（=color-darken-name= / =color-lighten-name=，按 =background-mode=） |
-| =:ui-panel-fg= / =:ui-button-ghost-fg= | =default= 前景 |
-| =:ui-panel-border= / =:ui-border= / =:ui-table-border= | 优先 =shadow= 前景，其次 =mode-line= 背景，最后 =default= 前景 |
-| =:ui-muted-fg= | =shadow= 前景 |
-| =:ui-accent= / =:ui-button-secondary-fg= / =:ui-info-fg= | =link= 前景 |
-| =:ui-button-primary-bg= | =highlight= 背景（缺省回落到 accent） |
-| =:ui-success-fg= / =:ui-warning-fg= / =:ui-danger-fg= | =success= / =warning= / =error= face 前景 |
-
-约束（都是踩过坑的）：
-
-- **只放解析出颜色串的键**：给某个 token 一个 =nil= 值会让组件把 nil 当颜色用，渲染期报非法颜色；
-  缺键时 ETAF 自动回落到包内默认调色板。
-- **=unspecified-bg= / =unspecified-fg= 必须过滤掉**：=emacs -Q --batch= 的 =default= face 就是这两个值，
-  直接传下去等于把垃圾当颜色。
-- 主题切换后重绘即可（=g=）；颜色在**渲染期**读取，不需要重启页面。
-
-实测值（同一份数据、同一页面，只换 =default= face）：
-
-| 主题 | default face 背景 | 页面 =default= remap 背景 | 面板节点 =ebox-cs-bg= |
-|---|---|---|---|
-| 深色 | =#202634= | =#202634=（一致） | =#0a3d0a3dffff=（=#202634= 提亮 4） |
-| 浅色 | =#fdf6e3= | =#fdf6e3=（一致） | =#f5c1f5c1f5c1=（=#fdf6e3= 压暗 4） |
-
-** 宽度策略与不截断（卡片布局）
-
-两条目标互相拉扯：**不溢出**（任何节点不越过窗口右边界）与**不截断**（命令名 / 函数名 /
-包名 / 路径必须完整可见）。ETAF 表格做不到后者，故数据区改用卡片。
-
-=etaf-table= 为什么不行（读 =etaf-ui-table.el= + 实测复核）：
-
-| 列宽语义 | 对齐 | 超长单元格 | 结论 |
-|---|---|---|---|
-| 整数 N（=:width 30=） | 严格对齐（走「定宽文本」快路径，整行一个 padded Text Host） | =etaf-ui--table-fit-text= 调 =truncate-string-to-width= 补 =…= | 违反「不截断」 |
-| =(fr N)= 权重 | **不对齐**：每行各自算 track（行容器 shrink-wrap），表头与数据行、数据行彼此起始位置都不同 | =etaf-ui--table-cell= 固定 =:overflow hidden :wrap-mode none=，直接裁掉（连 =…= 都没有） | 两罪并罚 |
-| =(fr N)= + 单元格自定义 =:cell= 返回 =:min-width (px 0)= 的可换行 box | 仍不对齐（min-width 压不住 grid 的 min-content 差异） | 文本能换行（=wrap-mode word= 生效），行高自适应 | 可换行但列不对齐 |
-
-实测（viewport 60 列，同一份 6 行数据）：
-
-#+BEGIN_SRC text
-修复前（etaf-table 定宽列）：截断 12 处 `…'，60 列下 5 个节点越过窗口，长命令名不可见全文
-修复后（卡片 + wrap）    ：截断 0 处，溢出节点 0，长命令名完整（折行后仍完整）
-#+END_SRC
-
-当前实现（=--card= + =el-chronos-dashboard-card=）：
-
-- 每条记录一张卡片：第一行**主键全文本**（命令名 / 函数名 / 阻塞事件的命令；会话用启动时间），
-  第二行其余字段「标签 值」按 = · = 串联；两行都 =:width 'stretch :wrap-mode 'word=，
-  超出窗口自动折行，行高自适应，**不做任何字符省略**。
-- 数据文本**禁止**经过 =--fit-text=：该函数只用于标题 / 图表标签（=--to-text-bars= 的图例列与
-  =--fit-text-chart= 的逐行收敛）。
-- 仍然按窗口宽度计算的只有：图表宽度（=--chart-width=）、tile 单元格宽度（=--tile-cell-width=，
-  ETAF 会校验单元格文本必须 ≤ 它）、下钻弹窗宽度（=--dialog-width=）、文本图逐行宽度
-  （=--fit-text-chart=）。内容宽度 = 窗口列数 − 面板左右占位 6 − 余量 1（=--content-cells=）。
-- 宽度来源是 ETAF viewport（=etaf-runtime-viewport=，渲染期读取即建立响应式依赖，窗口缩放会触发
-  重渲染），取不到时回退 =(window-body-width)=，再回退 80 列。
-
-实测四种宽度（同一份含 30+ 字符命令名的数据，viewport = 窗口列数）：
-
-| 窗口列数 | 截断（=…=） | 超宽行 | 溢出节点 | 最宽行 | 长命令名可读 |
-|---|---|---|---|---|---|
-| 60 | 0 | 0 | 0 | 58 | 是（折行） |
-| 80 | 0 | 0 | 0 | 78 | 是（折行） |
-| 120 | 0 | 0 | 0 | 117 | 是 |
-| 160 | 0 | 0 | 0 | 121 | 是 |
-
-** 降级规则
-
-| 场景 | 判据 | 行为 |
-|---|---|---|
-| ETAF 缺失 | =(require 'etaf nil t)= / =(require 'etaf-ui nil t)= 任一失败 | =display-warning= 提示安装 + =tabulated-list= 简版页；简版**含慢命令表与热点函数表两张表**并支持 =1=/=7=/=3= 切范围，不是空壳（I9） |
-| 非图形 frame（batch / terminal） | =--graphic-p= 为 nil（=display-graphic-p= 且 =image-type-available-p 'svg=） | 图表组件返回 =--to-text-bars= 的字符图（=·= / =░= / =▒= / =▓= / =█=），不报错（I11） |
-| 数据库打不开 / 查询失败 | analysis 返回 nil（已 =display-warning=） | 各区块显示「（无数据）」；=--load-snapshot= 再包一层 =condition-case= 双保险 |
-| 页面 buffer 被 kill | =--auto-refresh= 发现 buffer 不存在 | 自动取消 timer，零残留 |
-
-简版页（=tabulated-list=）一个 buffer 只支持一张表，故用区块标题行（=▸ 慢命令 TOP= /
-=▸ 热点函数 TOP=）把两张表放进同一张表的连续行里。
-
-** ETAF 实测踩坑清单（T8 实测，2026-10-24，Emacs 31.1）
-
-1. **组件不是函数**（=fboundp= 为 nil）
-   现象：=etaf-define-component= 定义的组件注册在 ETAF 的组件表里，不是 fboundp 可见的函数，
-   用 =fboundp 'el-chronos-dashboard-app= 探测恒为 nil。
-   应对：探测能力用 =etaf-mount= / =etaf-ui-svg-image= 的存在性（=el-chronos-dashboard-etaf-available-p=
-   只看 feature 与组件 API 是否就位），组件间调用用 =etaf-view= 形式，不用 =funcall=。
-
-2. **表格组件名是 =etaf-table=，不是 =etaf-ui-table=；=:row-key= 必填**
-   现象：计划与 ADR 早期写作 =etaf-ui-table=，实际注册名是 =etaf-table=；缺 =:row-key= 时
-   行身份无法稳定，=:on-row-press= 拿不到正确行。
-   应对：统一用 =etaf-table=，并显式给 =:row-key (lambda (row) (alist-get :key row))=。
-
-3. **=text= 内非字面量必须写 =(expr FORM)=**
-   现象：=text= 只接受字面字符串 / 子组件；直接写 =(text (--to-text-bars …))= 会被当 DSL 语法，
-   报语法错。
-   应对：要插入求值结果一律 =(text (expr FORM))=。同理在组件树中要 mapcar 生成子树，
-   也要写成 =(expr (mapcar …))=。
-
-4. **列表属性必须 =(quote ...)=**
-   现象：=:selected= 传 plist 时不加 =quote=，ETAF 把列表当代码求值，报 =void-function :title=。
-   应对：=:selected (quote ,selection)=；任何「数据型列表」属性同理。
-
-5. **重挂同一 buffer 必须先 =etaf-unmount=**
-   现象：反复 =etaf-mount= 到同一个 =*el-chronos*= 而不卸载，ETAF 保留上一实例的 =:bindings=，
-   弹窗与状态栏停在旧值（切范围看似无效）。
-   应对：=--render-etaf= 里先 =(when-let* ((runtime (etaf-runtime-for-buffer buffer))) (etaf-unmount runtime))=。
-
-6. **=:bindings= 必须用 =(etaf-value x)= 读**
-   现象：直接引用 binding 符号（如 =page-state=）读到的是 ref 对象本身，不是当前值。
-   应对：读状态一律 =(etaf-value page-state)= / =(etaf-value selected-state)=；写状态用
-   =--set-range= / =--set-page= 改 plist 后重绘（不直接 setf ref）。
-
-7. **无 polyline 图元，折线用 =etaf-ui-svg-path=**
-   现象：=etaf-ui-svg= 只提供 =rect= / =circle= / =line= / =path= / =text= / =group=，
-   没有 =polyline=。
-   应对：折线生成 =d= 属性（=--polyline-d=：=M x y L x y …=）再走 =etaf-ui-svg-path=；
-   =--sparkline= / =--trend-body= 都按此实现。
-
-8. **batch 下 =etaf-mount= 可正常挂载并产生文本**
-   现象：=emacs -Q --batch= 里 =etaf-mount= 能挂载并把组件树渲染成 buffer 文本
-   （=--graphic-p= 为 nil，图表走字符图路径）。
-   应对：ERT 可以直接断言页面文本（=test/el-chronos-ui-test.el= 的 ETAF 用例即由此而来），
-   无需真实 GUI；但 SVG 图元的断言走纯函数（=--bar= / --scale= / --sparkline= / --bar-chart= /
-   --heatmap= / --to-text-bars=）。
-
-9. **宏的软依赖：顶层写 =etaf-define-component= 会让 =make lint= 误编**
-   现象：=make lint= 用 =emacs -Q --batch -L .= 字节编译，ETAF 不在 load-path 时
-   =etaf-define-component= / =etaf-view= 这两个宏无法展开，宏调用被编成普通函数调用，
-   运行期即使 ETAF 在位也会失败（=void-function etaf-view=）。
-   应对：组件定义式与挂载形式都退化为**数据**并用 =(eval FORM t)= 延迟展开：组件定义放
-   =--component-forms=，挂载写 =(eval `(etaf-view …) t)=。代价是组件体不做编译期检查，
-   故组件体只调用本文件已定义好的函数。
-
-10. **=etaf-tile-grid= 的 =:cell-text= 必须单行且不超 =:cell-width=**
-    现象：=tile-grid= 会校验单元格文本宽度，多行或被折行的文本会触发布局校验失败 / 显示错乱。
-    应对：=--metric-text= 只产出「名称 值」短格式单行（=:cell-width 24= / =:cell-height 3=），
-    换行由布局负责；图形 frame 下改走 =:cell-image=（SVG 指标卡），文本路径仅用于非图形 frame。
-
-11. **=etaf-mount= 没有 =:background= / =:foreground=，背景要自己 remap**
-    现象：以为 =etaf-mount= 像 =etaf-app-open= 一样接受背景参数，传进去被当作未知选项；
-    而 =ebox--sync-canvas=（把根节点背景 remap 到 =default= face）只在**显示时**执行，
-    batch / 首帧前读不到。
-    应对：背景走两条通道 —— 根节点 =:background-color= / =:color=（主题色）+ 挂载后显式
-    =(face-remap-set-base 'default …)=（=--apply-theme-canvas=，与 =etaf-app--paint-canvas= 同机制）。
-    用 =set-base= 而不是 =add-relative=：重复渲染幂等，不会叠加。
-
-12. **组件 prop 名为 =:key= 会被拒绝；prop 里写 =(expr …)= 会变成「调用 expr」**
-    现象：=(etaf-define-component … (&key head detail key press))= 报
-    "Component prop key is reserved by the View grammar"；prop 位置写 =:on-press (expr press)=
-    时渲染期报 =void-function (expr)=（prop 的非字面量原样变成 hole 的 thunk）。
-    应对：prop 名避开 =:key= / =:ref= 等 View 语法保留字（本项目用 =head= / =detail= / =press=）；
-    prop 位置直接写变量名或函数调用，=(expr FORM)= 只用于 =text= 之类**子节点**位置。
-
-13. **=etaf-theme-provide= 只能在组件 =:setup= / 渲染上下文中调用**
-    现象：在顶层或 =:view= 里调会报 "ETAF provide requires Component setup or render context"。
-    应对：放在根组件的 =:setup=（本项目 =--define-components= 中第一次渲染时求值），子树内所有
-    内置组件的 token 解析自动命中；无需逐节点设色。
-
-14. **=etaf-table= 的单元格是 =:overflow hidden :wrap-mode none=**
-    现象：想靠 =:cell= 返回可换行 box 保住长文本，结果列仍不对齐（每行独立 track），且窄窗口下
-    被裁切。详见「宽度策略与不截断」一节。
-    应对：数据行改用卡片（=column= + =:wrap-mode 'word=）；表格只适合「短字段 + 定宽对齐」。
+- **降级可见**（I11）：端口占用 → =user-error= 且不换端口，不静默失败。任何一种失败都不影响采集与其他形态。
 
 * 浏览器 Web dashboard（=M-x el-chronos-web-start=）
 
@@ -376,77 +123,29 @@ ETAF 可用时 =eval= 一次；挂载形式同样走 =eval=。原因见下文踩
 - =el-chronos-report= 交互选范围（默认 =7d=），生成只读 org buffer。
 - =el-chronos-weekly-report= 把近 7 天报告写入 =chronos-weekly.org=（默认落运行时状态目录）。
 - =el-chronos-export= 导出 CSV（=# section:= 分块）或 JSON（单对象，含 overview 与各明细区块）。
-- =el-chronos-show-event= 展示单条慢事件完整栈与 context（=*el-chronos-event*=，dashboard 的 =d= 键复用）。
+- =el-chronos-show-event= 展示单条慢事件完整栈与 context（=*el-chronos-event*= 只读 buffer）。
 - =el-chronos-profile-command= 对单条命令做 1ms 高精度剖析（不查库，实时跑一次）。
 
 * 性能注意
 
 | 项 | 取值 | 控制手段 |
 |---|---|---|
-| 表格分页 | dashboard 每页 =el-chronos-dashboard-page-size= 20 行；Web 每页 10 行 | 单页行数固定，避免一次塞入全部排行拖慢重绘（TD-5） |
-| 每页行数与内存 | 5 张表**都**受 =el-chronos-dashboard-page-size= 约束（分页表按页取，不分页表只取首页）；快照层另有 =el-chronos-dashboard-max-rows= 200 行上限 | 见下节「每页行数与内存」：行数直接决定 ETAF 保留量与单次渲染的 RSS 峰值 |
-| 图表采样点 | dashboard =el-chronos-dashboard-chart-points= 60 点（=--downsample= 等距抽稀）；图表逻辑宽 =el-chronos-dashboard-chart-width= 72 | 采样点有上限，趋势桶数由 analysis 决定（24/168/720） |
-| 数据快照 | 一次挂载取齐 9 组数据；切范围/翻页/下钻只重绘 | 不在交互路径上重复查库 |
-| ETAF 重绘 | 每次重绘重建整棵组件树（先 =etaf-unmount=） | 已知代价：大数据量下的重绘耗时尚**未实测**（TD-5）；超 1s 则下调每页行数与采样点，必要时改按需渲染 |
+| Web 列表分页 | 前端每页 10 行（状态对象 =per=） | 单页行数固定，避免一次把全部排行塞进 DOM |
 | Web 查询 | 列表 =limit= 默认 20、上限 1000；堆栈默认 50 | 单线程串行，长查询会占主线程 |
-| Web 前端 | 一次取数 + 本地渲染；自动刷新默认 30s | 关掉自动刷新即零轮询；搜索/排序/分页均在本地数据上做 |
+| Web 请求上限 | 单请求累积 16384 字节（=el-chronos-web--max-request-bytes=） | 超出返回 413，防畸形请求无限占内存 |
+| Web 前端 | 一次取数 + 本地渲染；自动刷新默认 30s | 关掉自动刷新即零轮询；搜索 / 排序 / 分页均在本地数据上做 |
+| org 报告 | 慢命令 / 热点函数 / 阻塞 / 回归 / 会话各 20 行；趋势最近 48 桶；栈 10 行 | 报告一次成型、无增量渲染；重查询期间抑制阻塞判定，避免把报告耗时记成假阻塞 |
 
-** 每页行数与内存（2026-10-24 实测，Emacs 31.1）
+** 待实测
 
-**症状**：打开 dashboard 数次后进程内存暴涨，隔离实例（=elisp-test=）OOM。
-
-**量化**（batch + ETAF，fixture = 3000 会话 / 2 万命令 / 4800 函数行 / 6000 阻塞事件，
-每次 =M-x el-chronos-dashboard= 后先 =garbage-collect= 再读 =garbage-collect= 的 USED 与
-=/proc/self/status= 的 VmRSS）：
-
-| 指标 | 修复前（每渲染） | 修复后（每渲染） |
-|---|---|---|
-| 交给 =etaf-table= 的行数 | 2161（=:sessions= 无行数上限 2101 行 + 其余 60） | 80（5 表各 ≤ 20） |
-| =--tables= 的 =prin1= 长度 | 512 KB | 19.7 KB |
-| 快照 =prin1= 长度 | 225 KB | 40 KB |
-| GC 后存活 cons | 92 万 → 361 万（+62 万/次，线性不收敛） | 24.7 万 → 38 万（+3.3 万/次，采样窗口 flush 后回落到 24.7 万） |
-| VmRSS | 133 MB → 304 MB（+26 MB/次） | 103 MB → 105 MB |
-| 单次渲染耗时 | 25–34 s | 4–5 s |
-
-**当前渲染单位**（2026-10-24 起）：行单位是卡片（=el-chronos-dashboard-card=）而不是
-=etaf-table= 的行，但同样是**保留式 Host**（每卡一个 column Host + 两个 box），故
-=el-chronos-dashboard-page-size= 这条上限仍然必须生效 —— 换布局不减少保留对象数。
-
-**主因**（证据链，逐层排除）：
-1. =el-chronos-analysis-sessions= 按时间窗查询且**无行数上限**（一年重启数千次即数千行），
-   而 5 个表区块中 =:sessions= 标的是「不分页」，于是 =--tables= 把**整表**构造好交给 ETAF。
-1. =etaf-table= 用 =:for (item ...)= 逐行创建**保留式行组件**（每行一个 row Host + 单元格
-   子组件 + 行 key），行数直接等于保留对象数——不是「渲染时截断」能省的。
-1. 每次挂载 =etaf-unmount= 只 =remhash= 旧 runtime，页对象要等 GC；而采集层开着 CPU 采样时
-   （=el-chronos-mode 1=，10ms 间隔）GC 对采样栈保守扫描，旧页在采样日志 flush 前拿不回来
-   → 会话表越大，「每渲染泄漏一页」越贵。
-1. 排除项（实测均不是主因）：=--ensure-buffer-hooks= 的 =--hooked-buffers= 恒为 5、
-   buffer 数恒为 7（首开 +2 后不增）；=--components-defined-p= 守卫生效（组件只 =eval= 一次）；
-   =etaf--runtimes= 恒为 1（unmount 生效）；纯查询（不渲染）10 次的存活 cons 只 +0.5 万。
-
-**修法**：
-- =--render-rows=：**在构造行描述之前**截断——分页表取第 PAGE 页，不分页表只取前
-  =el-chronos-dashboard-page-size= 行；标题如实写「已加载 N 条，显示前 M 条」。
-- =--cap-rows= + =el-chronos-dashboard-max-rows=（200）：快照每个列表字段都封顶，
-  挡 =:sessions= / =:trend= / =:heatmap= 这类无界查询。
-- =--reload-snapshot=：重载前先把旧快照置 nil，查询期间不持有两代数据。
-- =el-chronos-collect--internal-buffer-p=：内部 buffer（名字以空格开头，如 ETAF 的
-  = *work*=）不补挂命令计时 hook（仍登记，避免重复判断）——顺带消掉「打开 dashboard 要碰
-  全部 buffer」的观感负担。
-
-**残余**：+3.3 万 cons/次是采样期间的保守保留，采集层每个 =el-chronos-sample-window-seconds=
-窗口 flush 采样日志后回落到基线（实测 =--sample-tick= 后 38 万 → 24.7 万），属有界抖动，
-且与行数成正比——所以行数上限是这条链路的第一道闸。回归用例见
-=test/el-chronos-ui-test.el=（=dashboard-tables-cap-rows= / =dashboard-snapshot-cap-rows= /
-=dashboard-repeat-open-no-growth=）。
-
-**待实测**：ETAF 页面在 30 天真实数据下的首次渲染与切范围重绘耗时（TD-5）；
-terminal 文本字符图的可读性；Web 页在 30 天数据下的火焰图渲染耗时。
+- Web 页在 30 天真实数据下的火焰图渲染耗时（详见 [[file:../openspec/tech-debt.md][openspec/tech-debt.md]]）。
 
 * 关联
 
-- 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]「可视化设计」节、I8–I11、T8/T9/T12
-- ADR：[[file:adr/0002-dual-visualization.md][docs/adr/0002-dual-visualization.md]]（双形态选型与代价）
+- 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]「可视化设计」节、I8–I11（历史记录，可视化设计部分已由 ADR-0003 取代）
+- ADR：[[file:adr/0003-web-only-visualization.md][docs/adr/0003-web-only-visualization.md]]（可视化收敛为 Web dashboard + org 报告两形态，取代 ADR-0002）
+- ADR（已被取代）：[[file:adr/0002-dual-visualization.md][docs/adr/0002-dual-visualization.md]]（Superseded by ADR-0003，正文保留为历史记录）
+- 本次移除计划：[[file:../openspec/completed/remove-dashboard-web-only.md][openspec/completed/remove-dashboard-web-only.md]]（把可视化收敛为 Web dashboard + org 报告两形态的动机与验收）
 - 接口：[[file:api.org][docs/api.org]]（analysis 查询签名与返回键）
 - 数据：[[file:schema.org][docs/schema.org]]（表结构、保留策略、P95 近似）
-- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-5 ETAF 重绘性能、TD-6 Web 无鉴权、TD-7 P95 精度）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-6 Web 无鉴权、TD-7 P95 精度）

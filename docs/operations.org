@@ -18,7 +18,6 @@
 | Emacs | 29.1+（需要内置 =sqlite=） | =M-: (and (fboundp 'sqlite-open) (sqlite-available-p))= → =t= |
 | SQLite | 编译期带 SQLite 支持 | =(featurep 'sqlite)= → =t= |
 | straight.el | 可选（用 =:local-repo= 安装时需要） | =(featurep 'straight)= |
-| ETAF | **可选**（仅 Emacs 内页面需要） | =(require 'etaf nil t)= / =(require 'etaf-ui nil t)= |
 
 ** 方式 A：straight.el（=:local-repo=，本包为独立仓库）
 
@@ -42,23 +41,6 @@
 (el-chronos-mode 1)
 #+END_SRC
 
-** 方式 C：需要 Emacs 内 ETAF 页面时（软依赖）
-
-=el-chronos-dashboard= 需要 =etaf= + =etaf-ui=；缺失时会 =display-warning= 并降级为
-=tabulated-list= 简版页（功能可用，图表变文本）。安装方式沿用本机 thomas-emacs 的
-=lisp/init-etaf.el= 里的 straight recipe（ETAF 由 =ecss= / =ebox= / =etaf= / =etaf-ui= 四个包
-组成，recipe 以该文件为准，本文件不复写仓库地址以免失效）：
-
-#+BEGIN_SRC elisp
-;; 示意：把 init-etaf.el 中 ecss / ebox / etaf / etaf-ui 的 recipe 原样用于你的配置
-(straight-use-package 'etaf)      ; 其 recipe 与依赖见 thomas-emacs lisp/init-etaf.el
-(straight-use-package 'etaf-ui)
-(require 'etaf)
-(require 'etaf-ui)
-#+END_SRC
-
-装好后验证：=M-: (el-chronos-dashboard-etaf-available-p)= → =t=。
-
 ** 安装后确认
 
 #+BEGIN_SRC elisp
@@ -71,7 +53,7 @@ el-chronos-db-path           ; 确认数据落点
 
 心跳检测到主线程阻塞（漂移超过 =el-chronos-block-threshold-ms=，默认 2000 ms）时，
 事件**始终**写入 =slow_events=（=kind="block"=）并出现在 =el-chronos-report= 与
-dashboard / Web 的阻塞列表里；=el-chronos-collect-notify-blocks= 只控制**要不要提示**：
+Web 页面的阻塞列表里；=el-chronos-collect-notify-blocks= 只控制**要不要提示**：
 
 | 取值 | 行为 | 适用 |
 |---|---|---|
@@ -136,16 +118,14 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 
 | 症状 | 可能原因 | 处置 |
 |---|---|---|
-| =*el-chronos*= 页面显示表格而非卡片 + 图表 | **ETAF 缺失或 require 失败**（=display-warning= 提示安装） | =M-: (el-chronos-dashboard-etaf-available-p)= 确认；按「安装 · 方式 C」装 =etaf= + =etaf-ui=；不装也能用简版（2 张表 + =1/7/3= 切范围） |
 | 启动即告警「SQLite 不可用」，采集被禁用 | Emacs < 29 或编译时缺 sqlite | =M-: (and (fboundp 'sqlite-open) (sqlite-available-p))=；换带 SQLite 支持的 Emacs 构建；观测器本身不阻断 Emacs 启动 |
 | =el-chronos-web-start= 抛 =user-error=「端口被占用」 | 8787 已被占用（可能是别的实例或 Windows 侧进程） | =ss -lntH "sport = :8787"= 查监听者；改 =el-chronos-web-port= 后重试。**不自动换端口**是设计（I11：可见失败优于静默漂移） |
 | 热点函数里一堆 =unknown= 包 | 函数来自**已删除包的残留 =.eln=**、=eval= 即时定义的临时 snippet（=.yas-setup-*=），或 =symbol-file= 确实取不到源码 | native-comp 的 =.eln= 路径已能反查源码（TD-1 已关闭，实测 96.6% 反查成功），故 =unknown= 现在**只剩这两类边界**。看 =el-chronos-attrib-file= 对该符号的返回值：返回 =.eln= 路径说明反查失败（多半是包已删）；不影响其他统计。需要源码级结论时用 =el-chronos-profile-command= 对单条命令剖析 |
 | 采样数一直是 0 / 热点表空 | ① 采样器启动失败（=display-warning=）；② 观测期间**没有真实操作**——纯 =sleep= 不产生 CPU 样本 | ① 查 =*Messages*= 与 =el-chronos-status=；② 正常敲命令 1 分钟后再看（采样是 CPU 采样，阻塞等待期没有 leaf 样本，阻塞要靠心跳 =slow_events(kind='block')= 体现） |
 | DB 体积显示得比预期小 | =el-chronos-analysis-db-size= **只统计主文件**，不含 =-wal= / =-shm=；WAL 未 checkpoint 时数据还在 wal 里 | 看总占用：=ls -l ~/.emacs.d/.local/state/chronos/=；随 checkpoint 主文件会长上来；需要立刻收敛就跑 =M-x el-chronos-store-vacuum= |
 | 某些 buffer 里的命令完全没被计时 | TD-9 类问题（=pre-command-hook= / =post-command-hook= 在 Emacs 31 起 auto-buffer-local） | 已修复：启动时遍历 =buffer-list= 补挂局部 hook 并由 =buffer-list-update-hook= 增量覆盖；若自造 buffer 仍漏采，确认没有在 =kill-all-local-variables= 之后手动覆盖这两个 hook |
-| 命令行里 =make lint= 报 =void-function etaf-view= | 顶层直接写 ETAF 宏，字节编译时宏缺席被编成函数调用 | 已在实现中规避（组件定义与挂载走 =(eval FORM t)=）；自定义扩展时同样不要把 ETAF 宏写在顶层 |
 | =total_ms= 与内置 =profiler-report= 的 total 列不一致 | 口径不同：本模块 total 按**栈内去重**，内置报告按每帧累加（TD-10） | 不是 bug。占比与回归判定都用 self 口径；跨工具对比时以 self 为准 |
-| echo area 不再弹出「主线程阻塞约 N ms」 | =el-chronos-collect-notify-blocks= 默认为 =nil=（静默），**不是漏记**——事件照旧落 =slow_events(kind="block")= 并进报告 / dashboard | 查库确认（见「阻塞提示」节的 SQL）；需要即时可见就把该变量设为 =messages=（只进 =*Messages*=）或 =t=（真 echo） |
+| echo area 不再弹出「主线程阻塞约 N ms」 | =el-chronos-collect-notify-blocks= 默认为 =nil=（静默），**不是漏记**——事件照旧落 =slow_events(kind="block")= 并进报告 / Web 页面 | 查库确认（见「阻塞提示」节的 SQL）；需要即时可见就把该变量设为 =messages=（只进 =*Messages*=）或 =t=（真 echo） |
 | 回归列表里出现看起来「没变慢」的函数 | 回归按 =el-chronos-regression-window-days=（默认 7 天）与自身上下窗口比较，**与页面显示范围无关**；小样本噪声由 =el-chronos-regression-min-samples= 抑制 | 看返回里的 =:current-samples= / =:previous-samples=；嫌噪就提高阈值或最小样本数 |
 
 * 验证步骤
@@ -165,11 +145,10 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 2. **真实操作 1 分钟**（开关文件、搜索、切 buffer、跑一次 =M-x org-agenda= 之类）——
    纯静止不产生 CPU 样本。
 3. =M-x el-chronos-report= → 报告 buffer 里「概览 / 慢命令 TOP / 热点函数 TOP / 趋势」非空。
-4. =M-x el-chronos-dashboard= → 页面可见；按 =1= / =7= / =3= 范围变化；点一行看弹窗；=q= 关闭。
-5. （可选）=M-x el-chronos-web-start= → 浏览器打开 =http://127.0.0.1:8787/= →
+4. （可选）=M-x el-chronos-web-start= → 浏览器打开 =http://127.0.0.1:8787/= →
    =curl --noproxy '*' -sS http://127.0.0.1:8787/api/summary | python -m json.tool= 合法 JSON →
    =ss -lntH "sport = :8787"= 只见 =127.0.0.1= → =M-x el-chronos-web-stop=。
-6. =(el-chronos-mode -1)= → =M-: el-chronos--active-timers= → =nil=（零残留）。
+5. =(el-chronos-mode -1)= → =M-: el-chronos--active-timers= → =nil=（零残留）。
 
 本机注意：=http_proxy= 已设而 =no_proxy= 未设，探活必须 =curl --noproxy '*'=，
 否则会被代理接管返回假 503。
@@ -213,8 +192,8 @@ Windows 侧进程可直连该端口）。定位是「本机自用的只读视图
 * 关联
 
 - 接口：[[file:api.org][docs/api.org]]
-- 界面 / 路由 / ETAF 踩坑：[[file:ui.org][docs/ui.org]]
+- 界面 / 路由：[[file:ui.org][docs/ui.org]]
 - 数据模型与保留策略：[[file:schema.org][docs/schema.org]]
 - 架构与实测结论：[[file:architecture.org][docs/architecture.org]]
-- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-1 / TD-2 / TD-3 已关闭；未关闭：TD-4 / TD-5 / TD-6 / TD-7 / TD-9 / TD-10 / TD-11）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（未关闭：TD-4 / TD-6 / TD-7 / TD-8 / TD-10 / TD-11 / TD-12；TD-1 / TD-2 / TD-3 / TD-5 / TD-9 已关闭）
 - 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]

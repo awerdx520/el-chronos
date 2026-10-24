@@ -39,6 +39,10 @@
 - 计划文档清单补入 `docs/api.org`（elisp 对外接口索引）与 `docs/operations.org`（装卸、数据清理、排障）。
 - 计划 `el-chronos-core.md` 归档到 `openspec/completed/`（Phase 4 Review & Document 完成，2026-10-24）；仓库内（`AGENTS.md` / `Readme.org` / `docs/*.org` / 两份 ADR）的计划链接统一指向归档路径，`openspec/active/` 保留为空目录。（本文件中「设计计划」一条保留当时的 `openspec/active/` 原始路径，属历史记录。）
 
+### 移除
+
+- **dashboard 模块与 ETAF 依赖移除**：删除 `el-chronos-dashboard.el`（1382 行：ETAF 组件树 + tabulated-list 降级页）与 `etaf` / `etaf-ui` 软依赖，可视化收敛为「浏览器 Web dashboard + org 报告」两形态（共享同一 `el-chronos-analysis` 查询层）。同时移除 5 个 defcustom（`el-chronos-dashboard-page-size` / `-max-rows` / `-chart-points` / `-chart-width` / `-refresh-seconds`）、24 个 dashboard ERT 用例与 5 项专用夹具；`test/el-chronos-ui-test.el` 更名为 `test/el-chronos-web-test.el`（9 个 Web 用例保留并改名为 `el-chronos-web-test-*`）。补 2 个 `el-chronos-show-event` 用例（该命令保留，原覆盖来自被删用例），用例总数 107 → **109**。不变量 I9 改写为「ETAF 已完全移除，可视化层不引入 ETAF」、I11 去掉 ETAF/SVG 降级子项；技术债 TD-5（ETAF 重绘性能）关闭。见 ADR-0003。
+
 ### 新增
 
 - **ETAF 可视化页面**（`el-chronos-dashboard.el`，976 行）：`*el-chronos*` 一屏呈现 10 项能力——概览卡片 6 指标、慢命令排行、热点函数排行（含包归属）、包/模块占比条形图、趋势折线、阻塞事件列表与详情、用法热力图、回归列表、会话列表与启动耗时、时间范围切换与行级下钻；快捷键 `1`/`7`/`3` 切范围、`g` 刷新、`r` 自动刷新、`d` 看完整栈、`q` 关闭。ETAF 缺失时降级为 `tabulated-list` 简版页（慢命令表 + 热点函数表 + 切范围），terminal frame 下图表降级为文本字符图（I9 / I11）。

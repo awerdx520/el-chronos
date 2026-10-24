@@ -20,14 +20,14 @@
 | 3 | 归因到哪个 straight 包 / =lisp/init-*.el= 模块 / site-lisp 文件？ | =attrib= 归因（符号 → 源码文件 → 包/模块） |
 | 4 | 长期趋势如何、某次改动是否引入回归？ | =hourly_*= 小时聚合 + 回归判定（近 N 天 vs 前 N 天） |
 | 5 | 哪些高频用法值得优先优化？ | =hourly_usage= 的 command / mode / project 维度 |
-| 6 | 怎么把它们都看见？ | 三种形态：org 报告 / Emacs 内 ETAF 页面 / 浏览器 Web dashboard |
+| 6 | 怎么把它们都看见？ | 两种形态：org 报告 / 浏览器 Web dashboard |
 
 * 安装
 
 ** 前置条件
 
 - Emacs **29.1+**，且编译时带 SQLite 支持：=M-: (and (fboundp 'sqlite-open) (sqlite-available-p))= → =t=
-- 可选：=straight.el=（用 =:local-repo= 安装时）；=etaf= + =etaf-ui=（仅 Emacs 内页面需要）
+- 可选：=straight.el=（用 =:local-repo= 安装时）
 
 ** straight.el（本包是独立仓库，用 =:local-repo=）
 
@@ -47,41 +47,27 @@
 (el-chronos-mode 1)
 #+END_SRC
 
-** 可选：装 ETAF（要 Emacs 内可视化页面时）
-
-不装也能用：=M-x el-chronos-dashboard= 会 =display-warning= 提示安装，并降级为内置
-=tabulated-list= 简版页（慢命令表 + 热点函数表 + =1=/=7=/=3= 切时间范围），采集与其他形态不受影响。
-
-安装方式沿用本机 thomas-emacs 的 =lisp/init-etaf.el= 里的 straight recipe（ETAF 由 =ecss= /
-=ebox= / =etaf= / =etaf-ui= 四个包组成，仓库地址以该文件为准）。装好后验证：
-=M-: (el-chronos-dashboard-etaf-available-p)= → =t=。
-
-* 使用（三种形态）
+* 使用（两种形态）
 
 | 形态 | 启动 | 适合 |
 |---|---|---|
 | org 报告 | =M-x el-chronos-report=（默认近 7 天，可 =1d= / =30d=） | 归档、版本间 diff；=M-x el-chronos-weekly-report= 写周报，=M-x el-chronos-export= 导出 CSV/JSON |
-| Emacs 内页面 | =M-x el-chronos-dashboard=（buffer =*el-chronos*=） | 日常顺手看一眼：概览卡片、趋势折线、包占比、热力图、5 张排行表、行级下钻 |
 | 浏览器 Web dashboard | =M-x el-chronos-web-start=（默认 =http://127.0.0.1:8787/=） | 深度分析：多图表、火焰图、搜索/排序/分页、多会话对比、CSV 导出 |
-
-常用快捷键（页面 buffer 内）：=1= / =7= / =3= 切时间范围，=g= 刷新，=r= 切换自动刷新（默认 30s），
-=d= 看当前下钻的阻塞事件完整栈，=q= 关闭。
 
 单条命令的深挖：=M-x el-chronos-profile-command= 在 1ms CPU 采样下**当场**跑一次命令并生成剖析报告
 （热点 / 调用链 / 包归属 / 优化建议），不查库、不依赖历史数据。
 
-三种形态的约束一致：
+两种形态的约束一致：
 
 - **只读**：都只查库，不写库、不改配置、不改 Emacs 行为。
 - **数据同源**：共享同一 =el-chronos-analysis= 查询层，两边数字不会对不上。
-- **降级可见**：ETAF 缺失 → =tabulated-list= 简版；terminal frame → 文本字符图；端口占用 → 明确报错。
+- **降级可见**：端口占用 → 明确报错，不自动换端口、不静默失败（I11）。
 
 * 依赖
 
 | 部分 | 依赖 | 说明 |
 |---|---|---|
 | 核心（入口 / 采集 / 归因 / 存储 / 分析 / 报告） | **零第三方** | 只用内置 =sqlite= / =profiler= / =cl-lib= / =subr-x= / =org= |
-| Emacs 内页面（=el-chronos-dashboard.el=） | **软依赖** =etaf= + =etaf-ui= | 一律 =(require ... nil t)=；缺失时告警并降级，核心与另两种形态不受影响（I9） |
 | Web dashboard（=el-chronos-web.el=） | **零依赖** | 内置 =make-network-process= 自写最小 HTTP server，HTML/CSS/JS 以字符串内嵌，无 CDN（I10） |
 
 * 非目标
@@ -140,7 +126,7 @@
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 103 用例）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 109 用例）
 make full-check     # check-parens + test
 #+END_SRC
 
@@ -151,10 +137,10 @@ make full-check     # check-parens + test
 * 当前状态
 
 - 阶段：**Phase 4（Review & Document）**。T1–T12 已实现：6 张表 SQLite 存储、命令/心跳/采样三条采集路径、
-  归因、13 个分析查询、org 报告、ETAF 页面、Web dashboard、单命令剖析、ERT 103 用例、文档全集。
+  归因、13 个分析查询、org 报告、Web dashboard、单命令剖析、ERT 109 用例、文档全集。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
-- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化]]
-- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]（含仍待实测项：ETAF 重绘性能 TD-5、P95 精度 TD-7、阻塞捕获残余缺口 TD-11；采样开销 TD-3、阻塞覆盖率 TD-2、`.eln` 归因 TD-1 已关闭）
+- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 只保留 Web 可视化]]
+- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]（含仍待实测项：P95 精度 TD-7、阻塞捕获残余缺口 TD-11；采样开销 TD-3、阻塞覆盖率 TD-2、`.eln` 归因 TD-1 已关闭；TD-5 已随可视化为 Web dashboard 单一形态而关闭）
 - 文档：[[file:docs/architecture.org][架构与实测结论]]、[[file:docs/schema.org][数据模型]]、[[file:docs/ui.org][界面与路由]]、[[file:docs/api.org][接口索引]]、[[file:docs/operations.org][运维手册]]
 
 * 许可证

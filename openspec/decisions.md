@@ -10,6 +10,7 @@
 | 2026-10-24 | 定位能力到「函数 + 调用链」为止，不承诺源码行级 | ELisp profiler 记录符号栈，无行号；行级只能对可疑函数做微基准+二分 | ADR-0001、`el-chronos-profile-command` |
 | 2026-10-24 | 默认隐私边界为命令级，不记文件路径/按键序列/内容 | 观测器不得成为隐私风险源；文件级需用户显式改 `el-chronos-usage-granularity` | ADR-0001、I7 |
 | 2026-10-24 | 可视化采用双形态（Emacs 内 ETAF 页面 + 浏览器 Web dashboard），共享同一 analysis 查询层 | Emacs 侧选 ETAF 而非内置 svg.el + tabulated-list：组件化布局、响应式状态、表格与 SVG 组合能力强，且本机已装；日常查看不离开 Emacs、深度分析在浏览器。代价：dashboard 对 ETAF 形成软依赖、需处理缺失与 terminal 降级，代码量增加约 40% | ADR-0002、I8–I11 |
+| 2026-10-24 | 可视化收敛为两形态（浏览器 Web dashboard + org 报告），删除 dashboard 模块与 ETAF 软依赖 | dashboard 与 Web 能力重叠但独占总维护成本（ETAF 软依赖、双渲染路径、10 条踩坑、TD-5 内存/重绘风险、24 个用例）；Web 已覆盖全部只读查看需求且零第三方依赖 | ADR-0003、I8–I11 改写（I 编号不变，I9/I11 语义见 `AGENTS.md` 不变量清单） |
 
 ## 决策模板
 

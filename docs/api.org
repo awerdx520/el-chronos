@@ -13,7 +13,7 @@
 所有查询函数在数据库打不开或 SQL 出错时 =display-warning= 并返回 =nil=，**不向调用方抛错**（I6）。
 #+END_QUOTE
 
-* 概览：8 个模块
+* 概览：7 个模块
 
 | 模块 | 文件 | 职责 | 对外符号数 |
 |---|---|---|---|
@@ -23,8 +23,10 @@
 | 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合 | 2 + 1 defcustom |
 | 分析 | =el-chronos-analysis.el= | 13 个只读聚合查询 | 13 |
 | 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
-| 页面 | =el-chronos-dashboard.el= | ETAF 页面 / tabulated-list 降级页 | 9 命令 + 10 纯函数 + 4 defcustom |
-| Web | =el-chronos-web.el= | 最小 HTTP server + 内嵌 dashboard | 3 |
+| Web | =el-chronos-web.el= | 最小 HTTP server + 内嵌 Web dashboard | 3 |
+
+可视化只有两种形态：**浏览器 Web dashboard**（=el-chronos-web.el=）与 **org 报告**（=el-chronos-report.el=），
+没有 Emacs 内的独立页面模块。
 
 * 入口模块（=el-chronos.el=）
 
@@ -106,8 +108,8 @@
 | =el-chronos-collect-start= | =()= | =t= / =nil= | 启动采集：命令计时 hook（全局 + 每 buffer 局部补挂，TD-9）、错误标记 advice、心跳 timer、采样 timer 与 profiler。幂等。 |
 | =el-chronos-collect-stop= | =()= | =t= / =nil= | 停止采集并清空全部状态，保证零残留（I5）。幂等。 |
 | =el-chronos-collect-notify-blocks= | defcustom，默认 =nil= | =(choice (const nil) (const messages) (const t))= | 心跳检测到阻塞时**如何提示**（不影响采集与记录：=slow_events(kind="block")= 恒照记）。=nil= 静默；=messages= 只写 =*Messages*=（=(let ((inhibit-message t)) (message ...))=，不占 echo area）；=t= 在 echo area 提示（旧语义）。详见 [[file:operations.org][docs/operations.org]]「阻塞提示」。 |
-| =el-chronos-collect--suppress-block-p= | defvar，默认 =nil= | boolean | **跨模块控制变量**：声明在 collect 侧（=el-chronos-collect.el=），**report 与 dashboard 侧绑定**（=el-chronos-report--without-block-events= / =el-chronos-dashboard--without-block-events= 在重查询 / 渲染期间 =let= 为 =t=），**collect 侧读取**（=el-chronos-collect--heartbeat= 用 =bound-and-true-p= 判断：非 =nil= 时跳过阻塞判定，只把 =--last-heartbeat= 推进到当前时刻，故解除绑定后不会补记整段 gap）。两个可视化模块必须先 =defvar= 同名声明，否则跨模块 =let= 绑定未声明变量会 =void-variable=；两侧同名同义，重复声明无副作用。语义上它只抑制「重查询 / 渲染耗时的假阻塞」——其间真实发生的阻塞同样不记，属有意取舍。 |
-| =el-chronos-collect--last-heartbeat= | defvar，默认 =nil= | 浮点秒 | 上一次心跳的实际触发时刻。**跨模块写入点**有三个：report 侧与 dashboard 侧在重查询 / 渲染结束（=unwind-protect= 清理段）重设基线，以及 collect 心跳自身在抑制期间推进基线；目的都是避免补跑的心跳把整段非采集耗时记成阻塞（详见 [[file:architecture.org][docs/architecture.org]]「报告自观测抑制」）。 |
+| =el-chronos-collect--suppress-block-p= | defvar，默认 =nil= | boolean | **跨模块控制变量**：声明在 collect 侧（=el-chronos-collect.el=），**report 侧绑定**（=el-chronos-report--without-block-events= 在重查询期间 =let= 为 =t=），**collect 侧读取**（=el-chronos-collect--heartbeat= 用 =bound-and-true-p= 判断：非 =nil= 时跳过阻塞判定，只把 =--last-heartbeat= 推进到当前时刻，故解除绑定后不会补记整段 gap）。report 必须先 =defvar= 同名声明，否则跨模块 =let= 绑定未声明变量会 =void-variable=；两侧同名同义，重复声明无副作用。语义上它只抑制「重查询耗时的假阻塞」——其间真实发生的阻塞同样不记，属有意取舍。 |
+| =el-chronos-collect--last-heartbeat= | defvar，默认 =nil= | 浮点秒 | 上一次心跳的实际触发时刻。**跨模块写入点**有两个：report 侧在重查询结束（=unwind-protect= 清理段）重设基线，以及 collect 心跳自身在抑制期间推进基线；目的都是避免补跑的心跳把整段非采集耗时记成阻塞（详见 [[file:architecture.org][docs/architecture.org]]「报告自观测抑制」）。 |
 
 一般**不直接调用**：由 =el-chronos-mode= 编排（=--start= / =--stop=）。单独加载 collect 时对
 store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
@@ -159,45 +161,6 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 (el-chronos-profile-command 'xref-find-definitions)
 #+END_SRC
 
-* 页面模块（=el-chronos-dashboard.el=）
-
-** 命令
-
-| 符号 | 签名 | 说明 |
-|---|---|---|
-| =el-chronos-dashboard= | =(&optional RANGE)= | 打开 / 刷新 =*el-chronos*= 页面；ETAF 可用走组件树，否则 =tabulated-list= 降级页。 |
-| =el-chronos-dashboard-refresh= | =()= | 重新取数并重绘（=g=）。 |
-| =el-chronos-dashboard-range-1d= / =-range-7d= / =-range-30d= | =()= | 切时间范围（=1= / =7= / =3=），页码归零、关闭弹窗。 |
-| =el-chronos-dashboard-next-page= / =-previous-page= | =()= | 翻页（顶栏按钮）。 |
-| =el-chronos-dashboard-show-event= | =()= | 看当前下钻选中阻塞事件的完整栈（=d=）。 |
-| =el-chronos-dashboard-toggle-auto-refresh= | =()= | 切换自动刷新（=r=）。 |
-| =el-chronos-dashboard-quit= | =()= | 取消自动刷新并关闭页面（=q=）。 |
-| =el-chronos-dashboard-etaf-available-p= | =()= | ETAF（=etaf= + =etaf-ui=）是否可用；只读探测，不重新 require。 |
-
-** 可测纯函数（内部命名，供 ERT 断言；签名稳定但**不承诺兼容**）
-
-| 符号 | 签名 | 说明 |
-|---|---|---|
-| =el-chronos-dashboard--bar= | =(VALUE MAX WIDTH)= | 条形字符串（=█= 重复，长度 ≤ WIDTH）。 |
-| =el-chronos-dashboard--scale= | =(VALUES MAX HEIGHT)= | 线性缩放到 =((IDX . Y) ...)=。 |
-| =el-chronos-dashboard--sparkline= | =(VALUES WIDTH HEIGHT)= | 完整 =<svg>= 折线字符串。 |
-| =el-chronos-dashboard--bar-chart= | =(ROWS WIDTH HEIGHT)= | 横向条形图 SVG 字符串。 |
-| =el-chronos-dashboard--heatmap= | =(ROWS WIDTH HEIGHT)= | 热力图 SVG 字符串。 |
-| =el-chronos-dashboard--to-text-bars= | =(SPEC &optional WIDTH)= | SVG 不可用时的字符图；**永不返回 image**（I11）。 |
-| =el-chronos-dashboard--range-symbol= | =(RANGE)= | 字符串或符号 → 归一符号（='1d= / ='7d= / ='30d=），非法值回落 ='7d=。**查询侧必须用它**：analysis 的 alist 键是符号，传字符串会让 =alist-get= 取不到并**静默回落 7 天**。凡下给 =el-chronos-analysis-*= 的 =:range-symbol=、=--chart-rows=、=--tables= 一律先过它。 |
-| =el-chronos-dashboard--range-string= | =(RANGE)= | → 规范字符串（="1d"= / ="7d"= / ="30d"=），供 UI 状态与显示。**分工**：UI 状态（=--range=）一律**存字符串**（顶栏/标题直接显示，无需转换），只有查询前才转符号；=--range->days= 两种形态都接受，故任何一处都别拿字符串直接去 =alist-get=。 |
-| =el-chronos-dashboard--range->days= | =(RANGE)= | → 天数；字符串、符号、整数（旧行为）三种写法都接受，未知按 7。 |
-| =el-chronos-dashboard--page-slice= | =(ROWS PAGE SIZE)= | 取第 PAGE 页（0 基）内容。 |
-
-** defcustom
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| =el-chronos-dashboard-page-size= | =20= | 表格每页行数（慢命令 / 热点函数两张主表分页）。 |
-| =el-chronos-dashboard-chart-points= | =60= | 趋势折线最多采样点数（超出等距抽稀）。 |
-| =el-chronos-dashboard-chart-width= | =72= | 图表逻辑宽度（也是 terminal 字符图宽度）。 |
-| =el-chronos-dashboard-refresh-seconds= | =30= | 自动刷新间隔（秒），=r= 切换、关页面即取消。 |
-
 * Web 模块（=el-chronos-web.el=）
 
 | 符号 | 签名 | 返回 | 说明 |
@@ -218,16 +181,15 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
 - 以 =--=（双连字符）结尾的是内部实现：=el-chronos--start= / =el-chronos-attrib--classify-path= /
   =el-chronos-store--flush= / =el-chronos-collect--pre-command= / =el-chronos-analysis--range= /
-  =el-chronos-report--content= / =el-chronos-dashboard--render-etaf= / =el-chronos-web--dispatch= 等。
+  =el-chronos-report--content= / =el-chronos-web--dispatch= 等。
 - **不承诺兼容**：可随时重命名、改签名或删除；用户配置与外部集成不得依赖。
-- 例外：=el-chronos-dashboard--bar= 等图表纯函数被 ERT 直接断言（见 [[file:ui.org][docs/ui.org]]），
-  改动时须同步测试。
 - 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
   继续，不向宿主抛错（I6）。
 
 * 关联
 
 - 计划与不变量：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
+- ADR：[[file:adr/0003-web-only-visualization.md][docs/adr/0003-web-only-visualization.md]]（可视化收敛为 Web dashboard + org 报告两形态，取代 ADR-0002）
 - 界面与路由：[[file:ui.org][docs/ui.org]]
 - 数据模型：[[file:schema.org][docs/schema.org]]
 - 装卸与排障：[[file:operations.org][docs/operations.org]]

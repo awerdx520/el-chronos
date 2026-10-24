@@ -22,10 +22,9 @@
 | 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行                             | 唯一允许写盘的一层（I3）             |
 | 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集                           | 只读数据库                         |
 | 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer / 导出文件                  | 创建 buffer、按需写导出文件         |
-| 可视化 dashboard | =el-chronos-dashboard.el= | =analysis= 结果集              | =ETAF= 组件树（ETAF → =etaf-ui-svg= ）    | 创建 =*el-chronos*= （只读渲染）    |
 | 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON → 内嵌 HTML / JS           | 仅监听 =127.0.0.1= （默认关闭、只读） |
 
-数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / dashboard / web（三种呈现形态，共享同一 analysis 查询层）= 。
+数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / web（两种呈现形态，共享同一 analysis 查询层）= 。
 =attrib= 是被动依赖（collect 调它补上下文），不被 store 反向调用。
 
 * 采集时序：四条路径
@@ -69,27 +68,13 @@
 
 * 可视化数据流
 
-两种形态（Emacs 内 ETAF 页面 / 浏览器 Web dashboard）共享同一 =el-chronos-analysis= 查询层，
+两种形态（org 报告 / 浏览器 Web dashboard）共享同一 =el-chronos-analysis= 查询层，
 不各自写 SQL；任一种不可用都不影响采集与另一种。
 
 ** 公共前半段
 
 =页面请求（M-x 或 HTTP GET）→ analysis 查询函数（返回 plist）→ SQLite（只读）→ 结果集=。
 analysis 只读数据库，呈现层只消费 plist——因此新增一种呈现形态不需要改采集与存储。
-
-** Emacs 侧（ETAF）
-
-1. =el-chronos-dashboard= 确保数据库已打开（只读）→ 读取 defcustom 与当前 =range=（=1d= / =7d= / =30d=）；
-2. 调 analysis 取 summary / top-functions / slow-commands / packages / trend / heatmap / stacks / sessions；
-3. 根组件 =el-chronos-dashboard-app= 以 =:bindings= 持有 =range= / =page= / =selected-event= / =filter=，
-   经 =etaf-mount= 渲染组件树；
-4. 表格走 =etaf-table=（=:columns= / =:rows= / =:row-key=，分页 20 行；注册名是 =etaf-table= 而非
-   =etaf-ui-table=）；图表走 =etaf-ui-svg-*= 生成 SVG markup →
-   =etaf-ui-svg-image= 得到 =(image :type svg :data STRING)= 描述符 → 交给 image Host
-   （如 =etaf-tile-grid= 的 =:cell-image=）；terminal frame 改文本条形；
-5. 交互：=1= / =7= / =3= 改 =range= → =etaf-ref= 状态变更 → 受影响子树重渲染；行 =:on-press= →
-   =etaf-dialog= 下钻（按需再查一次 analysis 的明细接口）；
-6. ETAF 缺失（=require ... nil t= 失败）→ =display-warning= + 内置 =tabulated-list= 简版（I9）。
 
 ** Web 侧
 
@@ -101,12 +86,12 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 
 ** 降级矩阵（I11）
 
+不可用必须**可见**降级，不得静默失败。
+
 | 场景 | 行为 |
 |---|---|
-| ETAF 未安装 / =require= 失败 | dashboard 降级 =tabulated-list= 简版 + =display-warning=（I9） |
-| terminal frame 或 SVG 不可用 | 图表降级为文本条形（字符重复），不报错 |
 | 8787 端口被占用 | =el-chronos-web-start= 明确报错（含端口与改 =el-chronos-web-port= 的提示），不静默失败 |
-| sqlite 不可用 | 三种呈现均提示"无数据"，采集侧按既有路径禁用 |
+| sqlite 不可用 | 两种呈现均提示"无数据"，采集侧按既有路径禁用 |
 
 * 启停与降级
 
@@ -215,13 +200,12 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 
 ** 9. 报告自观测抑制：三层防护 + 心跳侧感知
 
-需求：报告生成 / dashboard 渲染（首次加载 org + 13 个 analysis 查询 + ETAF 组件初始化，实测约 2.7s）
-不能被自己的 1s 心跳判为阻塞——那是观测者在观测自己，属假阳性。
-=el-chronos-report--without-block-events= 与 =el-chronos-dashboard--without-block-events= 用三层：
+需求：报告生成（首次加载 org + 13 个 analysis 查询）不能被自己的 1s 心跳判为阻塞——
+那是观测者在观测自己，属假阳性。=el-chronos-report--without-block-events= 用三层：
 
 1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧 =el-chronos-collect--heartbeat=
    用 =bound-and-true-p= 读取：**非 =nil= 时推进 =--last-heartbeat= 基线并跳过阻塞判定**
-   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report / dashboard 侧先 =defvar= 声明同名变量）；
+   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 侧先 =defvar= 声明同名变量）；
 2. 把 =el-chronos-block-threshold-ms= 临时抬到 60s（=--suppress-block-threshold-ms=），
    兜住抑制变量尚未生效的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
 3. **收尾在 =unwind-protect= 清理段把 =el-chronos-collect--last-heartbeat= 重设为当前时刻**。
@@ -232,7 +216,7 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 有让出主线程的间隙让心跳真的跑了一次，则靠第 1 层：心跳**推进基线 + 跳过判定**，
 因此**抑制期间不产生 block 事件，解除绑定后也不补记整段 gap**。
 
-取舍：抑制期间若真发生阻塞也不会被记录。有意接受——报告 / 首次渲染是用户主动触发的重操作，
+取舍：抑制期间若真发生阻塞也不会被记录。有意接受——报告生成是用户主动触发的重操作，
 其耗时属预期行为，不该混进「待排查的卡顿」。
 
 ** 10. 阻塞捕获覆盖率（TD-2，2026-10-24 实测）
@@ -384,7 +368,7 @@ DELETE FROM hourly_usage WHERE dimension = 'command' AND key IN ('unknown', 'ano
 | =samples= 是 self 口径 | =samples= = 该函数作为 **leaf** 被采样的次数；只作中间帧出现的函数 =samples= 恒为 0 而 =total_ms= > 0 | 有意如此：占比与回归判定都按 self 口径，避免「出现得多但自己不耗时」的函数虚高。恒有 =self_ms = samples × 采样间隔=，全表 =samples= 求和 = 窗口内真实样本总数（可直接作分母） |
 | 阻塞事件没有栈、也没有命令 | =slow_events(kind='block')= 的 =stack_json= 与 =command= 一律为 NULL，只有 =context_json= 里的 mode / project | I2 的必然结果（停转期间没有可靠 Lisp 回调）。心跳只能证明「停了 N 秒」；定位要靠同一时间窗的 =hourly_functions= / =hourly_stacks= 采样。覆盖率与误差已实测（TD-2，见实测结论 10） |
 | 剖析期间会取走一个采集窗口的样本 | =el-chronos-profile-command= 在观测器运行时复用共享 profiler：先取走当前窗口（该窗口样本归剖析），跑完命令再取差分 | 共享模式下不能重入 =profiler-cpu-start=（见实测结论 2）。代价是剖析期间的那一个采集窗口在 =hourly_functions= 上偏少甚至为空；单命令剖析是低频手动操作，接受此偏差 |
-| 回归判定窗口与显示范围无关 | =el-chronos-analysis-regressions= 忽略 =RANGE=，窗口由 =el-chronos-regression-window-days= 决定 | 报告节标题动态标注真实天数（=回归（近 N 天）=），避免误读；dashboard 的表格标题写死「近 7 天 vs 前 7 天」同理 |
+| 回归判定窗口与显示范围无关 | =el-chronos-analysis-regressions= 忽略 =RANGE=，窗口由 =el-chronos-regression-window-days= 决定 | 报告节标题动态标注真实天数（=回归（近 N 天）=），避免误读 |
 | =db-size= 只看主文件 | 不含 =-wal= / =-shm=，WAL 未 checkpoint 时主文件偏小 | 见 [[file:operations.org][docs/operations.org]]「排障」；要收敛体积跑 =el-chronos-store-vacuum= |
 | 火焰图是「按层聚合近似」 | Web 侧把栈按层级折叠，深度上限 6，宽度按样本数占比 | 不是精确 flame graph：=hourly_stacks= 只保留 top-N 栈，短栈合并；精度足以定位热点路径 |
 | 忽略 =RANGE= 的其它调用点 | =el-chronos-analysis-heatmap= 只取 =dimension='command'= | mode / project 维度不参与热力图（数据仍在 =hourly_usage= 里，可用 SQL 查） |
@@ -397,10 +381,6 @@ DELETE FROM hourly_usage WHERE dimension = 'command' AND key IN ('unknown', 'ano
 - [x] =profiler-cpu-log= 的 hash table 形态与「leaf 在 =aref 0=」的栈顺序实测（见实测结论 1）
 - [x] Web server 边界实测：短连接（=Connection: close=）+ 单线程串行 + 单请求 16KB 上限 → 413 +
       非 GET 405 + 未知路径 404 + 端口占用 =user-error=，均有 ERT 覆盖
-- [x] ETAF 在 =batch= 下可挂载并产生文本（ERT 可断言页面文本，见 [[file:ui.org][docs/ui.org]] 踩坑清单第 8 条）
-- [ ] **ETAF 渲染性能仍未实测**（TD-5）：30 天真实数据下首次渲染与切范围重绘耗时；超 1s 则下调
-      每页行数（=el-chronos-dashboard-page-size=）与图表采样点（=el-chronos-dashboard-chart-points=），
-      必要时改按需渲染。terminal 文本字符图的可读性同样待人工过一遍
 - [x] 采样开销实测（TD-3）：10ms 默认开销低于本机分辨率（噪声地板 ±0.7–1.1%），1ms 档 +0.46%
       外推 10ms ≈ 0.02–0.2%，保持默认 10ms。见实测结论 11
 - [x] 阻塞捕获覆盖率实测（TD-2）：5 个 ≥2s 停转场景 100% 捕获（命令内 / timer 回调 / 进程过滤器 /
