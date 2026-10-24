@@ -311,6 +311,43 @@
                                     (point-min) (point-max))))))
         (kill-buffer buffer)))))
 
+;;; 单条事件下钻：`el-chronos-show-event'
+
+(ert-deftest el-chronos-report-test-show-event-renders ()
+  "事件存在时 `el-chronos-show-event' 渲染 `*el-chronos-event*' 且含栈帧名。
+断言两层：返回的 buffer 就是事件 buffer（而非报告 buffer），且正文里逐条列出
+fixture 的两个栈帧符号与命令名——即真的走了 `--event-content' 的「调用栈」节。"
+  (el-chronos-test-with-db
+    (el-chronos-test--insert-slow-event
+     (el-chronos-test--now-ms) 3000 "block"
+     "el-chronos-test-cmd"
+     "[\"el-chronos-test-frame-a\",\"el-chronos-test-frame-b\"]"
+     "{\"mode\":\"emacs-lisp-mode\",\"project\":\"el-chronos\"}")
+    (let* ((id (el-chronos-test--scalar "SELECT last_insert_rowid()"))
+           (buffer (el-chronos-show-event id)))
+      (unwind-protect
+          (progn
+            (should (bufferp buffer))
+            ;; 事件详情固定落在 `el-chronos-report--event-buffer-name'（"*el-chronos-event*"）
+            (should (equal "*el-chronos-event*" (buffer-name buffer)))
+            (with-current-buffer buffer
+              (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+                (should (string-match-p (format "\\`#\\+TITLE: el-chronos 事件 #%d" id)
+                                        content))
+                (should (string-match-p "el-chronos-test-frame-a" content))
+                (should (string-match-p "el-chronos-test-frame-b" content))
+                (should (string-match-p "el-chronos-test-cmd" content))
+                (should (string-match-p "emacs-lisp-mode" content)))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(ert-deftest el-chronos-report-test-show-event-missing ()
+  "事件 id 不存在时 `el-chronos-show-event' 抛 `user-error'（不建 buffer）。"
+  (el-chronos-test-with-db
+    (should-error (el-chronos-show-event 99999999) :type 'user-error)
+    ;; 非法 id 同样按「不存在」处理，且不留半成品 buffer
+    (should-error (el-chronos-show-event "not-a-number") :type 'user-error)
+    (should-not (get-buffer "*el-chronos-event*"))))
+
 ;;; 报告期间不新增阻塞事件
 
 (ert-deftest el-chronos-report-test--suppress-binding-restored ()

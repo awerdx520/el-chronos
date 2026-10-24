@@ -149,7 +149,7 @@
 
 (defcustom el-chronos-collect-notify-blocks nil
   "心跳检测到主线程阻塞时如何提示。
-阻塞事件**始终**记入 `slow_events'（`kind' = \"block\"）并出现在报告与 dashboard 里，
+阻塞事件**始终**记入 `slow_events'（`kind' = \"block\"）并出现在报告与 Web 页面里，
 本开关只控制「提示」这一层，取任何值都不影响采集与记录。
 
 取值：
@@ -159,7 +159,7 @@
 - t        —— 在 echo area 提示一句（旧语义，兼容既有配置）。
 
 为什么默认静默：这条提示落在 echo area，用户输入中途出现会盖住 minibuffer 候选、
-干扰正常输入；而阻塞本身事后在报告 / dashboard 里可查。需要即时可见性时再显式
+干扰正常输入；而阻塞本身事后在报告 / Web 页面里可查。需要即时可见性时再显式
 改成 `messages'（只进日志）或 `t'（真 echo）。"
   :type '(choice (const :tag "静默（只记录，不提示）" nil)
                  (const :tag "只写 *Messages*" messages)
@@ -194,11 +194,11 @@
 
 (defvar el-chronos-collect--suppress-block-p nil
   "非 nil 时心跳跳过阻塞判定，只推进基线（抑制自观测假阳性）。
-由 `el-chronos-report' 与 `el-chronos-dashboard' 在渲染期间 `let' 绑定为 t；
+由 `el-chronos-report' 在渲染期间 `let' 绑定为 t；
 `el-chronos-collect--heartbeat' 用 `bound-and-true-p' 读取并据此跳过阻塞判定，
 同时把 `el-chronos-collect--last-heartbeat' 推进到当前时刻 —— 否则解除绑定后
 那一次补跑的心跳会把整段渲染耗时算成一条巨型阻塞（I2 只认时间差，无法事后区分）。
-两个可视化模块各自 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量报
+report 侧 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量报
 `void-variable'；同义重复声明无副作用。")
 
 (defvar el-chronos-collect--timers nil
@@ -652,7 +652,7 @@ Emacs 31.1：hook 内 `get-buffer-create' 再触发同一个 hook 一次），�
 
 (defun el-chronos-collect--internal-buffer-p (buffer)
   "BUFFER 是否是「内部 buffer」（名字以空格开头，Emacs 约定不可见）。
-这类 buffer（ETAF 挂载用的 ` *work*'、`with-temp-buffer' 的临时 buffer 等）不承载
+这类 buffer（渲染层挂载用的 ` *work*'、`with-temp-buffer' 的临时 buffer 等）不承载
 用户命令，不给它们补挂命令计时 hook；只判断名字，不读 buffer 内容。"
   (let ((name (buffer-name buffer)))
     (and (stringp name) (> (length name) 0) (eq (aref name 0) ?\s))))
@@ -670,9 +670,9 @@ Emacs 31 起两个 command hook 是 auto-buffer-local：buffer 一旦有局部�
 在无局部绑定时会回落全局值，区分不出这两种情况，故只在确认有局部绑定后才用它读局部值。
 
 跳过 minibuffer：其命令循环语义与普通 buffer 不同（`minibufferp' 为真即跳过）。
-跳过**内部 buffer**（名字以空格开头，见 `--internal-buffer-p`）：ETAF 挂载、`with-temp-buffer`
+跳过**内部 buffer**（名字以空格开头，见 `--internal-buffer-p`）：`with-temp-buffer`
 等每次渲染都会新建这类 buffer，它们不承载用户命令，补挂既无意义，又让
-`buffer-list-update-hook' 在每次渲染时反复遍历全部 buffer（「打开 dashboard 要碰全部
+`buffer-list-update-hook' 在每次渲染时反复遍历全部 buffer（「每次渲染要碰全部
 buffer」的观感来源）。跳过也登记，避免下次重复判断。
 每个 buffer 单独 `condition-case'，单个 buffer 失败不影响其余（I6），整体再兜一层；
 `--ensuring-p' 挡住 `buffer-list-update-hook' 的重入。

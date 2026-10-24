@@ -611,9 +611,9 @@ buffer 名**不以空格开头**：内部 buffer（空格开头）按 `--interna
 
 (ert-deftest el-chronos-collect-test-skips-internal-buffers ()
   "内部 buffer（名字以空格开头）即使局部值遮蔽全局值也不补挂，但仍然登记。
-ETAF 挂载、`with-temp-buffer' 每次渲染都会新建这类 buffer：补挂没有意义（它们不承载
+`with-temp-buffer' 每次渲染都会新建这类 buffer：补挂没有意义（它们不承载
 用户命令），却会让 `buffer-list-update-hook' 反复遍历全部 buffer、把 `--hooked-buffers'
-撑大（dashboard 重复打开时的观感负担）。登记仍要做，避免每次 buffer 切换重复判断。"
+撑大（重复渲染时的观感负担）。登记仍要做，避免每次 buffer 切换重复判断。"
   (let ((el-chronos-heartbeat-seconds 3600)
         (el-chronos-sample-window-seconds 3600)
         (buf (generate-new-buffer " *chronos-internal*")))

@@ -9,7 +9,7 @@
 ;;; Commentary:
 
 ;; 只读聚合查询层：把 SQLite 明细整理成纯数据（plist / list of plist），供 org 报告（T7）、
-;; ETAF 页面（T8）、Web API（T9）三方共用，SQL 只写在这里。
+;; Web API（T9）两方共用，SQL 只写在这里。
 ;;
 ;; 约定：首参 RANGE 取 `1d' / `7d' / `30d'（按当前时刻倒推）或显式半开区间
 ;; `(START . END)'（epoch 毫秒）；例外是 `el-chronos-analysis-regressions'——它的对比窗口由
