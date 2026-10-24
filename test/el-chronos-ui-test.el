@@ -40,6 +40,7 @@
 (require 'sqlite)
 (require 'el-chronos)
 (require 'el-chronos-store)
+(require 'el-chronos-collect)            ; `--heartbeat'：验证渲染不新增假阻塞
 (require 'el-chronos-dashboard)
 (require 'el-chronos-web)
 
@@ -156,6 +157,13 @@
                                                   "el-chronos-test-frame-b"))
                           (json-serialize context)))
     (or (caar (sqlite-select db "SELECT max(id) FROM slow_events")) 0)))
+
+(defun el-chronos-ui-test--count-block-events ()
+  "当前测试库里 `slow_events' 中 kind=\"block\" 的行数。
+心跳假阻塞的判据：渲染前后该计数必须不变（`el-chronos-collect--heartbeat' 判定阻塞后
+把事件塞进 store 的待写缓冲，`el-chronos-store-flush' 之后才落库，故调用前先 flush）。"
+  (when-let* ((db (el-chronos-store-open)))
+    (or (caar (sqlite-select db "SELECT count(*) FROM slow_events WHERE kind='block'")) 0)))
 
 ;;; dashboard：形态与内容（降级路径）
 
@@ -389,6 +397,32 @@ fixture 放一条「1 小时内」（确定落在 1d 窗口内）与一条「5 �
     (let ((el-chronos-dashboard--state (list :range "7d" :page 0 :selected nil)))
       (should-error (el-chronos-dashboard-show-event) :type 'user-error))))
 
+(ert-deftest el-chronos-ui-test-dashboard-suppresses-block-event ()
+  "渲染后心跳不新增 `block' 行：对照组（绕过抑制入口）会新增，抑制入口（`el-chronos-dashboard'）不会。
+`el-chronos-collect--last-heartbeat' 必须在 `let' 内读取 —— 它是 dynamic binding，
+出 `let' 后读到的是全局值。"
+  (el-chronos-ui-test--with-temp-db
+    (el-chronos-ui-test--with-fallback
+      (let ((el-chronos-collect-notify-blocks nil)
+            (baseline 0) (after-suppress 0) (age 0.0))
+        ;; 对照组：直接跑渲染、模拟 5s 前的心跳基线 → 心跳判定为阻塞（证明假阳性真实存在）
+        (let ((el-chronos-collect--last-heartbeat (- (float-time) 5.0)))
+          (el-chronos-dashboard--render-fallback "7d")
+          (el-chronos-collect--heartbeat))
+        (el-chronos-store-flush)
+        (setq baseline (el-chronos-ui-test--count-block-events))
+        (should (= 1 baseline))         ; 假阳性 1 行（fixture 未插 block 行）
+        ;; 修复后：走 `el-chronos-dashboard' 入口，基线被重设 → 心跳不再记阻塞
+        (let ((el-chronos-collect--last-heartbeat (- (float-time) 5.0)))
+          (el-chronos-dashboard "7d")
+          (el-chronos-collect--heartbeat)
+          (setq age (- (float-time) el-chronos-collect--last-heartbeat)))
+        (el-chronos-store-flush)
+        (setq after-suppress (el-chronos-ui-test--count-block-events))
+        (should (= baseline after-suppress))
+        ;; 基线确实被推进（不是靠运气把 gap 抹平）
+        (should (< age 1.0))))))
+
 ;;; Web server：启停、路由与边界
 
 (ert-deftest el-chronos-ui-test-web-start-stop ()
@@ -397,6 +431,7 @@ fixture 放一条「1 小时内」（确定落在 1d 窗口内）与一条「5 �
     (ignore-errors (el-chronos-web-stop))
     (unwind-protect
         (progn
+          (should-not (el-chronos-web-running-p))
           (let* ((proc (el-chronos-web-start 0))
                  (port (process-contact proc :service)))
             (should (processp proc))
@@ -410,6 +445,22 @@ fixture 放一条「1 小时内」（确定落在 1d 窗口内）与一条「5 �
             (should (el-chronos-web-running-p))
             (should (integerp (process-contact again :service)))))
       (ignore-errors (el-chronos-web-stop)))))
+
+(ert-deftest el-chronos-ui-test-web-running-p-returns-boolean ()
+  "`el-chronos-web-running-p' 严格返回 `t' / nil，不得把 `process-live-p' 的状态关键字
+（`listen' / `connect' / `stop'）泄漏给调用方。"
+  (el-chronos-ui-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (should-not (el-chronos-web-running-p))
+    (let ((proc (el-chronos-web-start 0)))
+      (unwind-protect
+          (progn
+            (should (processp proc))
+            ;; 底层状态确实不是布尔：这正是需要归一的原因
+            (should-not (eq t (process-live-p proc)))
+            (should (eq t (el-chronos-web-running-p))))
+        (ignore-errors (el-chronos-web-stop)))
+      (should-not (el-chronos-web-running-p)))))
 
 (ert-deftest el-chronos-ui-test-web-binds-loopback ()
   "server 只绑 127.0.0.1（I8：不接受 0.0.0.0）。"

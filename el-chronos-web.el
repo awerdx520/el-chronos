@@ -433,9 +433,12 @@ KIND 取 `range'（QUERY 只接受 range，如 sessions）、`all'（range + nil
 ;;; 启停
 
 (defun el-chronos-web-running-p ()
-  "Web server 是否正在运行。"
-  (and (processp el-chronos-web--process)
-       (process-live-p el-chronos-web--process)))
+  "Web server 是否正在运行；严格返回 `t' 或 nil。
+`process-live-p' 的状态是关键字（`listen' / `connect' / `stop' 等），直接返回会把状态
+关键字泄漏给调用方（`(if (running-p) ...)' 仍能用，但 `(eq t ...)' 这类布尔断言会失败，
+且调用方可能把 `stop' 误当运行中）。故归一为 `t' / nil。"
+  (let ((proc el-chronos-web--process))
+    (and (processp proc) (process-live-p proc) t)))
 
 (defun el-chronos-web-start (&optional port)
   "启动 Web dashboard，返回 server 进程对象。

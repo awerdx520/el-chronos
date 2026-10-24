@@ -12,6 +12,12 @@
 ;; `el-chronos-analysis'（本模块不写 SQL、不写库、不改采集行为）；阻塞事件的完整栈复用
 ;; `el-chronos-report' 的 `*el-chronos-event*'。
 ;;
+;; 自观测抑制：渲染是慢路径（首次渲染含 ETAF 组件定义 + 快照查询，实测约 2.8s），会被
+;; 1s 心跳记成一条 `block' 事件 —— 观测者在观测自己，属假阳性。`el-chronos-dashboard' 与
+;; `--refresh' 套用与 `el-chronos-report--without-block-events' 同款的**三层**抑制
+;; （抑制变量 + 抬高阈值 + 重置心跳基线），见
+;; `el-chronos-dashboard--without-block-events'。只包渲染入口，不包纯读取函数。
+;;
 ;; 两种形态（I9 / I11）：ETAF 可用 → `*el-chronos*' 是 `etaf-mount' 挂载的 ETAF 页面；
 ;; ETAF 缺失 → `display-warning' 提示安装 + `tabulated-list-mode' 降级页（慢命令区块 +
 ;; 热点函数区块 + `1'/`7'/`3' 切范围），不是空壳。图表在非图形 frame 下降级为文本字符图。
@@ -64,6 +70,46 @@ ETAF 由 `etaf' 与 `etaf-ui' 提供（recipe 见 thomas-emacs 的 `lisp/init-et
 (defun el-chronos-dashboard-etaf-available-p ()
   "返回 ETAF（`etaf' + `etaf-ui'）是否可用；只读探测，不重新 require。"
   (and (bound-and-true-p el-chronos-dashboard--etaf-available-p) t))
+
+;;; 自观测抑制（与 `el-chronos-report' 同机制，三层缺一不可）
+
+(defvar el-chronos-collect--suppress-block-p nil
+  "非 nil 时采集层心跳跳过阻塞判定。
+由报告层（`el-chronos-report--without-block-events'）与页面层
+（`el-chronos-dashboard--without-block-events'）在重查询 / 渲染期间 `let' 绑定为 t；
+本文件只声明 + 绑定，不读取。跨模块 `let' 绑定未声明变量会 `void-variable'，故必须
+`defvar' 声明（与 `el-chronos-collect' 侧同名同义，重复声明无副作用）。")
+
+(defvar el-chronos-collect--last-heartbeat nil
+  "上一次心跳的实际触发时刻（`float-time'），采集层持有。
+本文件只在渲染结束后重设基线：主线程被渲染占住期间心跳 timer 不会运行，`let' 绑定在渲染
+返回时就已解除，心跳是在**之后**才补跑的 —— 只做前两层抑制拦不住这次补跑。")
+
+(defconst el-chronos-dashboard--suppress-block-threshold-ms 60000
+  "渲染期间临时抬高的阻塞阈值（毫秒），作为抑制变量的兜底（60s 足够覆盖一次渲染）。")
+
+(defmacro el-chronos-dashboard--without-block-events (&rest body)
+  "在 BODY 执行期间抑制采集层把「页面渲染耗时」记成阻塞事件，返回 BODY 的值。
+
+与 `el-chronos-report--without-block-events' 同款三层保护（缺一不可）：
+
+1. 绑定 `el-chronos-collect--suppress-block-p' 为 t —— 采集层心跳据此跳过判定；
+2. 把 `el-chronos-block-threshold-ms' 临时抬到
+   `el-chronos-dashboard--suppress-block-threshold-ms'（60s）—— 兜住「抑制变量还没被
+   采集层读取」的过渡期；
+3. 收尾把 `el-chronos-collect--last-heartbeat' 重设为当前时刻 —— **唯一有效的一层**：
+   主线程被 BODY 占住时心跳 timer 根本不运行，`let' 绑定在 BODY 返回时就已解除，心跳
+   是在之后才补跑、看到整段 gap 的；不重置基线，前两层都拦不住这次补跑（report 侧已
+   实测验证）。
+
+代价：渲染期间恰好发生的**真实**阻塞也不会被记录。有意取舍 —— 首屏渲染 / 刷新是用户主动
+触发的一次性重绘，其耗时属预期行为，不该混进「待排查的卡顿」里。"
+  (declare (indent 0) (debug t))
+  `(let ((el-chronos-collect--suppress-block-p t)
+         (el-chronos-block-threshold-ms el-chronos-dashboard--suppress-block-threshold-ms))
+     (unwind-protect
+         (progn ,@body)
+       (setq el-chronos-collect--last-heartbeat (float-time)))))
 
 ;;; 常量与自定义项
 
@@ -848,12 +894,15 @@ tabulated-list（标题行也是条目），保证 `*el-chronos*' 仍是 tabulat
 ;;; 命令
 
 (defun el-chronos-dashboard--refresh ()
-  "重绘当前形态（ETAF 或降级）的页面，返回页面 buffer。"
-  (let ((range (or (plist-get el-chronos-dashboard--state :range)
-                   el-chronos-dashboard--default-range)))
-    (if (el-chronos-dashboard-etaf-available-p)
-        (el-chronos-dashboard--render-etaf range)
-      (el-chronos-dashboard--render-fallback range))))
+  "重绘当前形态（ETAF 或降级）的页面，返回页面 buffer。
+渲染属慢路径（快照查询 + ETAF 组件定义 + 挂载），期间抑制采集层的阻塞判定，避免观测者
+把自身渲染记成 `block' 事件（见 `el-chronos-dashboard--without-block-events'）。"
+  (el-chronos-dashboard--without-block-events
+    (let ((range (or (plist-get el-chronos-dashboard--state :range)
+                     el-chronos-dashboard--default-range)))
+      (if (el-chronos-dashboard-etaf-available-p)
+          (el-chronos-dashboard--render-etaf range)
+        (el-chronos-dashboard--render-fallback range)))))
 
 (defun el-chronos-dashboard-refresh ()
   "刷新 `*el-chronos*' 页面（快捷键 `g'），返回页面 buffer。"
@@ -955,21 +1004,25 @@ UI 状态与显示用字符串，下给 analysis 的查询一律转成符号（�
 
 形态选择（I9 / I11）：ETAF 可用 → ETAF 页面（组件树 + SVG 图表 + 表格 + 下钻，图形
 frame 用 SVG、terminal frame 用文本字符图）；ETAF 不可用 → `display-warning' 提示安装
-并降级到 tabulated-list 简版页面，不抛错。"
+并降级到 tabulated-list 简版页面，不抛错。
+
+渲染是慢路径（首次渲染含 ETAF 组件定义与快照查询，实测约 2.8s），整段套
+`el-chronos-dashboard--without-block-events'，避免这次自身耗时被心跳记成 `block' 事件。"
   (interactive)
-  (let ((buffer
-         (if (el-chronos-dashboard-etaf-available-p)
-             (el-chronos-dashboard--render-etaf range)
-           (display-warning
-            'el-chronos
-            (concat "ETAF 不可用，el-chronos 已降级为 tabulated-list 简版页面"
-                    "（慢命令 + 热点函数两张表、1/7/3 切时间范围）。"
-                    "安装后可用完整页面：straight recipe 见 thomas-emacs 的 lisp/init-etaf.el"
-                    "（需 ecss / ebox / etaf / etaf-ui 四个包，编译期顺序不可乱）。")
-            :warning)
-           (el-chronos-dashboard--render-fallback range))))
-    (unless noninteractive (display-buffer buffer))
-    buffer))
+  (el-chronos-dashboard--without-block-events
+    (let ((buffer
+           (if (el-chronos-dashboard-etaf-available-p)
+               (el-chronos-dashboard--render-etaf range)
+             (display-warning
+              'el-chronos
+              (concat "ETAF 不可用，el-chronos 已降级为 tabulated-list 简版页面"
+                      "（慢命令 + 热点函数两张表、1/7/3 切时间范围）。"
+                      "安装后可用完整页面：straight recipe 见 thomas-emacs 的 lisp/init-etaf.el"
+                      "（需 ecss / ebox / etaf / etaf-ui 四个包，编译期顺序不可乱）。")
+              :warning)
+             (el-chronos-dashboard--render-fallback range))))
+      (unless noninteractive (display-buffer buffer))
+      buffer)))
 
 (provide 'el-chronos-dashboard)
 
