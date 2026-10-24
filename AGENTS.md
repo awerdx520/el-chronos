@@ -188,7 +188,7 @@ ss -lntH "sport = :8787"
 | 用户文档 | `Readme.org`；变更日志 `CHANGELOG.md`（Keep a Changelog 格式） |
 | 技术文档 | `docs/architecture.org`（时序、数据流、实测结论）、`docs/schema.org`（DDL 与查询示例）、`docs/ui.org`（两形态界面、Web dashboard 路由与降级规则）、`docs/api.org`（接口索引）、`docs/operations.org`（装卸、清理、排障） |
 
-> 当前 `openspec/active/` 为空（只有 `.gitkeep`）：`remove-dashboard-web-only.md`、`fix-web-block-suppression.md`、`fix-sampling-attribution.md` 均已归档到 `openspec/completed/`（2026-10-24 / 2026-10-25）。
+> 当前 `openspec/active/` 含 `expand-observation-surface.md`（Phase 2 计划，待用户确认）；`remove-dashboard-web-only.md`、`fix-web-block-suppression.md`、`fix-sampling-attribution.md` 已归档到 `openspec/completed/`（2026-10-24 / 2026-10-25）。
 
 文档与代码同步：改接口/改 schema 必须同时更新 `docs/schema.org` 与 ADR 相关条目；
 新增已完成任务须在 `CHANGELOG.md` 的 `[Unreleased]` 段记录。
