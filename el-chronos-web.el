@@ -162,6 +162,50 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
         (min (truncate num) el-chronos-web--max-limit)
       default)))
 
+;;; 自观测抑制（TD-12）
+;;
+;; Web 请求在主线程同步处理（查询 + 序列化 + 发送），耗时会被 1s 心跳判成"主线程阻塞"，
+;; 形成"观测器自伤"记录。下面三个定义与 `el-chronos-report--without-block-events' 同款
+;; 三层机制；两处为**内联重复实现**（有意为之：web 不 require report 也不 require collect，
+;; 保持零额外依赖），任何一处改动都必须同步另一处。
+
+(defvar el-chronos-collect--suppress-block-p nil
+  "非 nil 时采集层心跳跳过阻塞判定。
+由 Web 层在请求处理期间 `let' 绑定为 t；**读取方在 `el-chronos-collect'**（心跳里
+`bound-and-true-p' 判断并推进基线），Web 层本身不读它。此处仅声明以避免跨模块 `let'
+绑定未声明变量报 `void-variable'；与 collect / report 侧同名同义，重复声明无副作用。")
+
+(defvar el-chronos-collect--last-heartbeat nil
+  "上一次心跳的实际触发时刻（`float-time'），采集层持有。
+Web 层只在一个场合写它：请求处理结束后重设基线，避免「请求耗时」被下一次心跳补算成阻塞
+（主线程被占住期间心跳 timer 不会运行）。")
+
+(defconst el-chronos-web--suppress-block-threshold-ms 60000
+  "Web 请求处理期间临时抬高的阻塞阈值（毫秒），作为抑制变量的兜底：
+即使 collect 侧尚未读取 `el-chronos-collect--suppress-block-p'，60s 也足够覆盖一次请求。")
+
+(defmacro el-chronos-web--without-block-events (&rest body)
+  "在 BODY 执行期间抑制采集层把「Web 请求处理耗时」记成阻塞事件，返回 BODY 的值。
+
+三层保护（缺一不可，与 `el-chronos-report--without-block-events' 同款）：
+
+1. 绑定 `el-chronos-collect--suppress-block-p' 为 t —— 采集层心跳据此直接跳过判定；
+2. 把 `el-chronos-block-threshold-ms' 临时抬到
+   `el-chronos-web--suppress-block-threshold-ms'（60s）—— 兜住「抑制变量还没被
+   采集层读取」的过渡期；
+3. 收尾把 `el-chronos-collect--last-heartbeat' 重设为当前时刻 —— 关键一步：主线程被
+   BODY 占住时心跳 timer 根本不会运行，`let' 绑定在 BODY 返回时就已解除，心跳是在**之后**
+   才补跑、看到整段 gap 的。只做 1、2 两层拦不住这一次补跑，必须重置基线。
+
+代价：请求处理期间恰好发生的**真实**阻塞也不会被记录。这是有意取舍 —— Web 请求是用户
+主动触发的重查询，其耗时属预期行为，不该混进「待排查的卡顿」里。"
+  (declare (indent 0) (debug t))
+  `(let ((el-chronos-collect--suppress-block-p t)
+         (el-chronos-block-threshold-ms el-chronos-web--suppress-block-threshold-ms))
+     (unwind-protect
+         (progn ,@body)
+       (setq el-chronos-collect--last-heartbeat (float-time)))))
+
 ;;; HTTP 层
 
 (defun el-chronos-web--parse-request (raw)
@@ -238,27 +282,30 @@ STATUS 是 `200 OK' 这类状态行文本，TYPE 是 Content-Type，BODY 是响�
 500 分支**不回显内部错误**：浏览器只看到通用文案（内部报错常含绝对路径、SQL 片段、
 变量值，回显等于对外泄露本机信息），`error-message-string' 改由 `display-warning'
 写到 Emacs 侧（`*Messages*' / `*Warnings*'），本机用户仍能排障（I11：可见降级，
-但可见面在 Emacs 而不是公网响应体）。"
-  (let ((resp (condition-case err
-                  (if-let* ((req (el-chronos-web--parse-request raw)))
-                      (el-chronos-web--dispatch req)
-                    (el-chronos-web--response "400 Bad Request" el-chronos-web--text-type
-                                              "<h1>400 Bad Request</h1>"))
-                (error
-                 (display-warning
-                  'el-chronos
-                  (format "Web dashboard 请求处理失败（%s）：%s"
-                          (or (plist-get (ignore-errors (el-chronos-web--parse-request raw))
-                                         :path)
-                              "?")
-                          (error-message-string err))
-                  :warning)
-                 (el-chronos-web--response
-                  "500 Internal Server Error" el-chronos-web--text-type
-                  (concat "<h1>500 Internal Server Error</h1>"
-                          "<p>请求处理失败。内部错误详见 Emacs 的 *Messages*。</p>"))))))
-    (el-chronos-web--send-response proc (plist-get resp :status) (plist-get resp :type)
-                                   (plist-get resp :body) (plist-get resp :headers))))
+但可见面在 Emacs 而不是公网响应体）。
+请求处理期间抑制采集层的阻塞判定（见 `el-chronos-web--without-block-events'），
+避免 Web 重查询被心跳记为「观测器自伤」阻塞（TD-12）。"
+  (el-chronos-web--without-block-events
+    (let ((resp (condition-case err
+                    (if-let* ((req (el-chronos-web--parse-request raw)))
+                        (el-chronos-web--dispatch req)
+                      (el-chronos-web--response "400 Bad Request" el-chronos-web--text-type
+                                                "<h1>400 Bad Request</h1>"))
+                  (error
+                   (display-warning
+                    'el-chronos
+                    (format "Web dashboard 请求处理失败（%s）：%s"
+                            (or (plist-get (ignore-errors (el-chronos-web--parse-request raw))
+                                           :path)
+                                "?")
+                            (error-message-string err))
+                    :warning)
+                   (el-chronos-web--response
+                    "500 Internal Server Error" el-chronos-web--text-type
+                    (concat "<h1>500 Internal Server Error</h1>"
+                            "<p>请求处理失败。内部错误详见 Emacs 的 *Messages*。</p>"))))))
+      (el-chronos-web--send-response proc (plist-get resp :status) (plist-get resp :type)
+                                     (plist-get resp :body) (plist-get resp :headers)))))
 
 (defun el-chronos-web--client-sentinel (proc _event)
   "客户端 PROC 断开后清掉它的未完成请求缓冲。"

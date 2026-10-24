@@ -227,6 +227,46 @@
       (when (process-live-p blocker) (delete-process blocker))
       (ignore-errors (el-chronos-web-stop)))))
 
+;; TD-12：Web 请求处理期间的自观测抑制（与 report 侧同款三层机制，端到端锁住）
+(ert-deftest el-chronos-web-test-suppresses-block-events ()
+  "请求处理期间抑制采集层阻塞判定，结束后恢复原值并重置心跳基线（TD-12）。
+三层都要验：① 抑制变量在请求体内为 t；② 阻塞阈值抬到 60s；③ 结束后基线被重置
+（否则解除抑制后补跑的那次心跳仍会把整段请求耗时记成阻塞）。
+用 `cl-letf' 替换路由处理器在**请求体内**取样：只在处理器被调用时才能看到抑制期间的值，
+事后从外部读只会读到已恢复的原值。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--with-server
+      (let* ((baseline (- (float-time) 100))
+             (seen-suppress 'unset)
+             (seen-threshold 'unset)
+             (seen-heartbeat 'unset)
+             (el-chronos-collect--suppress-block-p nil)
+             (el-chronos-block-threshold-ms 2000)
+             (el-chronos-collect--last-heartbeat baseline))
+        (cl-letf (((symbol-function 'el-chronos-web--route-summary)
+                   (lambda (_params)
+                     (setq seen-suppress el-chronos-collect--suppress-block-p
+                           seen-threshold el-chronos-block-threshold-ms
+                           seen-heartbeat el-chronos-collect--last-heartbeat)
+                     (el-chronos-web--response "200 OK" el-chronos-web--json-type
+                                               "{\"range\":\"7d\"}"))))
+          (let ((response (el-chronos-web-test--http "GET" "/api/summary")))
+            ;; 处理器的确被调用（否则下面对 'unset 的断言会以更晦涩的方式失败）
+            (should (equal 200 (plist-get response :status)))
+            (should (string-match-p "7d" (plist-get response :body)))
+            ;; ① 请求体内抑制变量为 t
+            (should (eq t seen-suppress))
+            ;; ② 阈值在请求体内抬到 60s
+            (should (= el-chronos-web--suppress-block-threshold-ms seen-threshold))
+            ;; 第 3 层只在收尾写基线：请求体内读到的仍是进入前的值
+            (should (= baseline seen-heartbeat))
+            ;; 请求结束后两层 `let' 绑定都恢复原值
+            (should-not el-chronos-collect--suppress-block-p)
+            (should (= 2000 el-chronos-block-threshold-ms))
+            ;; ③ 基线被重置到 ≈now（进入前是 now-100，不重置则相差约 100 秒）
+            (should (> el-chronos-collect--last-heartbeat (+ baseline 50)))
+            (should (< (- (float-time) el-chronos-collect--last-heartbeat) 2))))))))
+
 (provide 'el-chronos-web-test)
 
 ;;; el-chronos-web-test.el ends here
