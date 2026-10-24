@@ -209,25 +209,27 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 - 残余风险：去重是时间窗比较，两次**真实**相邻命令若相隔 <1ms 会被误合并（人类输入远达不到，
   键盘重复率上限约 30 Hz）。
 
-** 9. 报告自观测抑制：只有重置心跳基线有效
+** 9. 报告自观测抑制：三层防护 + 心跳侧感知
 
-需求：报告生成（首次加载 org + 13 个 analysis 查询，实测约 2.7s）不能被自己的 1s 心跳判为
-阻塞——那是观测者在观测自己，属假阳性。=el-chronos-report--without-block-events= 用三层：
+需求：报告生成 / dashboard 渲染（首次加载 org + 13 个 analysis 查询 + ETAF 组件初始化，实测约 2.7s）
+不能被自己的 1s 心跳判为阻塞——那是观测者在观测自己，属假阳性。
+=el-chronos-report--without-block-events= 与 =el-chronos-dashboard--without-block-events= 用三层：
 
-1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧心跳用 =bound-and-true-p=
-   读取后直接跳过判定（跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 侧先 =defvar=
-   声明同名变量）；
+1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧 =el-chronos-collect--heartbeat=
+   用 =bound-and-true-p= 读取：**非 =nil= 时推进 =--last-heartbeat= 基线并跳过阻塞判定**
+   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report / dashboard 侧先 =defvar= 声明同名变量）；
 2. 把 =el-chronos-block-threshold-ms= 临时抬到 60s（=--suppress-block-threshold-ms=），
-   兜住「抑制变量尚未被 collect 侧读取」的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
+   兜住抑制变量尚未生效的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
 3. **收尾在 =unwind-protect= 清理段把 =el-chronos-collect--last-heartbeat= 重设为当前时刻**。
 
-为什么第 3 层不可省（也是唯一根本手段）：**心跳 timer 在 BODY 执行期间根本不运行**（主线程被占），
-而 =let= 绑定在 BODY 返回时就已解除；补跑的那次心跳发生在**之后**，此刻
-=--last-heartbeat= 仍是报告开始前的时刻，gap = 报告时长 → 判成一条巨型阻塞。第 1、2 层都拦不住
-这一次补跑，只有把基线重置到「现在」才能让差值归零。
+三层各自负责什么：**BODY 执行期间心跳 timer 基本不运行**（主线程被占），结束后才补跑一次；
+那次补跑发生在 BODY 返回、=let= 绑定**已解除之后**，此刻抑制变量已是 =nil=，所以判定照跑——
+只有第 3 层（把基线重置到「现在」）能让差值归零，这是它不可省的原因。反过来，若 BODY 内部
+有让出主线程的间隙让心跳真的跑了一次，则靠第 1 层：心跳**推进基线 + 跳过判定**，
+因此**抑制期间不产生 block 事件，解除绑定后也不补记整段 gap**。
 
-副作用：报告期间若真发生阻塞也不会被记录。有意接受——报告是用户主动触发的重查询，其耗时属
-预期行为，不该混进「待排查的卡顿」。
+取舍：抑制期间若真发生阻塞也不会被记录。有意接受——报告 / 首次渲染是用户主动触发的重操作，
+其耗时属预期行为，不该混进「待排查的卡顿」。
 
 * 已知偏差（有意为之，不是 bug）
 

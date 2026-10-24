@@ -20,7 +20,7 @@
 - **单命令高精度剖析** `el-chronos-profile-command`（T11）：在 1ms CPU 采样下当场执行一次命令，输出热点 / 调用链 / 包归属 / 优化建议；profiler 已被常驻采样占用时复用共享模式（不自起自停）；`el-chronos-profile-save` 非 nil 时结果落 `slow_events(kind="profile")`。
 - **ERT 测试初期 76 用例**（`test/` 6 个文件，`make test` 自动发现）：schema / 迁移 / 批量写入 / 保留策略 / top-N 淘汰 / purge、归因链与 basename 隐私断言、命令三态与心跳阻塞、采样聚合自洽、analysis 13 查询 fixture、回归判定、dashboard（ETAF 与降级两路）与 Web 路由冒烟（405 / 404 / 端口占用 / start-stop）。
 - **报告层测试**（`test/el-chronos-report-test.el`，419 行 / 22 用例）：org 报告 10 节结构与动态回归窗口标题、周报、CSV/JSON 导出、单事件详情、单命令剖析 `--invoke` 三形态参数、Web 500 错误隐藏、端口 0 实际端口显示。
-- **ERT 总计 103 用例**（7 个测试文件；分布 report 22 / ui 23 / analysis 15 / collect 15 / store 14 / attrib 14），源码 8 模块 + 测试 7 文件共 6921 行；`make full-check` 全绿（`Ran 103 tests, 103 results as expected, 0 unexpected`，约 5.7 s），`make lint` 零告警。
+- **ERT 总计 106 用例**（7 个测试文件；分布 report 22 / ui 25 / collect 16 / analysis 15 / store 14 / attrib 14），源码 8 模块 + 测试 7 文件共 7067 行；`make full-check` 全绿（`Ran 106 tests, 106 results as expected, 0 unexpected`，约 4.6 s），`make lint` 零告警。
 - **文档**：新增 `docs/ui.org`（三形态总览、ETAF 组件树与 10 项能力映射、快捷键、**ETAF 10 条实测踩坑**、13 条 Web 路由表、org 报告 10 节、性能注意与 TD-5）、`docs/api.org`（8 模块对外接口索引、defcustom 清单、内部函数 `--` 不承诺兼容）、`docs/operations.org`（安装/卸载/数据清理/排障/验证步骤/隐私与保留表）；`docs/architecture.org` 补「实测结论」与「已知偏差」，`docs/schema.org` 补最终 DDL、top-N 淘汰 SQL、`session_id` 事实非空约束与 P95 近似说明；ADR-0002 状态转 Accepted 并补「实施结果」；`Readme.org`、`AGENTS.md` 同步。
 - 项目初始化：建立仓库骨架（`Makefile` 验证入口、`.gitignore`、`AGENTS.md` 仓库地图、`Readme.org` 项目说明）。
 - 设计计划：`openspec/active/el-chronos-core.md`，定义观测器分层、数据模型、采集策略、不变量与 T1–T10 任务分解。
@@ -51,7 +51,10 @@
 - **命令双记**（D1）：`pre-command-hook` 的局部值若含 `t` 标记，会**连跑**全局默认值，与「全局默认值 + 每个 buffer 局部补挂」方案叠加后每条命令产生 `ok` + `aborted` 两条记录，导致命令计数、使用频次、中断率全部翻倍。修复：只在局部值**不含** `t` 时才补挂（不含 `t` 的局部值才是完整的遮蔽值），并加 1ms 去重兜底（同一 `(命令 . 时间)` 窗口内只记一次）。
 - **profiler 帧名未归一**：`profiler` 回调给出的帧名可能是 `nil`（匿名帧）或闭包 `byte-code` 对象（形如 `#[0 "\300\207" [] 1]`），报告里直接出现 `nil` 与超长 `#[0 ...]` 串。修复：新增归一函数把 nil 映射为 `(anonymous)`、闭包对象映射为 `(closure)`，`el-chronos-collect` / `el-chronos-analysis` 两侧统一走归一。
 - **中间帧占据排行**：`top-functions` / `package-breakdown` 原先按 `total_ms` 排序，`samples=0` 的中间帧（只出现在栈中、从未作为 leaf 被采样）会挤掉真正的热点。修复：两个查询都以 `samples > 0` 为前置过滤，pct 分母同步改为 leaf 样本总数。
-- **报告生成被记为阻塞事件**：`el-chronos-report` 首次 `(require 'org)` 约 2.7 s，被自身 1s 心跳判为阻塞并落库，污染阻塞统计。修复见 `docs/architecture.org`「报告自观测抑制」——报告期间绑定抑制变量 + `unwind-protect` 内重置心跳基线（第三层机制，唯一有效手段）。
+- **报告生成被记为阻塞事件**：`el-chronos-report` 首次 `(require 'org)` 约 2.7 s，被自身 1s 心跳判为阻塞并落库，污染阻塞统计。修复见 `docs/architecture.org`「报告自观测抑制」——报告期间绑定抑制变量 + 抬高阈值 + `unwind-protect` 内重置心跳基线（三层机制；其中「重置基线」负责拦截事后补跑的补记，抑制变量本身由 collect 心跳读取，见下方「抑制层空转」条）。
 - **单命令剖析 `--invoke` 参数语义**：`el-chronos-profile-command` 的 `ARGS` 为列表时原先被当作单参数塞给命令，导致 `find-file` 这类多参数命令只收到一个拼接串。修复：`nil` / 列表 / 单值三形态归一（列表按参数逐个 `funcall`，单值包成单元素列表）。
 - **Web 500 响应泄露内部错误**：异常时错误详情（含 elisp 符号与栈片段）被直接写进 HTTP 响应体。修复：浏览器只回通用文案「内部错误，详见 *Messages*」，详情写 `*Messages*` 供排障。
 - **Web 端口 0 显示错误**：`el-chronos-web-start` 传 `:port 0`（由系统分配端口）时 message 显示 `0` 而非实际监听端口。修复：从 `make-network-process` 返回的进程读取真实端口后再提示。
+- **抑制层空转**：`el-chronos-report--without-block-events` / `el-chronos-dashboard--without-block-events` 早已绑定 `el-chronos-collect--suppress-block-p`，但 collect 侧心跳从不读取它——`let` 绑定形同空转，抑制完全依赖事后重置基线。修复：`el-chronos-collect--heartbeat` 用 `bound-and-true-p` 读取该变量，**抑制期间推进 `--last-heartbeat` 基线并跳过阻塞判定**，解除绑定后不再补记整段 gap。三层防护自此每层都有实际作用（新增 `el-chronos-collect-test-heartbeat-suppressed-skips-block` 断言 3s gap 不落库且基线被推进）。
+- **dashboard 首次渲染被记为阻塞事件**：`el-chronos-dashboard` 首次渲染时的 ETAF 组件初始化耗时（同步、占主线程）被自身 1s 心跳判为阻塞并落库。修复：渲染前同样走抑制（绑定抑制变量 + 抬高阈值 + `unwind-protect` 重置基线），与报告侧口径一致。
+- **`el-chronos-web-running-p` 返回非布尔值**：原先直接把 `process-status` 的结果交给调用方（`(listen ...)` / `(connect ...)` / `stop` 等状态值），`(if (running-p) ...)` 虽能判真，但 `(eq t ...)` 这类布尔断言会失败，且调用方可能把 `stop` 误当运行中。修复：归一为严格 `t` / `nil`（＝`processp` + `process-live-p` 后补 `t`），docstring 写明契约（新增 `el-chronos-ui-test-web-running-p-returns-boolean` 断言）。
