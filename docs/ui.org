@@ -1,0 +1,292 @@
+#+TITLE: el-chronos 可视化界面（ETAF 页面 / Web dashboard / org 报告）
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:3 num:nil
+
+#+BEGIN_QUOTE
+本文件描述三种呈现形态的结构、数据来源、交互、降级规则与实测踩坑清单。
+数据口径与字段定义以 [[file:../docs/schema.org][docs/schema.org]] 为准，分层与时序以
+[[file:architecture.org][docs/architecture.org]] 为准，对外函数签名以 [[file:api.org][docs/api.org]] 为准。
+所有形态都只调 =el-chronos-analysis= 的查询层（本层 SQL 只写在 =el-chronos-analysis.el=），
+**呈现层不写 SQL、不写库、不改采集行为**。
+#+END_QUOTE
+
+* 三形态总览
+
+| 形态 | 入口 | 产物 | 定位 | 依赖 |
+|---|---|---|---|---|
+| org 报告 | =M-x el-chronos-report= / =el-chronos-weekly-report= | =*el-chronos-report*= buffer / org 文件 | 归档、版本间 diff、导出 CSV/JSON | 零第三方 |
+| Emacs 内页面 | =M-x el-chronos-dashboard= | =*el-chronos*= buffer（ETAF 挂载） | 日常顺手看一眼、快捷键切范围、行级下钻 | 软依赖 =etaf= + =etaf-ui= |
+| 浏览器 Web dashboard | =M-x el-chronos-web-start= | =http://127.0.0.1:8787/= | 深度分析：多图表、搜索排序分页、火焰图、多会话对比 | 零第三方（内置 =make-network-process=） |
+
+共同约束：
+
+- **只读**：三者都只查库。Web 路由表里没有任何写入 / 执行入口（I8）。
+- **数据同源**：数字必然一致，不存在「两边对不上」；新增一种形态不需要改采集与存储。
+- **降级可见**（I11）：ETAF 缺失 → =tabulated-list= 简版；terminal frame → 文本字符图；
+  端口占用 → =user-error= 且不换端口。任何一种失败都不影响采集与其他形态。
+
+* ETAF 页面（=M-x el-chronos-dashboard=）
+
+** 组件树
+
+#+BEGIN_SRC text
+etaf-mount  buffer *el-chronos*
+└── el-chronos-dashboard-app            ; 根组件，:bindings 持有 range / page / selected
+    ├── etaf-panel "el-chronos · 性能与用法观测器"
+    │   ├── row.el-chronos-toolbar
+    │   │   ├── etaf-button "1 天" / "7 天" / "30 天"   ; :on-press → --range-1d/-7d/-30d
+    │   │   ├── etaf-button "刷新"                      ; :on-press → el-chronos-dashboard-refresh
+    │   │   └── etaf-button "上一页" / "下一页"          ; → --previous-page / --next-page
+    │   └── etaf-label  ; --status-line：范围 · DB 大小 · 采集状态 · 采样间隔 · 更新时间
+    ├── etaf-panel "概览（6 指标）"
+    │   └── etaf-tile-grid :rows 2 :columns 3 :cell-width 24 :cell-height 3
+    │       ├── :cell-text  → --metric-text   ; 非图形 frame
+    │       └── :cell-image → --metric-image  ; 图形 frame：etaf-ui-svg-rect + -text
+    ├── etaf-panel "图表"
+    │   └── (3 × el-chronos-dashboard-chart)   ; 自定义图表组件
+    │       ├── kind=trend   → --trend-body   ; 多折线（etaf-ui-svg-path）
+    │       ├── kind=bars    → --bar-chart    ; 横向条形（etaf-ui-svg-rect）
+    │       └── kind=heatmap → --heatmap      ; 热力格（etaf-ui-svg-rect + -text）
+    │       图形 frame：etaf-ui-svg-image 包成 (image :type svg …) → image Host
+    │       非图形 frame：(text (expr (--to-text-bars …))) → 字符图
+    ├── 5 × etaf-panel（表格区，由 --tables 逐节生成）
+    │   └── etaf-table :columns :rows :row-key :on-row-press
+    │       慢命令 TOP / 热点函数 TOP（含包归属）  → 分页（el-chronos-dashboard-page-size，默认 20 行）
+    │       阻塞事件 / 回归 / 会话                 → 不分页
+    └── etaf-dialog :open (etaf-value selected-state) :on-close --clear-selection
+        ├── text    : --drill 生成的详情正文
+        └── etaf-label : 优化建议（--suggestions）
+#+END_SRC
+
+组件定义式（=el-chronos-dashboard--component-forms=）是**数据**，由 =--define-components= 在
+ETAF 可用时 =eval= 一次；挂载形式同样走 =eval=。原因见下文踩坑清单第 9 条。
+
+** 10 项能力与数据来源
+
+| # | 能力 | 数据来源（analysis 函数） | 渲染载体 |
+|---|---|---|---|
+| ① | 概览卡片 6 指标（命令数、阻塞总时长、慢命令数、采样数、DB 大小、启动耗时） | =el-chronos-analysis-overview= + =el-chronos-analysis-db-size= | =etaf-tile-grid= 2×3 |
+| ② | 慢命令排行 | =el-chronos-analysis-slow-commands= RANGE 60 | =etaf-table=（分页 20） |
+| ③ | 热点函数排行（含包归属） | =el-chronos-analysis-top-functions= RANGE 60 | =etaf-table=（分页 20） |
+| ④ | 包 / 模块占比条形图 | =el-chronos-analysis-package-breakdown= RANGE 12 | =etaf-ui-svg-rect= + =etaf-ui-svg-image= |
+| ⑤ | 趋势折线（样本量 / 慢命令 / 阻塞事件） | =el-chronos-analysis-trend= RANGE | =etaf-ui-svg-path= + =etaf-ui-svg-image= |
+| ⑥ | 阻塞事件列表与详情 | =el-chronos-analysis-blocking-events= RANGE 20 + =el-chronos-analysis-event= ID | =etaf-table= + =etaf-dialog=（=d= 键看完整栈） |
+| ⑦ | 用法热力图（命令 × 时间桶） | =el-chronos-analysis-heatmap= RANGE 8 | =etaf-ui-svg-rect= 网格 |
+| ⑧ | 回归列表（近 N 天 vs 前 N 天） | =el-chronos-analysis-regressions= RANGE 20 | =etaf-table= |
+| ⑨ | 会话列表与启动耗时 | =el-chronos-analysis-sessions= RANGE | =etaf-table= |
+| ⑩ | 时间范围切换与下钻 | 上述全部 + =el-chronos-dashboard--drill= | =etaf-button= + =etaf-dialog= |
+
+数据快照在 =--load-snapshot= 里一次取齐（=:overview= =:slow= =:functions= =:packages= =:trend=
+=:heatmap= =:blockers= =:regressions= =:sessions=），切范围 / 翻页 / 下钻都只重绘、不重复查库；
+刷新（=g=）才重新取快照。
+
+** 快捷键
+
+| 键 | 命令 | 行为 |
+|---|---|---|
+| =1= | =el-chronos-dashboard-range-1d= | 切最近 1 天（页码归零、关闭弹窗） |
+| =7= | =el-chronos-dashboard-range-7d= | 切最近 7 天 |
+| =3= | =el-chronos-dashboard-range-30d= | 切最近 30 天 |
+| =g= | =el-chronos-dashboard-refresh= | 重新取数并重绘 |
+| =r= | =el-chronos-dashboard-toggle-auto-refresh= | 切换自动刷新（间隔 =el-chronos-dashboard-refresh-seconds=，默认 30s） |
+| =d= | =el-chronos-dashboard-show-event= | 在当前下钻选中项是阻塞事件时，于 =*el-chronos-event*= 显示完整栈 |
+| =q= | =el-chronos-dashboard-quit= | 取消自动刷新并关闭页面 |
+
+键位在 =--install-keys= 里用 =local-set-key= 装到页面 buffer 上；ETAF 组件内的按钮用
+=:on-press= 调同一批命令。翻页走顶栏按钮，不占快捷键。
+
+** 降级规则
+
+| 场景 | 判据 | 行为 |
+|---|---|---|
+| ETAF 缺失 | =(require 'etaf nil t)= / =(require 'etaf-ui nil t)= 任一失败 | =display-warning= 提示安装 + =tabulated-list= 简版页；简版**含慢命令表与热点函数表两张表**并支持 =1=/=7=/=3= 切范围，不是空壳（I9） |
+| 非图形 frame（batch / terminal） | =--graphic-p= 为 nil（=display-graphic-p= 且 =image-type-available-p 'svg=） | 图表组件返回 =--to-text-bars= 的字符图（=·= / =░= / =▒= / =▓= / =█=），不报错（I11） |
+| 数据库打不开 / 查询失败 | analysis 返回 nil（已 =display-warning=） | 各区块显示「（无数据）」；=--load-snapshot= 再包一层 =condition-case= 双保险 |
+| 页面 buffer 被 kill | =--auto-refresh= 发现 buffer 不存在 | 自动取消 timer，零残留 |
+
+简版页（=tabulated-list=）一个 buffer 只支持一张表，故用区块标题行（=▸ 慢命令 TOP= /
+=▸ 热点函数 TOP=）把两张表放进同一张表的连续行里。
+
+** ETAF 实测踩坑清单（T8 实测，2026-10-24，Emacs 31.1）
+
+1. **组件不是函数**（=fboundp= 为 nil）
+   现象：=etaf-define-component= 定义的组件注册在 ETAF 的组件表里，不是 fboundp 可见的函数，
+   用 =fboundp 'el-chronos-dashboard-app= 探测恒为 nil。
+   应对：探测能力用 =etaf-mount= / =etaf-ui-svg-image= 的存在性（=el-chronos-dashboard-etaf-available-p=
+   只看 feature 与组件 API 是否就位），组件间调用用 =etaf-view= 形式，不用 =funcall=。
+
+2. **表格组件名是 =etaf-table=，不是 =etaf-ui-table=；=:row-key= 必填**
+   现象：计划与 ADR 早期写作 =etaf-ui-table=，实际注册名是 =etaf-table=；缺 =:row-key= 时
+   行身份无法稳定，=:on-row-press= 拿不到正确行。
+   应对：统一用 =etaf-table=，并显式给 =:row-key (lambda (row) (alist-get :key row))=。
+
+3. **=text= 内非字面量必须写 =(expr FORM)=**
+   现象：=text= 只接受字面字符串 / 子组件；直接写 =(text (--to-text-bars …))= 会被当 DSL 语法，
+   报语法错。
+   应对：要插入求值结果一律 =(text (expr FORM))=。同理在组件树中要 mapcar 生成子树，
+   也要写成 =(expr (mapcar …))=。
+
+4. **列表属性必须 =(quote ...)=**
+   现象：=:selected= 传 plist 时不加 =quote=，ETAF 把列表当代码求值，报 =void-function :title=。
+   应对：=:selected (quote ,selection)=；任何「数据型列表」属性同理。
+
+5. **重挂同一 buffer 必须先 =etaf-unmount=**
+   现象：反复 =etaf-mount= 到同一个 =*el-chronos*= 而不卸载，ETAF 保留上一实例的 =:bindings=，
+   弹窗与状态栏停在旧值（切范围看似无效）。
+   应对：=--render-etaf= 里先 =(when-let* ((runtime (etaf-runtime-for-buffer buffer))) (etaf-unmount runtime))=。
+
+6. **=:bindings= 必须用 =(etaf-value x)= 读**
+   现象：直接引用 binding 符号（如 =page-state=）读到的是 ref 对象本身，不是当前值。
+   应对：读状态一律 =(etaf-value page-state)= / =(etaf-value selected-state)=；写状态用
+   =--set-range= / =--set-page= 改 plist 后重绘（不直接 setf ref）。
+
+7. **无 polyline 图元，折线用 =etaf-ui-svg-path=**
+   现象：=etaf-ui-svg= 只提供 =rect= / =circle= / =line= / =path= / =text= / =group=，
+   没有 =polyline=。
+   应对：折线生成 =d= 属性（=--polyline-d=：=M x y L x y …=）再走 =etaf-ui-svg-path=；
+   =--sparkline= / =--trend-body= 都按此实现。
+
+8. **batch 下 =etaf-mount= 可正常挂载并产生文本**
+   现象：=emacs -Q --batch= 里 =etaf-mount= 能挂载并把组件树渲染成 buffer 文本
+   （=--graphic-p= 为 nil，图表走字符图路径）。
+   应对：ERT 可以直接断言页面文本（=test/el-chronos-ui-test.el= 的 ETAF 用例即由此而来），
+   无需真实 GUI；但 SVG 图元的断言走纯函数（=--bar= / --scale= / --sparkline= / --bar-chart= /
+   --heatmap= / --to-text-bars=）。
+
+9. **宏的软依赖：顶层写 =etaf-define-component= 会让 =make lint= 误编**
+   现象：=make lint= 用 =emacs -Q --batch -L .= 字节编译，ETAF 不在 load-path 时
+   =etaf-define-component= / =etaf-view= 这两个宏无法展开，宏调用被编成普通函数调用，
+   运行期即使 ETAF 在位也会失败（=void-function etaf-view=）。
+   应对：组件定义式与挂载形式都退化为**数据**并用 =(eval FORM t)= 延迟展开：组件定义放
+   =--component-forms=，挂载写 =(eval `(etaf-view …) t)=。代价是组件体不做编译期检查，
+   故组件体只调用本文件已定义好的函数。
+
+10. **=etaf-tile-grid= 的 =:cell-text= 必须单行且不超 =:cell-width=**
+    现象：=tile-grid= 会校验单元格文本宽度，多行或被折行的文本会触发布局校验失败 / 显示错乱。
+    应对：=--metric-text= 只产出「名称 值」短格式单行（=:cell-width 24= / =:cell-height 3=），
+    换行由布局负责；图形 frame 下改走 =:cell-image=（SVG 指标卡），文本路径仅用于非图形 frame。
+
+* 浏览器 Web dashboard（=M-x el-chronos-web-start=）
+
+** 路由表（13 条，全部 GET、只读）
+
+| # | 方法 | 路径 | 参数 | 返回键 |
+|---|---|---|---|---|
+| 1 | GET | =/= | — | 内嵌单页 HTML（=text/html=） |
+| 2 | GET | =/api/summary= | =range= | =range= =generated-at= =overview={:commands :blocked-ms :slow-commands :samples :db-size :startup-ms :sessions}= |
+| 3 | GET | =/api/top-functions= | =range= =limit=（默认 20） | =range= =limit= =items=[{:function :file :package :self-ms :samples :pct}]= |
+| 4 | GET | =/api/slow-commands= | =range= =limit=（默认 20） | =range= =limit= =items=[{:name :count :total-ms :max-ms :avg-ms :aborted}]= |
+| 5 | GET | =/api/packages= | =range= | =range= =limit=（nil，不限）= =items=[{:package :self-ms :pct}]= |
+| 6 | GET | =/api/trend= | =range= =buckets=（省略则由窗口长度决定 24/168/720） | =range= =limit= =items=[{:bucket :samples :slow-commands :blocked}]= |
+| 7 | GET | =/api/heatmap= | =range= =limit=（默认 20） | =range= =limit= =items=[{:bucket :command :count :duration-ms}]= |
+| 8 | GET | =/api/stacks= | =range= =limit=（默认 50） | =range= =limit= =items=[{:stack :samples :pct}]= |
+| 9 | GET | =/api/sessions= | =range= | =range= =limit=（nil）= =items=[{:id :started-at :startup-ms :emacs-version :host}]= |
+| 10 | GET | =/api/blocking= | =range= =limit=（默认 20） | =range= =limit= =items=[{:id :ts :duration-ms :kind :command :mode :project}]= |
+| 11 | GET | =/api/regressions= | =range=（被忽略） =limit=（默认 20） | =range= =limit= =items=[{:function :current-ms :previous-ms :growth :current-samples :previous-samples}]= |
+| 12 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
+| 13 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
+
+约定：
+
+- 列表接口响应恒含 =range= =limit= =items= 三键（前端无需按接口分支）；=limit= 为 =null= 表示不限。
+- =range= 取 =1d= / =7d= / =30d=，非法或缺失回落 =7d=；=limit= 上限 =1000=。
+- =/api/event= 用「200 + =null=」而非 404：事件可能已被保留策略清理，属正常空结果；
+  只有未知路径才 404。非 GET → 405（带 =Allow: GET=），路径不以 =/= 开头 → 400，
+  请求头超过 =16384= 字节 → 413。
+
+** 内嵌前端结构
+
+页面结构（=el-chronos-web--markup=，无 CDN、无第三方库）：
+
+| 区块 | DOM | 图表实现 |
+|---|---|---|
+| 顶栏 | =#ranges= 范围按钮、=#refresh=、=#auto=（自动刷新 30s 勾选）、=#csv= 导出链接、=#status= | — |
+| 概览 | =.cards#ov=（6 张卡片） | 纯 HTML |
+| 趋势 | =svg#trend= + =#trend-legend= | 手写 SVG：面积 + 折线（=samples=）+ 柱（=slow-commands=） |
+| 包 / 模块占比 | =svg#donut= + =#donut-legend= | 手写 SVG 环形图（=stroke-dasharray=，R=45，前 8 项） |
+| 用法热力 | =.hm#heat=（DOM 网格） | CSS 背景色深浅 + =title= 悬浮提示，命令 ≤20、桶为时间轴 |
+| 慢命令 | =#q-slow= 搜索 + =table#t-slow= | 表格：列排序、分页 10 行 |
+| 热点函数 | =#q-func= 搜索 + =table#t-func= | 同上 |
+| 阻塞事件 | =table#t-block= | 表格 + 行点击下钻 |
+| 回归 | =table#t-reg= | 表格 |
+| 会话 | =table#t-sess= | 表格（多会话对比） |
+| 火焰图 | =svg#flame= + =#flame-legend= | **按层聚合近似**：栈按层级折叠，深度 ≤6 层，宽度按样本数占比 |
+| 下钻侧栏 | =aside#panel=（=#panel-close= / =#panel-body=） | 行点击 → =/api/event= 或本地已取数据渲染 |
+
+前端状态对象 =S=：=range=、=auto=、=timer=、=per=（每页 10 行）、=data=、=view=、
+=sort= / =dir=（各表的排序列与方向）、=q=（搜索词）、=page=。所有数据经 =fetch= 取 JSON，
+渲染在本地完成；断网无影响（同源、无外链资源）。
+
+** 只读与 loopback 边界
+
+- 只绑 =127.0.0.1=（=el-chronos-web--host= 是常量，不接受 =0.0.0.0=），端口 =el-chronos-web-port=（默认 8787）。
+- **无鉴权**。loopback 只防 LAN 暴露，**不构成本机访问控制**：WSL2 mirrored 网络共享端口空间，
+  Windows 侧进程可直接访问该端口（I8，见 [[file:../Readme.org][Readme]]「隐私边界」）。
+- 默认不自动启动（=el-chronos-web-auto-start= 为 nil）；端口占用 → =user-error=，
+  **不自动换端口**（I11）。用完 =M-x el-chronos-web-stop= 释放端口。
+- 端口 =0= 时由内核分配：=el-chronos-web-start= 的 =message= 与 =user-error= 一律取
+  =(process-contact PROC :service)= 反映**实际绑定**端口（取不到才回落入参），因此传 =0= 也不会
+  提示「http://127.0.0.1:0/」。调用方可用 =(process-contact (el-chronos-web-start))= 核验。
+- 路由表无写入 / 执行入口；CSV 导出也是只读查询 + 格式化。
+
+** 单线程串行处理的含义
+
+- 请求处理在 **Emacs 主线程同步执行**：=:filter= 收字节 → 凑到 =\r\n\r\n= → 解析请求行 → 一次响应
+  → =Connection: close= + EOF 关闭。因此**不需要** keep-alive、分块传输、长连接超时管理。
+- 后果一：响应时间 = 查询时间（SQLite 本地读取，毫秒级）；并发请求在 Emacs 里**排队**，
+  不是并行——多个标签页同时刷新会串行处理。
+- 后果二：单个慢查询会占住主线程（进而让采集的 timer 延迟）。因此列表接口都有 =limit= 上限
+  （默认 20、最大 1000），堆栈默认 50，包占比不分页。
+- 后果三：单请求累积上限 16KB（=--max-request-bytes=），超出返回 413，防畸形请求无限占内存。
+- 单请求异常 → 500 且 server 继续服务（I11：不因一次坏请求整体挂掉）。
+  **500 不回显内部错误**：浏览器只看到通用文案「请求处理失败。内部错误详见 Emacs 的 =*Messages*=。」，
+  错误详情（常含绝对路径与 SQL 片段）经 =display-warning= 写到 Emacs 侧 =\*Messages\*=
+  / =\*Warnings\*=，本机用户仍能排障——可见降级但不向浏览器泄露实现细节。
+
+* org 报告（=M-x el-chronos-report=）
+
+10 节，按 =el-chronos-report--content= 的输出顺序：
+
+| # | 节 | 数据来源 | 展示上限 |
+|---|---|---|---|
+| 1 | 概览 | =el-chronos-analysis-overview= → =--section-overview= | — |
+| 2 | 慢命令 TOP | =el-chronos-analysis-slow-commands= | 20 行；列：命令/次数/总耗时/最大/平均/中断数 |
+| 3 | 热点函数 TOP | =el-chronos-analysis-top-functions= | 20 行；列：函数/包/self/样本/占比 |
+| 4 | 包归因 | =el-chronos-analysis-package-breakdown= | 不限（unknown 与 GC 恒排末尾） |
+| 5 | 趋势 | =el-chronos-analysis-trend= | 最近 48 桶；列：小时/样本/慢命令/阻塞 |
+| 6 | 阻塞事件 | =el-chronos-analysis-blocking-events= | 20 行；列：时间/时长/命令/mode/project |
+| 7 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
+| 8 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
+| 9 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
+| 10 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+
+相关入口：
+
+- =el-chronos-report= 交互选范围（默认 =7d=），生成只读 org buffer。
+- =el-chronos-weekly-report= 把近 7 天报告写入 =chronos-weekly.org=（默认落运行时状态目录）。
+- =el-chronos-export= 导出 CSV（=# section:= 分块）或 JSON（单对象，含 overview 与各明细区块）。
+- =el-chronos-show-event= 展示单条慢事件完整栈与 context（=*el-chronos-event*=，dashboard 的 =d= 键复用）。
+- =el-chronos-profile-command= 对单条命令做 1ms 高精度剖析（不查库，实时跑一次）。
+
+* 性能注意
+
+| 项 | 取值 | 控制手段 |
+|---|---|---|
+| 表格分页 | dashboard 每页 =el-chronos-dashboard-page-size= 20 行；Web 每页 10 行 | 单页行数固定，避免一次塞入全部排行拖慢重绘（TD-5） |
+| 图表采样点 | dashboard =el-chronos-dashboard-chart-points= 60 点（=--downsample= 等距抽稀）；图表逻辑宽 =el-chronos-dashboard-chart-width= 72 | 采样点有上限，趋势桶数由 analysis 决定（24/168/720） |
+| 数据快照 | 一次挂载取齐 9 组数据；切范围/翻页/下钻只重绘 | 不在交互路径上重复查库 |
+| ETAF 重绘 | 每次重绘重建整棵组件树（先 =etaf-unmount=） | 已知代价：大数据量下的重绘耗时尚**未实测**（TD-5）；超 1s 则下调每页行数与采样点，必要时改按需渲染 |
+| Web 查询 | 列表 =limit= 默认 20、上限 1000；堆栈默认 50 | 单线程串行，长查询会占主线程 |
+| Web 前端 | 一次取数 + 本地渲染；自动刷新默认 30s | 关掉自动刷新即零轮询；搜索/排序/分页均在本地数据上做 |
+
+**待实测**：ETAF 页面在 30 天真实数据下的首次渲染与切范围重绘耗时（TD-5）；
+terminal 文本字符图的可读性；Web 页在 30 天数据下的火焰图渲染耗时。
+
+* 关联
+
+- 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]「可视化设计」节、I8–I11、T8/T9/T12
+- ADR：[[file:adr/0002-dual-visualization.md][docs/adr/0002-dual-visualization.md]]（双形态选型与代价）
+- 接口：[[file:api.org][docs/api.org]]（analysis 查询签名与返回键）
+- 数据：[[file:schema.org][docs/schema.org]]（表结构、保留策略、P95 近似）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-5 ETAF 重绘性能、TD-6 Web 无鉴权、TD-7 P95 精度）

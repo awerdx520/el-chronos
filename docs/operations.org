@@ -1,0 +1,196 @@
+#+TITLE: el-chronos 运维手册（安装 / 卸载 / 数据清理 / 排障 / 验证）
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:3 num:nil
+
+#+BEGIN_QUOTE
+本文件面向使用者与维护者：怎样装、怎样卸、数据在哪、出事怎么排查、怎么验证。
+接口细节见 [[file:api.org][docs/api.org]]，界面与路由见 [[file:ui.org][docs/ui.org]]，
+表结构与保留策略见 [[file:schema.org][docs/schema.org]]。
+#+END_QUOTE
+
+* 安装
+
+** 前置条件
+
+| 项 | 要求 | 检查方式 |
+|---|---|---|
+| Emacs | 29.1+（需要内置 =sqlite=） | =M-: (and (fboundp 'sqlite-open) (sqlite-available-p))= → =t= |
+| SQLite | 编译期带 SQLite 支持 | =(featurep 'sqlite)= → =t= |
+| straight.el | 可选（用 =:local-repo= 安装时需要） | =(featurep 'straight)= |
+| ETAF | **可选**（仅 Emacs 内页面需要） | =(require 'etaf nil t)= / =(require 'etaf-ui nil t)= |
+
+** 方式 A：straight.el（=:local-repo=，本包为独立仓库）
+
+#+BEGIN_SRC elisp
+;; 本包是独立仓库（不与 thomas-emacs 同仓），用 :local-repo 指向本地 clone。
+(straight-use-package
+ '(el-chronos :type built-in :local-repo "~/Workspace/el-chronos"))
+
+(require 'el-chronos)
+(el-chronos-mode 1)
+#+END_SRC
+
+若希望从远端拉取，把上例换成 =:type git :host ... :repo ...= 指向实际仓库地址
+（本仓库尚未发布远端地址，不要凭猜测填写）。
+
+** 方式 B：手动 =load-path=（无 straight）
+
+#+BEGIN_SRC elisp
+(add-to-list 'load-path "~/Workspace/el-chronos")
+(require 'el-chronos)
+(el-chronos-mode 1)
+#+END_SRC
+
+** 方式 C：需要 Emacs 内 ETAF 页面时（软依赖）
+
+=el-chronos-dashboard= 需要 =etaf= + =etaf-ui=；缺失时会 =display-warning= 并降级为
+=tabulated-list= 简版页（功能可用，图表变文本）。安装方式沿用本机 thomas-emacs 的
+=lisp/init-etaf.el= 里的 straight recipe（ETAF 由 =ecss= / =ebox= / =etaf= / =etaf-ui= 四个包
+组成，recipe 以该文件为准，本文件不复写仓库地址以免失效）：
+
+#+BEGIN_SRC elisp
+;; 示意：把 init-etaf.el 中 ecss / ebox / etaf / etaf-ui 的 recipe 原样用于你的配置
+(straight-use-package 'etaf)      ; 其 recipe 与依赖见 thomas-emacs lisp/init-etaf.el
+(straight-use-package 'etaf-ui)
+(require 'etaf)
+(require 'etaf-ui)
+#+END_SRC
+
+装好后验证：=M-: (el-chronos-dashboard-etaf-available-p)= → =t=。
+
+** 安装后确认
+
+#+BEGIN_SRC elisp
+(el-chronos-mode 1)
+(el-chronos-status)          ; echo area 显示运行状态与 DB 路径
+el-chronos-db-path           ; 确认数据落点
+#+END_SRC
+
+* 卸载
+
+三步，顺序不能反（先停观测再删数据，否则会有未 flush 缓冲写回）。
+
+1. **停止观测**： =(el-chronos-mode -1)= —— 清理 timer、hook（含每 buffer 的局部 hook）、
+   profiler、未 flush 缓冲（I5 零残留）。确认：=M-: el-chronos--running-p= → =nil=。
+2. **移除加载路径**：删掉配置里的 =(require 'el-chronos)= / straight 的 =straight-use-package= 段，
+   再从 =load-path= 移除目录；（可选）删除本地 clone。
+3. **删除数据**（可选）：删
+   =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=（连同同目录的
+   =chronos.sqlite-wal= / =chronos.sqlite-shm=）。删除前请先做完第 1 步。
+
+#+BEGIN_SRC sh
+# 卸载后彻底清数据（先确认 Emacs 已退出或已 el-chronos-mode -1）
+rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
+#+END_SRC
+
+不删库也不影响其他功能：下次重新启用会复用同一库继续累积。
+
+* 数据清理
+
+| 操作 | 入口 | 作用范围 | 备注 |
+|---|---|---|---|
+| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 三张 =hourly_*= 聚合表**永久保留**，不参与自动清理 |
+| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含 =hourly_*=） | 输入留空 = 清空全部 6 张表 |
+| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 6 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键 |
+| 回收空间 | =M-x el-chronos-store-vacuum= | =VACUUM=（重写库文件） | 不能在事务内执行；purge 后跑一次可显著缩小文件 |
+| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库 |
+
+#+BEGIN_SRC elisp
+(el-chronos-purge (truncate (* 1000 (float-time (date-to-time "2026-09-01 00:00:00")))))
+;; => (("commands" . 12345) ("slow_events" . 67) ("hourly_functions" . 890) ...)
+(el-chronos-store-vacuum)   ; => t
+#+END_SRC
+
+** 何时该 purge
+
+- 库文件明显膨胀（例如开了 =el-chronos-usage-granularity= 为 =file= 一段时间后改回 =command=，
+  旧的路径类 =hourly_usage= 行不会被自动清掉——该表永久保留）。
+- 换了机器 / 换了工作场景，旧数据的趋势对比已无意义。
+- 怀疑数据被污染（例如长时间未联网机器时钟跳变导致的桶错位）。
+
+* 排障
+
+| 症状 | 可能原因 | 处置 |
+|---|---|---|
+| =*el-chronos*= 页面显示表格而非卡片 + 图表 | **ETAF 缺失或 require 失败**（=display-warning= 提示安装） | =M-: (el-chronos-dashboard-etaf-available-p)= 确认；按「安装 · 方式 C」装 =etaf= + =etaf-ui=；不装也能用简版（2 张表 + =1/7/3= 切范围） |
+| 启动即告警「SQLite 不可用」，采集被禁用 | Emacs < 29 或编译时缺 sqlite | =M-: (and (fboundp 'sqlite-open) (sqlite-available-p))=；换带 SQLite 支持的 Emacs 构建；观测器本身不阻断 Emacs 启动 |
+| =el-chronos-web-start= 抛 =user-error=「端口被占用」 | 8787 已被占用（可能是别的实例或 Windows 侧进程） | =ss -lntH "sport = :8787"= 查监听者；改 =el-chronos-web-port= 后重试。**不自动换端口**是设计（I11：可见失败优于静默漂移） |
+| 热点函数里一堆 =unknown= 包 | native-comp 下 =symbol-file= 命中 =.eln=（TD-1），或函数是 =eval= 即时定义的（无源码文件） | 看 =el-chronos-attrib-file= 对该符号的返回值：返回 =.eln= 路径说明是编译产物；兜底失败按设计降级 =unknown=，不影响其他统计。需要源码级结论时用 =el-chronos-profile-command= 对单条命令剖析 |
+| 采样数一直是 0 / 热点表空 | ① 采样器启动失败（=display-warning=）；② 观测期间**没有真实操作**——纯 =sleep= 不产生 CPU 样本 | ① 查 =*Messages*= 与 =el-chronos-status=；② 正常敲命令 1 分钟后再看（采样是 CPU 采样，阻塞等待期没有 leaf 样本，阻塞要靠心跳 =slow_events(kind='block')= 体现） |
+| DB 体积显示得比预期小 | =el-chronos-analysis-db-size= **只统计主文件**，不含 =-wal= / =-shm=；WAL 未 checkpoint 时数据还在 wal 里 | 看总占用：=ls -l ~/.emacs.d/.local/state/chronos/=；随 checkpoint 主文件会长上来；需要立刻收敛就跑 =M-x el-chronos-store-vacuum= |
+| 某些 buffer 里的命令完全没被计时 | TD-9 类问题（=pre-command-hook= / =post-command-hook= 在 Emacs 31 起 auto-buffer-local） | 已修复：启动时遍历 =buffer-list= 补挂局部 hook 并由 =buffer-list-update-hook= 增量覆盖；若自造 buffer 仍漏采，确认没有在 =kill-all-local-variables= 之后手动覆盖这两个 hook |
+| 命令行里 =make lint= 报 =void-function etaf-view= | 顶层直接写 ETAF 宏，字节编译时宏缺席被编成函数调用 | 已在实现中规避（组件定义与挂载走 =(eval FORM t)=）；自定义扩展时同样不要把 ETAF 宏写在顶层 |
+| =total_ms= 与内置 =profiler-report= 的 total 列不一致 | 口径不同：本模块 total 按**栈内去重**，内置报告按每帧累加（TD-10） | 不是 bug。占比与回归判定都用 self 口径；跨工具对比时以 self 为准 |
+| 回归列表里出现看起来「没变慢」的函数 | 回归按 =el-chronos-regression-window-days=（默认 7 天）与自身上下窗口比较，**与页面显示范围无关**；小样本噪声由 =el-chronos-regression-min-samples= 抑制 | 看返回里的 =:current-samples= / =:previous-samples=；嫌噪就提高阈值或最小样本数 |
+
+* 验证步骤
+
+** 自动化（仓库自带入口，全部走 =emacs -Q --batch=，不碰运行中的 daemon）
+
+| 命令 | 层级 | 内容 | 期望 |
+|---|---|---|---|
+| =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
+| =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 103 tests, 103 results as expected, 0 unexpected= |
+| =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
+
+** 手动 smoke（端到端，5 分钟）
+
+1. =(require 'el-chronos)= → =(el-chronos-mode 1)= → =M-x el-chronos-status= 确认运行中。
+2. **真实操作 1 分钟**（开关文件、搜索、切 buffer、跑一次 =M-x org-agenda= 之类）——
+   纯静止不产生 CPU 样本。
+3. =M-x el-chronos-report= → 报告 buffer 里「概览 / 慢命令 TOP / 热点函数 TOP / 趋势」非空。
+4. =M-x el-chronos-dashboard= → 页面可见；按 =1= / =7= / =3= 范围变化；点一行看弹窗；=q= 关闭。
+5. （可选）=M-x el-chronos-web-start= → 浏览器打开 =http://127.0.0.1:8787/= →
+   =curl --noproxy '*' -sS http://127.0.0.1:8787/api/summary | python -m json.tool= 合法 JSON →
+   =ss -lntH "sport = :8787"= 只见 =127.0.0.1= → =M-x el-chronos-web-stop=。
+6. =(el-chronos-mode -1)= → =M-: el-chronos--active-timers= → =nil=（零残留）。
+
+本机注意：=http_proxy= 已设而 =no_proxy= 未设，探活必须 =curl --noproxy '*'=，
+否则会被代理接管返回假 503。
+
+** elisp 验证走隔离实例
+
+仓库内的 =.el= 验证一律走 elisp-dev-mcp 的 =verify= 隔离实例（=elisp_mcp_set_task= 传 =verify=），
+**不要**在 =config= 任务下跑 ERT / 批量字节编译 / 全量 flymake（会占住用户在用的 Emacs 主线程）。
+收尾：=set_task auto= → =elisp_mcp_instance(action="stop", instance="verify")=。
+
+* 隐私边界与数据保留
+
+** 记录 / 不记录
+
+| 类别 | 内容 |
+|---|---|
+| **记录** | 命令名、耗时、GC 耗时、major-mode、项目 **basename**、结果（=ok= / =aborted= / =error=）、函数符号名、函数定义源码路径（仅归因所需） |
+| **不记录** | 被操作文件路径、buffer 内容、按键序列、命令参数、剪贴板、环境变量 |
+
+=commands.project= 只存 basename（=file-name-nondirectory= 处理后的目录名），取不到为 =NULL=；
+断言：该列不出现 =/=。唯一例外是用户**主动**把 =el-chronos-usage-granularity= 改为 =file=——
+此时 =hourly_usage= 会写入被操作文件的绝对路径，且该表永久保留（只能 =el-chronos-purge= 清）。
+
+** 数据保留表
+
+| 表 | 保留 | 清理方式 | 行数上界 |
+|---|---|---|---|
+| =sessions= | 随 =commands= 一并清理（=started_at= 同口径） | retention / purge | 每启动一次一行 |
+| =commands= | =el-chronos-retention-days=（默认 30 天） | 自动 retention / purge | 每命令一行 |
+| =slow_events= | 同 =commands= | 自动 retention / purge | 仅超阈值事件 |
+| =hourly_functions= | **永久** | 仅 purge | ≤ 24 × 函数数 / 天 |
+| =hourly_usage= | **永久** | 仅 purge | ≤ 24 × 维度取值数 / 天 |
+| =hourly_stacks= | **永久** | 仅 purge | ≤ 24 × =el-chronos-store-stack-top-n=（默认 200）× 会话数 / 天 |
+
+** Web 的特殊说明
+
+Web 无鉴权；只绑 =127.0.0.1= 仅防 LAN 暴露，**不构成本机访问控制**（WSL2 mirrored 网络下
+Windows 侧进程可直连该端口）。定位是「本机自用的只读视图」：默认不启动，用完即
+=M-x el-chronos-web-stop=，不要在不可信本地进程或多用户共享环境里长期开着（TD-6）。
+
+* 关联
+
+- 接口：[[file:api.org][docs/api.org]]
+- 界面 / 路由 / ETAF 踩坑：[[file:ui.org][docs/ui.org]]
+- 数据模型与保留策略：[[file:schema.org][docs/schema.org]]
+- 架构与实测结论：[[file:architecture.org][docs/architecture.org]]
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（TD-1 / TD-5 / TD-6 / TD-9 / TD-10）
+- 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]

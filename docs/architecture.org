@@ -1,0 +1,262 @@
+#+TITLE: el-chronos 架构（骨架）
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:3 num:nil
+
+#+BEGIN_QUOTE
+状态：**Phase 4（Review & Document），T1–T11 已实现并实测**（2026-10-24，GNU Emacs 31.1）。
+本文件描述分层、四条采集路径、可视化数据流、**实测结论**与**已知偏差**；不变量与字段定义以
+[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]] 为准，
+对外接口见 [[file:api.org][docs/api.org]]，界面与路由见 [[file:ui.org][docs/ui.org]]。
+尚未实测的项集中在文末「待补」清单，与 [[file:../openspec/tech-debt.md][openspec/tech-debt.md]] 的 TD 编号对应。
+#+END_QUOTE
+
+* 分层与数据流
+
+分层单向依赖（采集 → 归因 → 存储 → 分析 → 呈现 / 可视化），上层不反向调用下层；任何一层异常都不得向宿主（Emacs 主循环）抛错（I6）。
+
+| 层              | 模块                     | 输入                         | 输出                                   | 副作用                            |
+|-----------------+-------------------------+-----------------------------+---------------------------------------+----------------------------------|
+| 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调 | 内存中的事件与小时聚合桶                  | 只读环境、写内存                    |
+| 归因 attrib      | =el-chronos-attrib.el=    | 符号名、buffer               | file / package / mode / project 字符串 | 无（缓存 hash table）              |
+| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行                             | 唯一允许写盘的一层（I3）             |
+| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集                           | 只读数据库                         |
+| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer / 导出文件                  | 创建 buffer、按需写导出文件         |
+| 可视化 dashboard | =el-chronos-dashboard.el= | =analysis= 结果集              | =ETAF= 组件树（ETAF → =etaf-ui-svg= ）    | 创建 =*el-chronos*= （只读渲染）    |
+| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON → 内嵌 HTML / JS           | 仅监听 =127.0.0.1= （默认关闭、只读） |
+
+数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / dashboard / web（三种呈现形态，共享同一 analysis 查询层）= 。
+=attrib= 是被动依赖（collect 调它补上下文），不被 store 反向调用。
+
+* 采集时序：四条路径
+
+** 路径 1：启动（每会话一次）
+
+1. =after-init-hook= / =emacs-startup-hook= 打点 → 记 =t0= ；
+2. 计算 =startup_ms= 、采集 =emacs-version= / =host= / =gc-threshold= ；
+3. =store= 插入一行 =sessions= ；
+4. 若 =el-chronos-enabled= 为真 → 启动采样器与心跳 timer。
+
+** 路径 2：命令边界（每命令一次）
+
+1. =pre-command-hook= ：
+   - 若上一命令仍处于"未结算"状态 → 判为 =aborted= （被 =C-g= 中断），补记一条；
+   - 记 =this-command= 名、 =t_start= 、 =gcs-done= / =gc-elapsed= 基线；
+2. 命令执行（本观测器不参与，无 advice）；
+3. =post-command-hook= ：算 =duration_ms= 、 =gc_ms= 、 =outcome= ；
+4. =attrib-context= 补 =mode= / =project= ；用法三维计数自增；
+5. 超 =el-chronos-slow-command-threshold-ms= → 追加 =slow_events= 行（含当时栈快照）。
+
+** 路径 3：心跳（每 =el-chronos-heartbeat-seconds=，默认 1s）
+
+1. timer 回调取 =float-time= ，与上次 tick 比较；
+2. 漂移 > =el-chronos-block-threshold-ms= （默认 2000ms）→ 记一条 =block= 型 =slow_events= ；
+3. 阻塞期间 Lisp 未被调度，因此**栈证据只能来自路径 4 的 SIGPROF 样本**（I2），事后回溯；
+4. 更新上次 tick，重新挂 timer。
+
+** 路径 4：采样 tick（每 =el-chronos-sample-window-seconds=，默认 10s）
+
+1. =profiler-cpu-log= 取回本窗口采样（SIGPROF 在 C 层累积，与 Lisp 是否被阻塞无关）；
+2. 逐样本聚合：同一函数累计 =samples= / =self_ms= ；依据栈做 total 归属；
+3. =attrib= 补 =file= / =package= 维度；
+4. 累加进内存中的小时桶（按整点 key 分桶），**不立即写库**；
+5. 调 =profiler-cpu-stop= + =profiler-cpu-start=（取用即重置，避免长期累积内存）；
+6. =store= 的 flush timer 在小时切换/缓冲达阈值时批量落库。
+
+* 可视化数据流
+
+两种形态（Emacs 内 ETAF 页面 / 浏览器 Web dashboard）共享同一 =el-chronos-analysis= 查询层，
+不各自写 SQL；任一种不可用都不影响采集与另一种。
+
+** 公共前半段
+
+=页面请求（M-x 或 HTTP GET）→ analysis 查询函数（返回 plist）→ SQLite（只读）→ 结果集=。
+analysis 只读数据库，呈现层只消费 plist——因此新增一种呈现形态不需要改采集与存储。
+
+** Emacs 侧（ETAF）
+
+1. =el-chronos-dashboard= 确保数据库已打开（只读）→ 读取 defcustom 与当前 =range=（=1d= / =7d= / =30d=）；
+2. 调 analysis 取 summary / top-functions / slow-commands / packages / trend / heatmap / stacks / sessions；
+3. 根组件 =el-chronos-dashboard-app= 以 =:bindings= 持有 =range= / =page= / =selected-event= / =filter=，
+   经 =etaf-mount= 渲染组件树；
+4. 表格走 =etaf-table=（=:columns= / =:rows= / =:row-key=，分页 20 行；注册名是 =etaf-table= 而非
+   =etaf-ui-table=）；图表走 =etaf-ui-svg-*= 生成 SVG markup →
+   =etaf-ui-svg-image= 得到 =(image :type svg :data STRING)= 描述符 → 交给 image Host
+   （如 =etaf-tile-grid= 的 =:cell-image=）；terminal frame 改文本条形；
+5. 交互：=1= / =7= / =3= 改 =range= → =etaf-ref= 状态变更 → 受影响子树重渲染；行 =:on-press= →
+   =etaf-dialog= 下钻（按需再查一次 analysis 的明细接口）；
+6. ETAF 缺失（=require ... nil t= 失败）→ =display-warning= + 内置 =tabulated-list= 简版（I9）。
+
+** Web 侧
+
+1. =el-chronos-web-start= 用 =make-network-process :server t :host "127.0.0.1"= 起监听（I8）；
+2. 请求 → 路由分发：=GET /= 返回内嵌 HTML/CSS/JS 字符串；=GET /api/*= 调 analysis → JSON；
+   =GET /api/export.csv= → CSV；=GET /api/event?id=N= → 单事件完整栈 + 上下文；
+3. 前端 JS 定时（默认 30s，可关）轮询 =/api/*= 并本地重绘，无 CDN、断网可用（I10）；
+4. =el-chronos-web-stop= 关闭 process 与 buffer，干净释放端口。
+
+** 降级矩阵（I11）
+
+| 场景 | 行为 |
+|---|---|
+| ETAF 未安装 / =require= 失败 | dashboard 降级 =tabulated-list= 简版 + =display-warning=（I9） |
+| terminal frame 或 SVG 不可用 | 图表降级为文本条形（字符重复），不报错 |
+| 8787 端口被占用 | =el-chronos-web-start= 明确报错（含端口与改 =el-chronos-web-port= 的提示），不静默失败 |
+| sqlite 不可用 | 三种呈现均提示"无数据"，采集侧按既有路径禁用 |
+
+* 启停与降级
+
+- =el-chronos-mode= 为 global minor mode，幂等；停用时按 I5 清理：timer、hook、profiler、未 flush 缓冲。
+- sqlite 不可用（Emacs < 29 或编译时缺 sqlite）：=message= 警告并禁用，不报错、不阻断启动。
+- 采集路径全程 =condition-case=，失败降级 =unknown= 并继续（I6）。
+
+* 实测结论（2026-10-24，Emacs 31.1，=emacs -Q --batch=）
+
+实现过程中验证的运行时事实，与设计阶段的假设有出入处**以本节为准**（源码注释里也逐条注明）。
+这些结论直接决定了几处实现选择，改动相关代码前先读本节。
+
+** 1. profiler 采样日志形态与栈顺序
+
+- =profiler-cpu-log= 返回 **hash table**（键 = 符号 vector，值 = 样本数），不是早期版本的 alist。
+  实现里对两种形态都做了兜底（=el-chronos-collect--accumulate=）。
+- **栈顺序：=(aref stack 0)= 是最内层（leaf，最近一次求值）**，=(aref stack (1- len))= 是最外层
+  （=command-line= / =normal-top-level=）。实测一条长度 16 的栈：
+  =[0]=let =[1]=while =[2]=let =[3]=let =[4]=probe-leaf =[5]=+ =[6]=setq =[7]=let
+  =[8]=while =[9]=let =[10]=let =[11]=probe-inner =[12]=probe-outer
+  =[13]=load-with-code-conversion =[14]=command-line-1 =[15]=command-line=。
+- 因此 **self 时间归属取 =(aref stack 0)=**；leaf 常是 =let= / =while= / =+= 这类 subr
+  （解释执行的函数把 self 时间落在它们身上），**不做额外过滤**。
+- 采集的栈最多保留 40 帧（=--current-stack=），落 =slow_events.stack_json=；报告展示自 leaf
+  起最多 8 帧（=el-chronos-report--stack-frames=）。
+
+** 2. =profiler-cpu-start= 已在运行时再调用会抛错（剖析用共享模式）
+
+- 常驻采样已经占着 profiler 时，=el-chronos-profile-command= 不能直接 =profiler-cpu-start=，
+  否则抛「profiler already started」类错误。
+- 处置：=el-chronos-profile--run= 先判 profiler 是否已启动——已启动则**复用共享模式**
+  （取走窗口、跑命令、再取一次差分），未启动才自起自停。因此单命令剖析在观测器运行中也能用。
+- 换算：剖析间隔 1ms（=el-chronos-profile--interval-ns= 为 1000000）；样本数很少时用
+  =--estimated-interval= 由「样本数 × 实际耗时」反推每个样本代表的时间，避免展示成固定 1ms 的假精度。
+
+** 3. =(backtrace)= 在 Emacs 31 返回 nil（要用 =backtrace-frames=）
+
+- 自 Emacs 31 起 =(backtrace)= 改为「把调用栈打印到 buffer」，**返回 nil**；拿帧列表必须用
+  =backtrace-frames=（帧格式 =(求值否 函数 参数表 标记)=）。
+- 实现：=el-chronos-collect--backtrace-frames= 用它并保证**不向任何输出流打印内容**
+  （否则会污染 =*Messages*= 甚至当前 buffer）。慢事件快照走这条路径。
+
+** 4. =pre-command-hook= / =post-command-hook= 是 auto-buffer-local（TD-9，已修复）
+
+- Emacs 31 起这两个 hook 的 =local-variable-if-set-p= 为 =t=：=add-hook= 不带 LOCAL 时只改
+  **默认值**，而任何已留下局部绑定的 buffer（实测 =*scratch*= 被 eldoc 留过局部值）会用局部值
+  **遮蔽**默认值 → 该 buffer 内命令完全不计时（静默漏采）。
+- 修复为「全局默认值 + 每 buffer 补挂局部值」双路：
+  1. =el-chronos-collect-start= 照旧 =add-hook= 全局默认值（新 buffer 未建局部绑定时的来源，
+     也是 =el-chronos-mode -1= 后的正常态）；
+  2. =--ensure-buffer-hooks= 遍历 =buffer-list=，给未登记的 buffer 建局部绑定（无局部绑定时
+     先复制默认值，避免丢掉其他包的默认 hook）后追加本模块两个函数，并 =puthash= 记入
+     =--hooked-buffers=（**weak key**：buffer 被 kill 后自动出表）；
+  3. =buffer-list-update-hook= 挂同一个 ensure 函数，新建 / 切换 buffer 后增量补挂（已登记者一次
+     =gethash= 即返回）；
+  4. =el-chronos-collect-stop= 先摘 =buffer-list-update-hook=，再由 =--clean-buffer-hooks= 用
+     =remove-hook ... LOCAL=t= 摘局部值，对「摘后已回落默认值」的局部绑定再 =kill-local-variable=
+     （不把遮蔽坑留给用户），最后 =clrhash= 登记表。
+- 验收：被遮蔽 buffer 内命令计时恢复（batch 端到端捕获到 =move-end-of-line= 事件）；连续 3 轮
+  start/stop 无重复挂；stop 后局部值与登记表零残留。
+
+** 5. =buffer-list-update-hook= 会重入，必须加守卫
+
+- 该 hook 在 =get-buffer-create= / 切 buffer 等操作里高频触发，而补挂过程中（=with-current-buffer=、
+  =add-hook=、日志）又可能改动 buffer 列表 → 重入。
+- 处置：=--ensuring-p= 动态变量做重入守卫，进入即返回；配合「已登记即跳过」，补挂是 O(1) 增量的，
+  不会在热路径上退化为全量遍历。
+
+** 6. SQLite 与 JSON 的类型约束
+
+- =sqlite-execute= 的绑定参数**不接受符号**（报 =(sqlite-error "invalid argument")=），
+  =json-serialize= 同样不接受符号。
+- 处置：落库前 =outcome= / =kind= 与栈里的符号一律转字符串（DB 里仍是 TEXT 的
+  =ok= / =error= / =aborted=、=block= / =command=）；=--json-value= / =--json-string= 负责递归转换。
+
+** 7. 命令 error 的识别依赖 advice
+
+- =C-g= 通常**仍会**跑 =post-command-hook=（quit 在命令循环里被捕获），所以这类命令照常结算为
+  =ok= / =error=，duration 含卡顿时间——正是目标 #1 要看的。
+- =aborted= 只覆盖「上一条命令在下次 =pre= 时仍未结算」，即 =post-command-hook= 被彻底跳过的顶层
+  中断（=throw= 到顶层、=top-level= 重启、在 hook 自身或深层原生代码里跳出命令循环）。
+- 命令抛错由 =command-error-default-function= 的 advice 标记（TD-8：Emacs 30+ 默认
+  =command-error-function= 是 =help-command-error-confusable-suggestions=，内部仍调默认实现，
+  实测可用；若用户换成**不委托**默认实现的函数，则 =error= 识别失效）。
+
+** 8. hook 双跑陷阱（D1）
+
+- =run-hooks= 对**列表**值有历史语义：列表中的 =t= 标记表示「跑完本列表**再跑**全局默认值」。
+  =pre-command-hook= / =post-command-hook= 自 Emacs 31 起 auto-buffer-local，因此
+  「buffer 有局部绑定 + 局部值含 =t=」时，局部值与全局默认值**都会跑**。
+- TD-9 的第一次修复在补挂时无条件追加本模块两个函数 → 若某 buffer 既有局部值本身含 =t=
+  （=add-hook= 不加 =t=，但第三方包或用户手写局部值可能有），本模块函数既在局部值里又在
+  全局默认值里 → 一条命令的 =pre= 跑两次：第一次把上一条结算为 =ok=，第二次发现无待结算命令
+  → 补记一条 =aborted= 空记录。表现为命令计数 / 使用频次 / 中断率**约翻倍**，并出现大量
+  =duration≈0= 的 =aborted=。
+- 两层防护（=el-chronos-collect--ensure-buffer-hooks= 与 =--pre-command=）：
+  1. **只在被遮蔽时补挂**：判据 =(not (memq t (buffer-local-value hook buf)))= ——
+     局部值含 =t= 时全局已在跑，补挂即双跑；局部值不含 =t= 时才补（此时局部值完全遮蔽默认值，
+     不补就是 TD-9 的原始漏采）。判「有无局部绑定」必须用 =local-variable-p=；
+     =buffer-local-value= 在无局部绑定时回落全局值，区分不出这两种情况。
+  2. **1ms 去重兜底**：=--pre-command= 在 =--pending-p= 为真且
+     =(float-time) - --command-start < 0.001= 时直接返回，同一命令不会被记两次；
+     即便将来出现新的双跑来源（多个包各挂一次），计数也不会翻倍。
+- 残余风险：去重是时间窗比较，两次**真实**相邻命令若相隔 <1ms 会被误合并（人类输入远达不到，
+  键盘重复率上限约 30 Hz）。
+
+** 9. 报告自观测抑制：只有重置心跳基线有效
+
+需求：报告生成（首次加载 org + 13 个 analysis 查询，实测约 2.7s）不能被自己的 1s 心跳判为
+阻塞——那是观测者在观测自己，属假阳性。=el-chronos-report--without-block-events= 用三层：
+
+1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧心跳用 =bound-and-true-p=
+   读取后直接跳过判定（跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 侧先 =defvar=
+   声明同名变量）；
+2. 把 =el-chronos-block-threshold-ms= 临时抬到 60s（=--suppress-block-threshold-ms=），
+   兜住「抑制变量尚未被 collect 侧读取」的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
+3. **收尾在 =unwind-protect= 清理段把 =el-chronos-collect--last-heartbeat= 重设为当前时刻**。
+
+为什么第 3 层不可省（也是唯一根本手段）：**心跳 timer 在 BODY 执行期间根本不运行**（主线程被占），
+而 =let= 绑定在 BODY 返回时就已解除；补跑的那次心跳发生在**之后**，此刻
+=--last-heartbeat= 仍是报告开始前的时刻，gap = 报告时长 → 判成一条巨型阻塞。第 1、2 层都拦不住
+这一次补跑，只有把基线重置到「现在」才能让差值归零。
+
+副作用：报告期间若真发生阻塞也不会被记录。有意接受——报告是用户主动触发的重查询，其耗时属
+预期行为，不该混进「待排查的卡顿」。
+
+* 已知偏差（有意为之，不是 bug）
+
+| 偏差 | 具体表现 | 原因 / 处置 |
+|---|---|---|
+| =total_ms= ≠ =profiler-report= 的 total 列 | 本模块 total 按**栈内去重**（同一函数在一条栈里出现多次只算一次），内置报告按每帧累加 | TD-10。去重口径才符合「经过该函数的样本数」语义，避免深递归函数的 total 被重复帧放大。**不打算对齐**；跨工具对比时以 self 为准 |
+| =samples= 是 self 口径 | =samples= = 该函数作为 **leaf** 被采样的次数；只作中间帧出现的函数 =samples= 恒为 0 而 =total_ms= > 0 | 有意如此：占比与回归判定都按 self 口径，避免「出现得多但自己不耗时」的函数虚高。恒有 =self_ms = samples × 采样间隔=，全表 =samples= 求和 = 窗口内真实样本总数（可直接作分母） |
+| 阻塞事件的栈证据是「事后」的 | 主线程停转期间没有可靠 Lisp 回调，=slow_events(kind='block')= 的栈来自 SIGPROF 样本回溯 | I2 的必然结果。心跳只能证明「停转了 N 秒」，栈归因依赖采样，覆盖率待实测（TD-2） |
+| 剖析期间会取走一个采集窗口的样本 | =el-chronos-profile-command= 在观测器运行时复用共享 profiler：先取走当前窗口（该窗口样本归剖析），跑完命令再取差分 | 共享模式下不能重入 =profiler-cpu-start=（见实测结论 2）。代价是剖析期间的那一个采集窗口在 =hourly_functions= 上偏少甚至为空；单命令剖析是低频手动操作，接受此偏差 |
+| 回归判定窗口与显示范围无关 | =el-chronos-analysis-regressions= 忽略 =RANGE=，窗口由 =el-chronos-regression-window-days= 决定 | 报告节标题动态标注真实天数（=回归（近 N 天）=），避免误读；dashboard 的表格标题写死「近 7 天 vs 前 7 天」同理 |
+| =db-size= 只看主文件 | 不含 =-wal= / =-shm=，WAL 未 checkpoint 时主文件偏小 | 见 [[file:operations.org][docs/operations.org]]「排障」；要收敛体积跑 =el-chronos-store-vacuum= |
+| 火焰图是「按层聚合近似」 | Web 侧把栈按层级折叠，深度上限 6，宽度按样本数占比 | 不是精确 flame graph：=hourly_stacks= 只保留 top-N 栈，短栈合并；精度足以定位热点路径 |
+| 忽略 =RANGE= 的其它调用点 | =el-chronos-analysis-heatmap= 只取 =dimension='command'= | mode / project 维度不参与热力图（数据仍在 =hourly_usage= 里，可用 SQL 查） |
+
+* 待补（Phase 4 之后）
+
+- [x] Emacs 31 下 =pre-command-hook= / =post-command-hook= 的 auto-buffer-local 行为与补挂方案实测
+      （TD-9，已修复并有 ERT 覆盖：被遮蔽 buffer 计时恢复、3 轮 start/stop 零重复挂）
+- [x] =backtrace-frames= 替代 =(backtrace)= 的帧提取路径实测（Emacs 31 返回 nil，见实测结论 3）
+- [x] =profiler-cpu-log= 的 hash table 形态与「leaf 在 =aref 0=」的栈顺序实测（见实测结论 1）
+- [x] Web server 边界实测：短连接（=Connection: close=）+ 单线程串行 + 单请求 16KB 上限 → 413 +
+      非 GET 405 + 未知路径 404 + 端口占用 =user-error=，均有 ERT 覆盖
+- [x] ETAF 在 =batch= 下可挂载并产生文本（ERT 可断言页面文本，见 [[file:ui.org][docs/ui.org]] 踩坑清单第 8 条）
+- [ ] **ETAF 渲染性能仍未实测**（TD-5）：30 天真实数据下首次渲染与切范围重绘耗时；超 1s 则下调
+      每页行数（=el-chronos-dashboard-page-size=）与图表采样点（=el-chronos-dashboard-chart-points=），
+      必要时改按需渲染。terminal 文本字符图的可读性同样待人工过一遍
+- [ ] 采样开销实测（TD-3）：10ms 常驻的 CPU 占比，是否需退到 20/50ms
+- [ ] 阻塞捕获覆盖率实测（TD-2）：timer / 进程过滤器 / redisplay 三类召回率
+- [ ] native-comp 下 =symbol-file= 的 =.eln= 归因链路实测（TD-1）
+- [ ] 实际采集一次真实使用日的行数统计，校验「86 万行/天」估算
+- [ ] 最终时序图（含真实 hook 执行顺序与 timer 抖动数据）
+- [ ] P95 近似算法误差对比（TD-7）：排序取位 vs 分桶直方图

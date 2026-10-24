@@ -1,0 +1,233 @@
+#+TITLE: el-chronos 对外接口索引（elisp API）
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:3 num:nil
+
+#+BEGIN_QUOTE
+本文件按模块列出 el-chronos 的对外符号（函数 / 命令 / defcustom）、签名、返回值与一句话说明。
+**兼容承诺**：不带双连字符的符号是对外接口，改动需在 =CHANGELOG.md= 的 =[Unreleased]= 记录
+（破坏性改动另记 ADR）；**内部函数一律以 =--= 结尾，不承诺兼容**，可随时重命名或删除，
+不要在用户配置里依赖它们。
+
+单位约定（I4）：时间戳、耗时、桶起点一律**毫秒**；采样间隔用**纳秒**（仅内存，不落库）。
+所有查询函数在数据库打不开或 SQL 出错时 =display-warning= 并返回 =nil=，**不向调用方抛错**（I6）。
+#+END_QUOTE
+
+* 概览：8 个模块
+
+| 模块 | 文件 | 职责 | 对外符号数 |
+|---|---|---|---|
+| 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 15 defcustom |
+| 归因 | =el-chronos-attrib.el= | 符号 → 源码文件 → 包 / 模块；命令上下文 | 4 |
+| 存储 | =el-chronos-store.el= | SQLite schema、批量 flush、保留与 purge | 10 |
+| 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合 | 2 + 1 defcustom |
+| 分析 | =el-chronos-analysis.el= | 13 个只读聚合查询 | 13 |
+| 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
+| 页面 | =el-chronos-dashboard.el= | ETAF 页面 / tabulated-list 降级页 | 9 命令 + 10 纯函数 + 4 defcustom |
+| Web | =el-chronos-web.el= | 最小 HTTP server + 内嵌 dashboard | 3 |
+
+* 入口模块（=el-chronos.el=）
+
+** 命令
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-mode= | =(ARG)=，global minor mode | — | 全局开关：=1= 启动采集、=-1= 零残留停止（I5）。幂等。 |
+| =el-chronos-status= | =()=，interactive | 状态文本（同时 =message=） | 在 echo area 显示运行状态（是否运行、DB 路径、timer 数、会话 id 等）。 |
+
+#+BEGIN_SRC elisp
+(require 'el-chronos)
+(el-chronos-mode 1)     ; 启动观测
+(el-chronos-status)     ; 查看状态
+(el-chronos-mode -1)    ; 停止，清理 timer / hook / profiler / 未 flush 缓冲
+#+END_SRC
+
+** defcustom（全部属于 =el-chronos= 组）
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| =el-chronos-enabled= | =t= | boolean | 总开关。为 nil 时 mode 仍可切换，但不启动采集。 |
+| =el-chronos-sampling-interval-ns= | =10000000= | integer | profiler 采样间隔（纳秒，默认 10ms）。 |
+| =el-chronos-sample-window-seconds= | =10= | integer | 采样窗口长度（秒）；每满一个窗口取走计数并重置。 |
+| =el-chronos-heartbeat-seconds= | =1= | number | 心跳间隔（秒），用于检测命令外阻塞。 |
+| =el-chronos-block-threshold-ms= | =2000= | number | 心跳漂移超过该值记一次 =block= 事件（毫秒）。 |
+| =el-chronos-slow-command-threshold-ms= | =200= | number | 慢命令阈值（毫秒）。 |
+| =el-chronos-db-path= | =<user-emacs-directory>/.local/state/chronos/chronos.sqlite= | file | 唯一的落库文件（I3）。 |
+| =el-chronos-retention-days= | =30= | integer | 明细表（=commands= / =slow_events=）保留天数。 |
+| =el-chronos-usage-granularity= | ='command= | choice（=command= / =file=） | 用法聚合维度。=file= 会记**被操作文件绝对路径**且永久保留，默认不记（I7）。 |
+| =el-chronos-store-stack-top-n= | =200= | integer | 每会话每小时保留的栈样本条数上限（按 =samples= 淘汰）。 |
+| =el-chronos-regression-window-days= | =7= | integer | 回归判定窗口长度（近 N 天 vs 前 N 天）。 |
+| =el-chronos-regression-threshold= | =0.5= | number | 回归增长率阈值（0.5 = +50%）。 |
+| =el-chronos-regression-min-samples= | =10= | integer | 回归判定要求的最小样本数（两窗口各自满足）。 |
+| =el-chronos-web-port= | =8787= | integer | Web dashboard 端口（只绑 =127.0.0.1=，占用即失败不换端口）。 |
+| =el-chronos-web-auto-start= | =nil= | boolean | 启用观测时是否顺带启动 Web（默认不启动）。 |
+
+* 归因模块（=el-chronos-attrib.el=）
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-attrib-file= | =(SYMBOL)= | 源码文件路径字符串或 =nil= | =symbol-file= + native-comp =.eln= 兜底；取不到返回 nil。 |
+| =el-chronos-attrib-package= | =(SYMBOL-OR-PATH)= | 包名字符串，失败为 ="unknown"= | 路径前缀 → straight 包 / =lisp/init-*.el= 模块 / site-lisp / =built-in=；**任何失败都返回 ="unknown"=、不抛错**（I6）。 |
+| =el-chronos-attrib-context= | =()= | plist =(:mode MODE :project BASENAME :file PATH-or-nil)= | 当前命令上下文。=:project= 只取项目 **basename**（I7）；=:file= 仅在 =el-chronos-usage-granularity= 为 =file= 时非 nil。 |
+| =el-chronos-attrib-clear-cache= | =()=，interactive | 清除条目数 | 清空符号归因缓存（重载包之后用）。 |
+
+#+BEGIN_SRC elisp
+(el-chronos-attrib-package 'save-buffer)   ; => "built-in"
+(el-chronos-attrib-package "/some/unknown/path.el") ; => "unknown"
+(el-chronos-attrib-context)                ; => (:mode emacs-lisp-mode :project "el-chronos" :file nil)
+#+END_SRC
+
+* 存储模块（=el-chronos-store.el=）
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-store-open= | =(&optional PATH)= | SQLite 句柄或 =nil= | 打开（或复用）数据库：pragma、=user_version= 检查与迁移、幂等；失败返回 nil 且已告警。 |
+| =el-chronos-store-close= | =()= | =t= / =nil= | flush 缓冲 → 取消 flush timer → 关库 → 清状态。 |
+| =el-chronos-store-record-command= | =(EVENT)= | 无 | 命令事件入缓冲（plist，键见 =commands= 表）。 |
+| =el-chronos-store-record-slow-event= | =(EVENT)= | 无 | 慢事件 / 阻塞事件入缓冲。 |
+| =el-chronos-store-record-usage= | =(HOUR-TS DIMENSION KEY COUNT DURATION-MS)= | 无 | 累加小时用量；=DIMENSION= 取 =command= / =mode= / =project= / =file=。 |
+| =el-chronos-store-record-function-samples= | =(HOUR-TS FUNCTION FILE PACKAGE SELF-MS TOTAL-MS SAMPLES)= | 无 | 累加小时函数聚合（upsert）。 |
+| =el-chronos-store-record-stacks= | =(HOUR-TS STACKS)= | 无 | 累加小时栈样本；=STACKS= 为 =((STACK-JSON . SAMPLES) ...)=。 |
+| =el-chronos-store-flush= | =()= | 无 | 全部缓冲单事务写库；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。 |
+| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含 =hourly_*=）；=BEFORE= 为 nil 时清空 6 张表。与自动 retention 的区别是连聚合一起删。 |
+| =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
+
+#+BEGIN_SRC elisp
+(el-chronos-store-open)      ; 幂等；打不开返回 nil
+(el-chronos-store-flush)     ; 立刻落库（通常由 5s flush timer 自动做）
+(el-chronos-purge)           ; 清空全部历史
+(el-chronos-store-vacuum)    ; 回收文件空间
+#+END_SRC
+
+* 采集模块（=el-chronos-collect.el=）
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-collect-start= | =()= | =t= / =nil= | 启动采集：命令计时 hook（全局 + 每 buffer 局部补挂，TD-9）、错误标记 advice、心跳 timer、采样 timer 与 profiler。幂等。 |
+| =el-chronos-collect-stop= | =()= | =t= / =nil= | 停止采集并清空全部状态，保证零残留（I5）。幂等。 |
+| =el-chronos-collect-notify-blocks= | defcustom，默认 =t= | boolean | 心跳检测到阻塞时是否在 echo area 提示一句。 |
+| =el-chronos-collect--suppress-block-p= | defvar，默认 =nil= | boolean | **跨模块控制变量**：**report 侧绑定**（=el-chronos-report--without-block-events= 在重查询期间 =let= 为 =t=），**collect 侧读取**（心跳回调用 =bound-and-true-p= 判断后跳过阻塞判定）。report 侧必须先 =defvar= 同名声明，否则跨模块 =let= 绑定未声明变量会 =void-variable=；两侧同名同义，重复声明无副作用。语义上它只抑制「报告耗时的假阻塞」——真实阻塞在报告期间同样不记，属有意取舍。 |
+| =el-chronos-collect--last-heartbeat= | defvar，默认 =nil= | 浮点秒 | 上一次心跳的实际触发时刻。**唯一的跨模块写入点**在 report 侧：重查询结束（=unwind-protect= 清理段）重设基线，避免补跑的心跳把整段报告耗时记成阻塞（详见 [[file:architecture.org][docs/architecture.org]]「报告自观测抑制」）。 |
+
+一般**不直接调用**：由 =el-chronos-mode= 编排（=--start= / =--stop=）。单独加载 collect 时对
+store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
+
+* 分析模块（=el-chronos-analysis.el=，13 个查询）
+
+=RANGE= 取 ='1d= / ='7d= / ='30d=（按当前时刻倒推，上界含当前毫秒 +1 毫秒避免漏行），
+或显式半开区间 ='(START . END)=（epoch 毫秒）。全部只读，返回 plist 或 list of plist；
+失败返回 =nil= 并 =display-warning=。
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-analysis-overview= | =(RANGE)= | plist | 概览 6+1 指标：=:commands= =:blocked-ms= =:slow-commands= =:samples= =:db-size= =:startup-ms=（近 10 次有效会话中位数）= =:sessions= |
+| =el-chronos-analysis-top-functions= | =(RANGE &optional LIMIT INCLUDE-GC)= | list of plist | 热点函数，按 self 降序；元素 =(:function :file :package :self-ms :samples :pct)=；默认排除 ="Automatic GC"= |
+| =el-chronos-analysis-slow-commands= | =(RANGE &optional LIMIT)= | list of plist | 命令排行，按总耗时降序；=(:name :count :total-ms :max-ms :avg-ms :aborted)= |
+| =el-chronos-analysis-package-breakdown= | =(RANGE &optional LIMIT)= | list of plist | 包 / 模块占比；=(:package :self-ms :pct)=；=unknown= 与 =GC= 恒排末尾 |
+| =el-chronos-analysis-trend= | =(RANGE &optional BUCKETS)= | list of plist | 分桶趋势；=(:bucket :samples :slow-commands :blocked)=；空桶不返回 |
+| =el-chronos-analysis-heatmap= | =(RANGE &optional LIMIT)= | list of plist | 命令 × 时间桶热力；=(:bucket :command :count :duration-ms)= |
+| =el-chronos-analysis-stacks= | =(RANGE &optional LIMIT)= | list of plist | 调用栈排行；=(:stack :samples :pct)=，=:stack= 第 0 帧是 leaf；默认 50 |
+| =el-chronos-analysis-sessions= | =(RANGE)= | list of plist | 会话列表，按启动时间降序；=(:id :started-at :startup-ms :emacs-version :host)= |
+| =el-chronos-analysis-blocking-events= | =(RANGE &optional LIMIT)= | list of plist | 命令外阻塞事件，按耗时降序；=(:id :ts :duration-ms :kind :command :mode :project)= |
+| =el-chronos-analysis-event= | =(ID)= | plist 或 =nil= | 单条慢事件完整详情；=:stack= 为帧名 list、=:context= 为 plist |
+| =el-chronos-analysis-regressions= | =(RANGE &optional LIMIT)= | list of plist | 回归列表，按增长率降序；=(:function :current-ms :previous-ms :growth :current-samples :previous-samples)=。**窗口由 =el-chronos-regression-window-days= 决定，RANGE 参数被忽略** |
+| =el-chronos-analysis-names= | =()= | 字符串 list 或 =nil= | 库中出现过的命令名（升序去重），供补全。 |
+| =el-chronos-analysis-db-size= | =()= | 字节数（整数） | **仅主文件**字节数，不含 =-wal= / =-shm=（WAL 未 checkpoint 时主文件偏小）。 |
+
+#+BEGIN_SRC elisp
+(plist-get (el-chronos-analysis-overview '7d) :slow-commands)
+(cl-loop for r in (el-chronos-analysis-top-functions '1d 10)
+         do (message "%s %s%%" (plist-get r :function) (plist-get r :pct)))
+#+END_SRC
+
+* 报告模块（=el-chronos-report.el=）
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-report= | =(&optional RANGE)=，interactive | 报告 buffer | 生成（或刷新）=*el-chronos-report*= 只读 org 报告；默认 =7d=，10 节内容见 [[file:ui.org][docs/ui.org]]。 |
+| =el-chronos-weekly-report= | =(&optional FILE)=，interactive | 文件名 | 把近 7 天报告写入 =FILE=（默认 =chronos-weekly.org=，落运行时状态目录）。 |
+| =el-chronos-export= | =(FORMAT FILE &optional RANGE)=，interactive | 文件名 | =FORMAT= 取 ='csv= / ='json=；CSV 用 =# section:= 分块。 |
+| =el-chronos-show-event= | =(ID)=，interactive | 事件 buffer | 在 =*el-chronos-event*= 展示慢事件完整栈与 context。 |
+| =el-chronos-profile-command= | =(COMMAND &optional ARGS)=，interactive | 剖析 buffer | 在 1ms CPU 采样下**当场**执行一次 =COMMAND=，生成高精度剖析报告（热点 / 调用链 / 包归属 / 优化建议），不查库。=ARGS= **三形态**：=nil= 不传参；**列表** 逐元素作为独立参数（按参数个数传递，不拼成单串）；**单值**（非列表）自动包成单元素列表。 |
+| =el-chronos-profile-save= | defcustom，默认 =nil= | boolean | 非 nil 时把剖析结果作为 =slow_events(kind="profile")= 写入并立即 flush。 |
+
+#+BEGIN_SRC elisp
+(el-chronos-report '7d)
+(el-chronos-weekly-report)                      ; → <state>/chronos-weekly.org
+(el-chronos-export 'csv "/tmp/chronos.csv" '30d)
+(el-chronos-show-event 42)
+(el-chronos-profile-command 'xref-find-definitions)
+#+END_SRC
+
+* 页面模块（=el-chronos-dashboard.el=）
+
+** 命令
+
+| 符号 | 签名 | 说明 |
+|---|---|---|
+| =el-chronos-dashboard= | =(&optional RANGE)= | 打开 / 刷新 =*el-chronos*= 页面；ETAF 可用走组件树，否则 =tabulated-list= 降级页。 |
+| =el-chronos-dashboard-refresh= | =()= | 重新取数并重绘（=g=）。 |
+| =el-chronos-dashboard-range-1d= / =-range-7d= / =-range-30d= | =()= | 切时间范围（=1= / =7= / =3=），页码归零、关闭弹窗。 |
+| =el-chronos-dashboard-next-page= / =-previous-page= | =()= | 翻页（顶栏按钮）。 |
+| =el-chronos-dashboard-show-event= | =()= | 看当前下钻选中阻塞事件的完整栈（=d=）。 |
+| =el-chronos-dashboard-toggle-auto-refresh= | =()= | 切换自动刷新（=r=）。 |
+| =el-chronos-dashboard-quit= | =()= | 取消自动刷新并关闭页面（=q=）。 |
+| =el-chronos-dashboard-etaf-available-p= | =()= | ETAF（=etaf= + =etaf-ui=）是否可用；只读探测，不重新 require。 |
+
+** 可测纯函数（内部命名，供 ERT 断言；签名稳定但**不承诺兼容**）
+
+| 符号 | 签名 | 说明 |
+|---|---|---|
+| =el-chronos-dashboard--bar= | =(VALUE MAX WIDTH)= | 条形字符串（=█= 重复，长度 ≤ WIDTH）。 |
+| =el-chronos-dashboard--scale= | =(VALUES MAX HEIGHT)= | 线性缩放到 =((IDX . Y) ...)=。 |
+| =el-chronos-dashboard--sparkline= | =(VALUES WIDTH HEIGHT)= | 完整 =<svg>= 折线字符串。 |
+| =el-chronos-dashboard--bar-chart= | =(ROWS WIDTH HEIGHT)= | 横向条形图 SVG 字符串。 |
+| =el-chronos-dashboard--heatmap= | =(ROWS WIDTH HEIGHT)= | 热力图 SVG 字符串。 |
+| =el-chronos-dashboard--to-text-bars= | =(SPEC &optional WIDTH)= | SVG 不可用时的字符图；**永不返回 image**（I11）。 |
+| =el-chronos-dashboard--range-symbol= | =(RANGE)= | 字符串或符号 → 归一符号（='1d= / ='7d= / ='30d=），非法值回落 ='7d=。**查询侧必须用它**：analysis 的 alist 键是符号，传字符串会让 =alist-get= 取不到并**静默回落 7 天**。凡下给 =el-chronos-analysis-*= 的 =:range-symbol=、=--chart-rows=、=--tables= 一律先过它。 |
+| =el-chronos-dashboard--range-string= | =(RANGE)= | → 规范字符串（="1d"= / ="7d"= / ="30d"=），供 UI 状态与显示。**分工**：UI 状态（=--range=）一律**存字符串**（顶栏/标题直接显示，无需转换），只有查询前才转符号；=--range->days= 两种形态都接受，故任何一处都别拿字符串直接去 =alist-get=。 |
+| =el-chronos-dashboard--range->days= | =(RANGE)= | → 天数；字符串、符号、整数（旧行为）三种写法都接受，未知按 7。 |
+| =el-chronos-dashboard--page-slice= | =(ROWS PAGE SIZE)= | 取第 PAGE 页（0 基）内容。 |
+
+** defcustom
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| =el-chronos-dashboard-page-size= | =20= | 表格每页行数（慢命令 / 热点函数两张主表分页）。 |
+| =el-chronos-dashboard-chart-points= | =60= | 趋势折线最多采样点数（超出等距抽稀）。 |
+| =el-chronos-dashboard-chart-width= | =72= | 图表逻辑宽度（也是 terminal 字符图宽度）。 |
+| =el-chronos-dashboard-refresh-seconds= | =30= | 自动刷新间隔（秒），=r= 切换、关页面即取消。 |
+
+* Web 模块（=el-chronos-web.el=）
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-web-start= | =(&optional PORT)=，interactive | server 进程对象 | 起 server，只绑 =127.0.0.1=（I8）；端口占用 =user-error=，不换端口。 |
+| =el-chronos-web-stop= | =()=，interactive | =t=（确有关闭）/ =nil= | 关闭 server 并释放端口。 |
+| =el-chronos-web-running-p= | =()= | boolean | server 是否在运行。 |
+
+13 条只读 GET 路由见 [[file:ui.org][docs/ui.org]]「浏览器 Web dashboard」节。
+
+#+BEGIN_SRC elisp
+(el-chronos-web-start)        ; → http://127.0.0.1:8787/
+(el-chronos-web-running-p)    ; => t
+(el-chronos-web-stop)         ; => t
+#+END_SRC
+
+* 内部函数约定
+
+- 以 =--=（双连字符）结尾的是内部实现：=el-chronos--start= / =el-chronos-attrib--classify-path= /
+  =el-chronos-store--flush= / =el-chronos-collect--pre-command= / =el-chronos-analysis--range= /
+  =el-chronos-report--content= / =el-chronos-dashboard--render-etaf= / =el-chronos-web--dispatch= 等。
+- **不承诺兼容**：可随时重命名、改签名或删除；用户配置与外部集成不得依赖。
+- 例外：=el-chronos-dashboard--bar= 等图表纯函数被 ERT 直接断言（见 [[file:ui.org][docs/ui.org]]），
+  改动时须同步测试。
+- 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
+  继续，不向宿主抛错（I6）。
+
+* 关联
+
+- 计划与不变量：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
+- 界面与路由：[[file:ui.org][docs/ui.org]]
+- 数据模型：[[file:schema.org][docs/schema.org]]
+- 装卸与排障：[[file:operations.org][docs/operations.org]]

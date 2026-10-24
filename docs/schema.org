@@ -1,0 +1,283 @@
+#+TITLE: el-chronos 数据模型（骨架）
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:3 num:nil
+
+#+BEGIN_QUOTE
+状态：**Phase 4（Review & Document），DDL 与实现已对齐**（2026-10-24，=el-chronos-store.el=（~el-chronos-store--schema-ddl~））。
+本文件的 DDL、索引、保留策略与
+[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]「数据模型」节一致；
+接口签名见 [[file:api.org][docs/api.org]]，界面消费方式见 [[file:ui.org][docs/ui.org]]。
+尚未实测的项（行数估算、=EXPLAIN QUERY PLAN=、P95 精度）见文末「待补」。
+#+END_QUOTE
+
+* 数据库位置与 PRAGMA
+
+- 路径：=el-chronos-db-path=，默认 =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=。
+- 迁移：=PRAGMA user_version=（当前 =1=），逐版本 =ALTER= 升级，启动时幂等执行。
+  迁移前先把 DB 文件复制为 =chronos.sqlite.bak=；迁移失败则回滚该文件 + =display-warning=，
+  **不破坏原库**（宁可这轮不采集，也不留半迁移状态）。
+- =PRAGMA journal_mode = WAL=（读写不互斥）；=PRAGMA busy_timeout = 2000=（实现常量
+  =el-chronos-store--busy-timeout-ms=）。
+- 所有时间戳为 epoch **毫秒**（I4）；所有时长为**毫秒**浮点（采样间隔用纳秒，仅存在于内存）。
+
+* 最终 DDL（=user_version= 1，6 表 + 3 索引）
+
+以下与 =el-chronos-store--schema-ddl= 逐字一致，一次批量执行（全部 =IF NOT EXISTS=，幂等）；
+=commands= 有外键引用 =sessions=，**建表顺序不能改**。
+
+#+BEGIN_SRC sql
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL,
+  emacs_version TEXT, host TEXT, startup_ms REAL, gc_threshold REAL);
+CREATE TABLE IF NOT EXISTS commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+  session_id INTEGER NOT NULL REFERENCES sessions(id), name TEXT NOT NULL,
+  duration_ms REAL NOT NULL, gc_ms REAL, mode TEXT, project TEXT,
+  outcome TEXT, kind TEXT);
+CREATE INDEX IF NOT EXISTS idx_commands_ts ON commands(ts);
+CREATE INDEX IF NOT EXISTS idx_commands_duration ON commands(duration_ms DESC);
+CREATE TABLE IF NOT EXISTS hourly_functions (
+  hour_ts INTEGER NOT NULL, session_id INTEGER NOT NULL, function TEXT NOT NULL,
+  file TEXT, package TEXT, self_ms REAL NOT NULL DEFAULT 0,
+  total_ms REAL NOT NULL DEFAULT 0, samples INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour_ts, session_id, function));
+CREATE TABLE IF NOT EXISTS slow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, duration_ms REAL NOT NULL,
+  kind TEXT, command TEXT, stack_json TEXT, context_json TEXT);
+CREATE INDEX IF NOT EXISTS idx_slow_events_ts ON slow_events(ts);
+CREATE TABLE IF NOT EXISTS hourly_usage (
+  hour_ts INTEGER NOT NULL, dimension TEXT NOT NULL, key TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0, duration_ms REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour_ts, dimension, key));
+CREATE TABLE IF NOT EXISTS hourly_stacks (
+  hour_ts INTEGER NOT NULL, session_id INTEGER, stack_hash TEXT NOT NULL,
+  stack_json TEXT NOT NULL, samples INTEGER,
+  PRIMARY KEY (hour_ts, session_id, stack_hash));
+#+END_SRC
+
+（源码里 DDL 是单行压缩形式，字段与约束完全一致；此处为可读性重排。）
+
+** 写路径的 SQL
+
+| 用途 | 形态 | 说明 |
+|---|---|---|
+| 命令事件 | 纯 =INSERT= | 每命令一行，进缓冲后由 flush timer 批量提交 |
+| 慢事件 | 纯 =INSERT= | 只有超阈值 / 阻塞 / 剖析结果才写 |
+| 函数聚合 | =INSERT … ON CONFLICT(hour_ts, session_id, function) DO UPDATE SET self_ms = self_ms + excluded.self_ms, total_ms = total_ms + excluded.total_ms, samples = samples + excluded.samples= | 累加而非覆盖 |
+| 用量聚合 | =… ON CONFLICT(hour_ts, dimension, key) DO UPDATE SET count = count + excluded.count, duration_ms = duration_ms + excluded.duration_ms= | 同上 |
+| 栈聚合 | =… ON CONFLICT(hour_ts, session_id, stack_hash) DO UPDATE SET samples = samples + excluded.samples= | =stack_hash = sha1(stack_json)= 去重 |
+
+* 6 张表
+
+** sessions（每次启动一行）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =id= | INTEGER PK AUTOINCREMENT | 会话 id |
+| =started_at= | INTEGER NOT NULL | 启动时刻（epoch ms） |
+| =emacs_version= | TEXT | =emacs-version= |
+| =host= | TEXT | =system-name= |
+| =startup_ms= | REAL | after-init → emacs-startup 耗时 |
+| =gc_threshold= | REAL | 当次会话的 =gc-cons-threshold= |
+
+** commands（每命令一行）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =id= | INTEGER PK AUTOINCREMENT | 行 id |
+| =ts= | INTEGER NOT NULL | 命令结束时刻（epoch ms） |
+| =session_id= | INTEGER NOT NULL | → =sessions.id= |
+| =name= | TEXT NOT NULL | 命令符号名 |
+| =duration_ms= | REAL NOT NULL | 耗时（毫秒） |
+| =gc_ms= | REAL | 该命令期间 GC 耗时 |
+| =mode= | TEXT | =major-mode= |
+| =project= | TEXT | **项目 basename**（不存绝对路径），取不到 NULL |
+| =outcome= | TEXT | =ok= / =aborted= / =error= |
+| =kind= | TEXT | =interactive= / =called= |
+
+索引：=idx_commands_ts(ts)=、=idx_commands_duration(duration_ms DESC)=。
+
+** hourly_functions（采样的小时聚合，主键去重）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =hour_ts= | INTEGER NOT NULL | 整点（epoch ms） |
+| =session_id= | INTEGER NOT NULL | 会话 id |
+| =function= | TEXT NOT NULL | 符号名 |
+| =file= | TEXT | 归因文件（=.el= / =.eln= / built-in） |
+| =package= | TEXT | straight 包 / lisp 模块 / site-lisp / built-in / unknown |
+| =self_ms= | REAL NOT NULL DEFAULT 0 | 采样命中该函数自身的时间 |
+| =total_ms= | REAL NOT NULL DEFAULT 0 | 作为栈帧出现的时间（含子调用） |
+| =samples= | INTEGER NOT NULL DEFAULT 0 | 命中的样本数 |
+
+主键：=(hour_ts, session_id, function)=。
+
+** slow_events（超阈值事件 + 阻塞事件）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =id= | INTEGER PK AUTOINCREMENT | 行 id |
+| =ts= | INTEGER NOT NULL | 事件时刻 |
+| =duration_ms= | REAL NOT NULL | 持续时长 |
+| =kind= | TEXT | =block=（心跳漂移） / =command=（慢命令） |
+| =command= | TEXT | 相关命令名（block 可为 NULL / 上一命令） |
+| =stack_json= | TEXT | 符号栈快照（JSON 数组，取内层 N 帧） |
+| =context_json= | TEXT | mode / project / gc 等上下文 |
+
+索引：=idx_slow_events_ts(ts)=。
+
+** hourly_usage（用法三维计数）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =hour_ts= | INTEGER NOT NULL | 整点（epoch ms） |
+| =dimension= | TEXT NOT NULL | =command= / =mode= / =project= |
+| =key= | TEXT NOT NULL | 维度取值 |
+| =count= | INTEGER NOT NULL DEFAULT 0 | 次数 |
+| =duration_ms= | REAL NOT NULL DEFAULT 0 | 累计耗时 |
+
+主键：=(hour_ts, dimension, key)=。
+
+** hourly_stacks（每小时 top-N 栈样本，火焰图数据基础）
+
+用于火焰图与调用链分析：只保留每小时样本数最高的 N 条栈（=el-chronos-store-stack-top-n=，默认 200），
+超限按 =samples= 淘汰，因此行数上界为「小时数 × 会话数 × N」，不会随采样频率线性膨胀。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =hour_ts= | INTEGER NOT NULL | 整点（epoch ms） |
+| =session_id= | INTEGER | 会话 id。列本身无 =NOT NULL=（DDL 允许 NULL），但**当前实现恒非 NULL**，见下方约束说明 |
+| =stack_hash= | TEXT NOT NULL | =sha1(stack_json)=，去重与主键 |
+| =stack_json= | TEXT NOT NULL | backtrace 向量数组（JSON），第 0 帧是 leaf |
+| =samples= | INTEGER | 该栈在本小时的命中样本数 |
+
+主键：=(hour_ts, session_id, stack_hash)=。
+
+** =session_id= 的「事实非空」约束
+
+DDL 没有写 =NOT NULL=，但当前实现要求它非空，否则 top-N 淘汰会静默失效：
+
+- SQL 的 =NOT IN (SELECT …)= 在子查询结果含 NULL 时整体不成立；主键也把 NULL 当作互不相等，
+  同一栈的多次写入会成为多行而不是累加。因此 =session_id= 为 NULL 时「去重 + 淘汰」都不可靠。
+- 写入侧：=el-chronos-store--stack-session= 只在能取到会话 id 时返回它；取不到则**跳过本次栈写入**
+  并每进程告警一次（=el-chronos-store--stack-skip-warned=）。采集层无会话时（例如单独加载 store
+  做测试）也走这条路径。
+- 淘汰侧：=--evict-stacks= 对 =session_id= 为 NULL 的分组**跳过淘汰**并告警一次
+  （=el-chronos-store--null-session-warned=），不执行有风险的 DELETE。
+- 结论：正常运行时所有行都有 =session_id=；看到 NULL 行说明有非正常写入路径，见
+  [[file:operations.org][docs/operations.org]]「排障」。
+
+** top-N 淘汰 SQL
+
+每个受影响的 =(hour_ts, session_id)= 分组在**同一事务内**执行（与 upsert 同一个 flush 事务）：
+
+#+BEGIN_SRC sql
+DELETE FROM hourly_stacks
+WHERE hour_ts = ?1 AND session_id = ?2
+  AND stack_hash NOT IN (
+    SELECT stack_hash FROM hourly_stacks
+    WHERE hour_ts = ?1 AND session_id = ?2
+    ORDER BY samples DESC
+    LIMIT ?3);                     -- ?3 = el-chronos-store-stack-top-n（默认 200）
+#+END_SRC
+
+要点：
+
+- 淘汰按 **=(hour_ts, session_id)= 分组**，不跨会话、不跨小时；因此上界是「小时数 × 会话数 × N」。
+- =ORDER BY samples DESC= 保留样本数最高的 N 条；并列时保留哪条未定义（对火焰图无影响）。
+- 只在 flush 时对本批涉及的组执行，不做全表扫描。
+- 被淘汰的栈在下一次窗口聚合时可能重新写入（它是「本小时 top-N」而非「永久保留 id」）。
+
+* 3 个典型查询
+
+** 查询 1：热点函数 TOP（最近 7 天，按 self 时间）
+
+#+BEGIN_SRC sql
+SELECT function,
+       package,
+       SUM(self_ms)                                    AS self_ms,
+       SUM(total_ms)                                   AS total_ms,
+       SUM(samples)                                    AS samples
+FROM hourly_functions
+WHERE hour_ts >= :since_ms
+GROUP BY function, package
+ORDER BY self_ms DESC
+LIMIT 30;
+#+END_SRC
+
+** 查询 2：慢命令 TOP（最近 7 天，按最大单次；P95 见「百分位（P95）说明」）
+
+#+BEGIN_SRC sql
+SELECT name,
+       COUNT(*)                                        AS calls,
+       SUM(duration_ms)                                AS total_ms,
+       MAX(duration_ms)                                AS max_ms,
+       SUM(CASE WHEN outcome = 'aborted' THEN 1 ELSE 0 END) AS aborted
+FROM commands
+WHERE ts >= :since_ms
+GROUP BY name
+HAVING calls >= 3
+ORDER BY max_ms DESC
+LIMIT 30;
+#+END_SRC
+
+** 查询 3：包归因占比（最近 7 天，按 self 时间）
+
+#+BEGIN_SRC sql
+SELECT COALESCE(package, 'unknown')                    AS package,
+       SUM(self_ms)                                    AS self_ms,
+       ROUND(100.0 * SUM(self_ms)
+             / (SELECT SUM(self_ms) FROM hourly_functions WHERE hour_ts >= :since_ms), 1) AS pct
+FROM hourly_functions
+WHERE hour_ts >= :since_ms
+GROUP BY package
+ORDER BY self_ms DESC;
+#+END_SRC
+
+* 保留策略
+
+| 表 | 保留 | 说明 |
+|---|---|---|
+| =sessions= | 随明细一起（=started_at= 同口径） | 每启动一次一行；自动 retention 不动它，=el-chronos-purge= 按 =started_at= 删 |
+| =commands= | =el-chronos-retention-days=（默认 30 天） | 每命令一行的明细，超期删除（=--prune=） |
+| =slow_events= | 同 =commands= | 慢事件与阻塞事件明细，超期删除 |
+| =hourly_functions= | **永久** | 小时聚合，行数 ≤ 24 × 函数数/天 |
+| =hourly_usage= | **永久** | 小时聚合，行数 ≤ 24 × 维度取值数/天 |
+| =hourly_stacks= | **永久** | top-N 淘汰（默认 200/小时/会话），行数 ≤ 24 × 200 × 会话数/天 |
+
+- 自动 retention（=el-chronos-store--prune=）**只作用于 =commands= / =slow_events=**，不得动
+  =hourly_*= 三张聚合表（趋势与跨年对比依赖它们）。
+- =hourly_*= 的唯一清理途径是用户手动 =M-x el-chronos-purge=（按日期或全部）。
+- 清理在低优先级 timer 中执行，避免占用交互时段。
+
+* 百分位（P95）说明：当前是近似
+
+SQLite 没有百分位聚合函数，当前实现**不用**「=ORDER BY … LIMIT/OFFSET= 排序取位」逐条扫描，
+而是走两条近似路径：
+
+1. **排行按 max / avg 展示**（=el-chronos-analysis-slow-commands= 返回 =:max-ms= / =:avg-ms=），
+   不声称是 P95；
+2. 需要长尾刻画时看 =slow_events= 的阻塞与超阈值事件分布，以及趋势桶的计数。
+
+精度风险见 TD-7：长尾分布下，「排序取位」与「分桶直方图」两种算法在样本量大且分布偏斜时可能
+偏差 >5%。**待实测**（见文末待补）；偏差超阈值时改为 =commands= 按 =duration_ms= 预分桶的直方图表，
+而不是在查询时排序取位。
+
+* 手动清理与迁移回滚
+
+- =el-chronos-purge (&optional before)=：删除指定日期前的**全部**数据（含 =hourly_*=）。
+  不给 =before= 时按 =el-chronos-retention-days= 计算；用于用户主动清空历史，与自动 retention 区分。
+- 迁移流程：读 =PRAGMA user_version= → 若低于代码期望版本，先复制 DB 为 =.bak= → 逐版本执行迁移 SQL →
+  全部成功则写新 =user_version=；任一步失败则用 =.bak= 覆盖回滚 + =display-warning=，本轮禁用采集。
+- 彻底重置：关闭 Emacs 后删除 =chronos.sqlite=（连同 =-wal= / =-shm=）即可，下次启动重建空库。
+
+* 待补（Phase 4 之后）
+
+- [x] 最终 DDL 与实现对齐（6 表 + 3 索引 + =user_version = 1=，见「最终 DDL」节）
+- [x] =hourly_stacks= 的 top-N 淘汰 SQL 与 =session_id= 非空约束说明（见对应小节）
+- [x] 保留策略表补齐 =sessions= 行与 purge 边界（自动 retention 只碰两张明细表）
+- [ ] 各表日均行数与数据库增长速率实测（校验 86 万行/天估算）
+- [ ] =EXPLAIN QUERY PLAN= 实测：三个典型查询是否走索引（=idx_commands_ts= / =idx_commands_duration= / =idx_slow_events_ts=）
+- [ ] 保留策略对 SQLite 文件大小的影响（purge 后是否需要 =VACUUM=；当前建议手动 =el-chronos-store-vacuum=）
+- [ ] P95 近似精度实测（TD-7）：排序取位 vs 分桶直方图误差；偏差 >5% 改直方图表

@@ -1,0 +1,21 @@
+# 运行时状态目录（SQLite 数据库等）
+.local/
+
+# 字节编译产物
+*.elc
+*.eln
+.eln-cache/
+eln-cache/
+
+# 编辑器临时文件
+*~
+.#*
+
+# 测试日志
+/test/*.log
+
+# org 导出与时间戳缓存
+/.org-timestamps/
+
+# 运行时数据库（仓库根兜底忽略，正常落 .local/state/chronos/）
+/chronos.sqlite*
