@@ -198,14 +198,17 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 - 残余风险：去重是时间窗比较，两次**真实**相邻命令若相隔 <1ms 会被误合并（人类输入远达不到，
   键盘重复率上限约 30 Hz）。
 
-** 9. 报告自观测抑制：三层防护 + 心跳侧感知
+** 9. 自观测抑制（report / Web）：三层防护 + 心跳侧感知
+（本节原名「报告自观测抑制」，更名以纳入 Web 请求处理侧；旧引用按原名检索本文件仍可命中。）
 
-需求：报告生成（首次加载 org + 13 个 analysis 查询）不能被自己的 1s 心跳判为阻塞——
-那是观测者在观测自己，属假阳性。=el-chronos-report--without-block-events= 用三层：
+需求：报告生成（首次加载 org + 13 个 analysis 查询）与 Web 请求处理（查询 + 序列化 + 发送，
+主线程同步）都不能被自己的 1s 心跳判为阻塞——那是观测者在观测自己，属假阳性。两个入口各有
+一个同款宏：=el-chronos-report--without-block-events=（报告）与
+=el-chronos-web--without-block-events=（Web 请求），都用三层：
 
 1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧 =el-chronos-collect--heartbeat=
    用 =bound-and-true-p= 读取：**非 =nil= 时推进 =--last-heartbeat= 基线并跳过阻塞判定**
-   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 侧先 =defvar= 声明同名变量）；
+   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 与 web 侧各自先 =defvar= 声明同名变量）；
 2. 把 =el-chronos-block-threshold-ms= 临时抬到 60s（=--suppress-block-threshold-ms=），
    兜住抑制变量尚未生效的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
 3. **收尾在 =unwind-protect= 清理段把 =el-chronos-collect--last-heartbeat= 重设为当前时刻**。
@@ -218,6 +221,11 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 
 取舍：抑制期间若真发生阻塞也不会被记录。有意接受——报告生成是用户主动触发的重操作，
 其耗时属预期行为，不该混进「待排查的卡顿」。
+
+**两处实现的关系**：为保持 =el-chronos-web.el= 零额外依赖（不 require report / collect），
+web 侧是**内联重复实现**而非复用 report 的宏；任何一处改动都必须同步另一处，端到端覆盖见
+=el-chronos-web-test-suppresses-block-events= 与 report 侧 =--suppress-binding-restored= /
+=--report-suppresses-block-event=。
 
 ** 10. 阻塞捕获覆盖率（TD-2，2026-10-24 实测）
 

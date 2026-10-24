@@ -135,6 +135,7 @@ I8（只绑 `127.0.0.1`、默认关闭、只读）、I10（可视化资源内嵌
   本文只记录决策与不变量口径，不断言其完成状态。
 - **决策工件**：本文 + ADR-0002 状态改 Superseded + `openspec/decisions.md` 新增一行 +
   `openspec/tech-debt.md` 关闭 TD-5（T5）。
+- **后续修复**：TD-12（Web 请求处理未纳入自观测抑制）已关闭 —— `el-chronos-web--handle-request` 外层加 `el-chronos-web--without-block-events`（report 侧同款三层内联实现），并新增端到端用例；详见 `openspec/completed/fix-web-block-suppression.md`。
 
 ## 替代方案与被否决原因
 

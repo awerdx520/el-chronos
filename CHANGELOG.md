@@ -22,6 +22,25 @@
   开头的 buffer（ETAF 挂载的 ` *work*`、`with-temp-buffer` 等），跳过补挂但仍登记——
   消掉每次渲染遍历全部 buffer 的负担（`--hooked-buffers` 因此稳定不增）。
 
+- **Web 请求处理未纳入自观测抑制（TD-12）**：`el-chronos-web.el` 的请求处理（查询 + 序列化 + `process-send-string`）在主线程同步执行，耗时会被 1s 心跳判为一条 `slow_events(kind="block")`，形成「观测器自伤」记录与真实卡顿混淆。修法：在 `el-chronos-web--handle-request` 外层加 `el-chronos-web--without-block-events`——与 report 侧同款**三层机制**（绑定 `el-chronos-collect--suppress-block-p` / 阈值临时抬到 60s / `unwind-protect` 清理段重置心跳基线），为**内联重复实现**（web 刻意不 require report / collect，保持零额外依赖）。代价与 report 一致：请求期间真实发生的阻塞同样不记（用户主动触发的重查询耗时不属待排查卡顿）。新增 `el-chronos-web-test-suppresses-block-events` 端到端锁住三层（含反向验证：删掉基线重置后该用例必红）；用例总数 109 → **110**。见 `openspec/completed/fix-web-block-suppression.md`。
+- dashboard 范围切换失效：UI 状态存**字符串**（`"1d"` / `"7d"` / `"30d"`），而 `el-chronos-analysis--range` 的 alist 键是**符号**（`'1d` / `'7d` / `'30d`）；传字符串会让 `alist-get` 取不到并**静默回落 7 天**，因此按 `1` / `3` 切到 1d 或 30d 后实际仍按 7d 查询。新增 `el-chronos-dashboard--range-symbol`（字符串 / 符号 → 归一符号，非法值回落 `7d`）与 `--range-string` 两个边界函数：状态与显示保持字符串，下给 analysis 的查询（`--load-snapshot` 的 `:range-symbol`、`--chart-rows`、`--tables`）一律转符号，`--range->days` 同时接受两种形态。
+- samples 口径回归 self：`el-chronos-collect--accumulate-appearance` 不再累加 `samples`，改由 `el-chronos-collect--accumulate-self` 只给 leaf 同时累加 `self` / `samples`（`total_ms` 仍是「出现在任一栈中」的时间）。修复概览 `:samples` 样本数虚高、`top-functions` 的 pct 分母失真、回归判定被中间帧样本虚高击穿（抗噪退化）。文件头 2b、`--window-self` 与相关 docstring 同步写明「samples = 该函数作为 leaf 被采样的次数」。
+- flush 失败时聚合缓冲无界增长：`el-chronos-store-flush` 的 error 分支无条件清空命令缓冲与全部聚合 hash（成功路径在会话为 nil 时保留命令缓冲是有意差异，已加注释说明）。
+- 回归窗口配置失效：org 报告的回归节标题改为动态 `（近 %d 天）`，天数取 `el-chronos-regression-window-days`（`bound-and-true-p` 守卫，默认 7），不再让人误以为按显示范围判定。
+- 同毫秒记录漏统计：`el-chronos-analysis--range` 把窗口上界 `END` 加 1 毫秒、SQL 统一用 `ts < END`，避免 `1d` 这类按当前时刻倒推的窗口漏掉与查询时刻同毫秒写入的最新行。
+- file 粒度用法维度：`el-chronos-usage-granularity` 为 `'file` 时按被操作文件补记 `hourly_usage` 的 `file` 维度；docstring 更正为「写入被操作文件绝对路径、该表永久保留，仅 `el-chronos-purge` 可删」，默认 `'command` 不记任何路径（I7）。
+- TD-9：Emacs 31 起 `pre-command-hook` / `post-command-hook` 为 auto-buffer-local，已有局部绑定的 buffer 会遮蔽全局默认值，导致该 buffer 内命令完全漏采。改为「全局默认值 + 每个 buffer 局部补挂」：启动时遍历 `buffer-list` 补挂局部值并登记（weak key），`buffer-list-update-hook` 增量覆盖新 buffer；停止时摘除局部值与登记表，并把「摘后回落到默认值」的局部绑定一并 `kill-local-variable`，不留遮蔽坑。实测被遮蔽 buffer 内命令计时恢复、连续 3 轮 start/stop 无重复挂、stop 后零残留。
+- **命令双记**（D1）：`pre-command-hook` 的局部值若含 `t` 标记，会**连跑**全局默认值，与「全局默认值 + 每个 buffer 局部补挂」方案叠加后每条命令产生 `ok` + `aborted` 两条记录，导致命令计数、使用频次、中断率全部翻倍。修复：只在局部值**不含** `t` 时才补挂（不含 `t` 的局部值才是完整的遮蔽值），并加 1ms 去重兜底（同一 `(命令 . 时间)` 窗口内只记一次）。
+- **profiler 帧名未归一**：`profiler` 回调给出的帧名可能是 `nil`（匿名帧）或闭包 `byte-code` 对象（形如 `#[0 "\300\207" [] 1]`），报告里直接出现 `nil` 与超长 `#[0 ...]` 串。修复：新增归一函数把 nil 映射为 `(anonymous)`、闭包对象映射为 `(closure)`，`el-chronos-collect` / `el-chronos-analysis` 两侧统一走归一。
+- **中间帧占据排行**：`top-functions` / `package-breakdown` 原先按 `total_ms` 排序，`samples=0` 的中间帧（只出现在栈中、从未作为 leaf 被采样）会挤掉真正的热点。修复：两个查询都以 `samples > 0` 为前置过滤，pct 分母同步改为 leaf 样本总数。
+- **报告生成被记为阻塞事件**：`el-chronos-report` 首次 `(require 'org)` 约 2.7 s，被自身 1s 心跳判为阻塞并落库，污染阻塞统计。修复见 `docs/architecture.org`「报告自观测抑制」——报告期间绑定抑制变量 + 抬高阈值 + `unwind-protect` 内重置心跳基线（三层机制；其中「重置基线」负责拦截事后补跑的补记，抑制变量本身由 collect 心跳读取，见下方「抑制层空转」条）。
+- **单命令剖析 `--invoke` 参数语义**：`el-chronos-profile-command` 的 `ARGS` 为列表时原先被当作单参数塞给命令，导致 `find-file` 这类多参数命令只收到一个拼接串。修复：`nil` / 列表 / 单值三形态归一（列表按参数逐个 `funcall`，单值包成单元素列表）。
+- **Web 500 响应泄露内部错误**：异常时错误详情（含 elisp 符号与栈片段）被直接写进 HTTP 响应体。修复：浏览器只回通用文案「内部错误，详见 *Messages*」，详情写 `*Messages*` 供排障。
+- **Web 端口 0 显示错误**：`el-chronos-web-start` 传 `:port 0`（由系统分配端口）时 message 显示 `0` 而非实际监听端口。修复：从 `make-network-process` 返回的进程读取真实端口后再提示。
+- **抑制层空转**：`el-chronos-report--without-block-events` / `el-chronos-dashboard--without-block-events` 早已绑定 `el-chronos-collect--suppress-block-p`，但 collect 侧心跳从不读取它——`let` 绑定形同空转，抑制完全依赖事后重置基线。修复：`el-chronos-collect--heartbeat` 用 `bound-and-true-p` 读取该变量，**抑制期间推进 `--last-heartbeat` 基线并跳过阻塞判定**，解除绑定后不再补记整段 gap。三层防护自此每层都有实际作用（新增 `el-chronos-collect-test-heartbeat-suppressed-skips-block` 断言 3s gap 不落库且基线被推进）。
+- **dashboard 首次渲染被记为阻塞事件**：`el-chronos-dashboard` 首次渲染时的 ETAF 组件初始化耗时（同步、占主线程）被自身 1s 心跳判为阻塞并落库。修复：渲染前同样走抑制（绑定抑制变量 + 抬高阈值 + `unwind-protect` 重置基线），与报告侧口径一致。
+- **`el-chronos-web-running-p` 返回非布尔值**：原先直接把 `process-status` 的结果交给调用方（`(listen ...)` / `(connect ...)` / `stop` 等状态值），`(if (running-p) ...)` 虽能判真，但 `(eq t ...)` 这类布尔断言会失败，且调用方可能把 `stop` 误当运行中。修复：归一为严格 `t` / `nil`（＝`processp` + `process-live-p` 后补 `t`），docstring 写明契约（新增 `el-chronos-ui-test-web-running-p-returns-boolean` 断言）。
+
 ### 变更
 
 - **阻塞提示默认静默**：`el-chronos-collect-notify-blocks` 默认由 `t` 改为 `nil`——心跳检测到主线程
@@ -68,23 +87,3 @@
 - 分析层：13 个聚合查询（top 函数、慢命令、阻塞事件、包归因、趋势、热力、栈样本、会话、回归判定等），返回 plist 供两种可视化形态共用（`el-chronos-analysis.el`，T6）。
 - 报告层：org 报告（1/7/30 天）、周报、CSV/JSON 导出、单事件详情（`el-chronos-report.el`，T7）。
 - 入口模块：`el-chronos-mode`（global minor mode）、defcustom 全套、启停编排幂等与 SQLite 不可用降级（`el-chronos.el`，T2）。
-
-### 修复
-
-- dashboard 范围切换失效：UI 状态存**字符串**（`"1d"` / `"7d"` / `"30d"`），而 `el-chronos-analysis--range` 的 alist 键是**符号**（`'1d` / `'7d` / `'30d`）；传字符串会让 `alist-get` 取不到并**静默回落 7 天**，因此按 `1` / `3` 切到 1d 或 30d 后实际仍按 7d 查询。新增 `el-chronos-dashboard--range-symbol`（字符串 / 符号 → 归一符号，非法值回落 `7d`）与 `--range-string` 两个边界函数：状态与显示保持字符串，下给 analysis 的查询（`--load-snapshot` 的 `:range-symbol`、`--chart-rows`、`--tables`）一律转符号，`--range->days` 同时接受两种形态。
-- samples 口径回归 self：`el-chronos-collect--accumulate-appearance` 不再累加 `samples`，改由 `el-chronos-collect--accumulate-self` 只给 leaf 同时累加 `self` / `samples`（`total_ms` 仍是「出现在任一栈中」的时间）。修复概览 `:samples` 样本数虚高、`top-functions` 的 pct 分母失真、回归判定被中间帧样本虚高击穿（抗噪退化）。文件头 2b、`--window-self` 与相关 docstring 同步写明「samples = 该函数作为 leaf 被采样的次数」。
-- flush 失败时聚合缓冲无界增长：`el-chronos-store-flush` 的 error 分支无条件清空命令缓冲与全部聚合 hash（成功路径在会话为 nil 时保留命令缓冲是有意差异，已加注释说明）。
-- 回归窗口配置失效：org 报告的回归节标题改为动态 `（近 %d 天）`，天数取 `el-chronos-regression-window-days`（`bound-and-true-p` 守卫，默认 7），不再让人误以为按显示范围判定。
-- 同毫秒记录漏统计：`el-chronos-analysis--range` 把窗口上界 `END` 加 1 毫秒、SQL 统一用 `ts < END`，避免 `1d` 这类按当前时刻倒推的窗口漏掉与查询时刻同毫秒写入的最新行。
-- file 粒度用法维度：`el-chronos-usage-granularity` 为 `'file` 时按被操作文件补记 `hourly_usage` 的 `file` 维度；docstring 更正为「写入被操作文件绝对路径、该表永久保留，仅 `el-chronos-purge` 可删」，默认 `'command` 不记任何路径（I7）。
-- TD-9：Emacs 31 起 `pre-command-hook` / `post-command-hook` 为 auto-buffer-local，已有局部绑定的 buffer 会遮蔽全局默认值，导致该 buffer 内命令完全漏采。改为「全局默认值 + 每个 buffer 局部补挂」：启动时遍历 `buffer-list` 补挂局部值并登记（weak key），`buffer-list-update-hook` 增量覆盖新 buffer；停止时摘除局部值与登记表，并把「摘后回落到默认值」的局部绑定一并 `kill-local-variable`，不留遮蔽坑。实测被遮蔽 buffer 内命令计时恢复、连续 3 轮 start/stop 无重复挂、stop 后零残留。
-- **命令双记**（D1）：`pre-command-hook` 的局部值若含 `t` 标记，会**连跑**全局默认值，与「全局默认值 + 每个 buffer 局部补挂」方案叠加后每条命令产生 `ok` + `aborted` 两条记录，导致命令计数、使用频次、中断率全部翻倍。修复：只在局部值**不含** `t` 时才补挂（不含 `t` 的局部值才是完整的遮蔽值），并加 1ms 去重兜底（同一 `(命令 . 时间)` 窗口内只记一次）。
-- **profiler 帧名未归一**：`profiler` 回调给出的帧名可能是 `nil`（匿名帧）或闭包 `byte-code` 对象（形如 `#[0 "\300\207" [] 1]`），报告里直接出现 `nil` 与超长 `#[0 ...]` 串。修复：新增归一函数把 nil 映射为 `(anonymous)`、闭包对象映射为 `(closure)`，`el-chronos-collect` / `el-chronos-analysis` 两侧统一走归一。
-- **中间帧占据排行**：`top-functions` / `package-breakdown` 原先按 `total_ms` 排序，`samples=0` 的中间帧（只出现在栈中、从未作为 leaf 被采样）会挤掉真正的热点。修复：两个查询都以 `samples > 0` 为前置过滤，pct 分母同步改为 leaf 样本总数。
-- **报告生成被记为阻塞事件**：`el-chronos-report` 首次 `(require 'org)` 约 2.7 s，被自身 1s 心跳判为阻塞并落库，污染阻塞统计。修复见 `docs/architecture.org`「报告自观测抑制」——报告期间绑定抑制变量 + 抬高阈值 + `unwind-protect` 内重置心跳基线（三层机制；其中「重置基线」负责拦截事后补跑的补记，抑制变量本身由 collect 心跳读取，见下方「抑制层空转」条）。
-- **单命令剖析 `--invoke` 参数语义**：`el-chronos-profile-command` 的 `ARGS` 为列表时原先被当作单参数塞给命令，导致 `find-file` 这类多参数命令只收到一个拼接串。修复：`nil` / 列表 / 单值三形态归一（列表按参数逐个 `funcall`，单值包成单元素列表）。
-- **Web 500 响应泄露内部错误**：异常时错误详情（含 elisp 符号与栈片段）被直接写进 HTTP 响应体。修复：浏览器只回通用文案「内部错误，详见 *Messages*」，详情写 `*Messages*` 供排障。
-- **Web 端口 0 显示错误**：`el-chronos-web-start` 传 `:port 0`（由系统分配端口）时 message 显示 `0` 而非实际监听端口。修复：从 `make-network-process` 返回的进程读取真实端口后再提示。
-- **抑制层空转**：`el-chronos-report--without-block-events` / `el-chronos-dashboard--without-block-events` 早已绑定 `el-chronos-collect--suppress-block-p`，但 collect 侧心跳从不读取它——`let` 绑定形同空转，抑制完全依赖事后重置基线。修复：`el-chronos-collect--heartbeat` 用 `bound-and-true-p` 读取该变量，**抑制期间推进 `--last-heartbeat` 基线并跳过阻塞判定**，解除绑定后不再补记整段 gap。三层防护自此每层都有实际作用（新增 `el-chronos-collect-test-heartbeat-suppressed-skips-block` 断言 3s gap 不落库且基线被推进）。
-- **dashboard 首次渲染被记为阻塞事件**：`el-chronos-dashboard` 首次渲染时的 ETAF 组件初始化耗时（同步、占主线程）被自身 1s 心跳判为阻塞并落库。修复：渲染前同样走抑制（绑定抑制变量 + 抬高阈值 + `unwind-protect` 重置基线），与报告侧口径一致。
-- **`el-chronos-web-running-p` 返回非布尔值**：原先直接把 `process-status` 的结果交给调用方（`(listen ...)` / `(connect ...)` / `stop` 等状态值），`(if (running-p) ...)` 虽能判真，但 `(eq t ...)` 这类布尔断言会失败，且调用方可能把 `stop` 误当运行中。修复：归一为严格 `t` / `nil`（＝`processp` + `process-live-p` 后补 `t`），docstring 写明契约（新增 `el-chronos-ui-test-web-running-p-returns-boolean` 断言）。

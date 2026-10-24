@@ -195,5 +195,5 @@ Windows 侧进程可直连该端口）。定位是「本机自用的只读视图
 - 界面 / 路由：[[file:ui.org][docs/ui.org]]
 - 数据模型与保留策略：[[file:schema.org][docs/schema.org]]
 - 架构与实测结论：[[file:architecture.org][docs/architecture.org]]
-- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（未关闭：TD-4 / TD-6 / TD-7 / TD-8 / TD-10 / TD-11 / TD-12；TD-1 / TD-2 / TD-3 / TD-5 / TD-9 已关闭）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（未关闭：TD-4 / TD-6 / TD-7 / TD-8 / TD-10 / TD-11；TD-1 / TD-2 / TD-3 / TD-5 / TD-9 / TD-12 已关闭）
 - 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
