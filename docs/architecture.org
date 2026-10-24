@@ -78,7 +78,10 @@ C profiler 的栈向量有三类「不是函数」的元素，处理口径各不
 
 判据顺序（=--builtin-primitive-p=）：① =(not (fboundp S))= 且名字以 =" (C function)"= 结尾或等于
 ="Automatic GC"=（profiler 自造符号，=strings /usr/bin/emacs= 可查到字面串）；② =fboundp= +
-=(subrp (indirect-function S))= + 非 =module-function-p=（动态模块来自第三方，不能归 built-in 掩盖来源）。
+=(subrp (indirect-function S))= + **排除 =native-comp-function-p= 的 native-comp 函数**（Emacs 30+ 的
+=subrp= 对它们也为 =t=——docstring 写作「built-in *or native-compiled* Lisp function」；不排除就会把
+straight 包的 native-comp 函数短路成 =built-in=，绕过 =.eln= 反查归因）+ 非 =module-function-p=
+（动态模块来自第三方，不能归 built-in 掩盖来源）。
 
 **这带来三处口径变化**（不是 bug）：
 1. =overview= 的 =:samples= 不再含 nil 叶子 → 数值下降，更接近真实 CPU 归属；

@@ -111,13 +111,23 @@
 
 (ert-deftest el-chronos-attrib-test-builtin-primitive-skips-symbol-file ()
   "C 原语走短路分支，完全不查 `symbol-file'（T2 的核心收益：不做无谓 IO）。
-`symbol-file' 对原语恒返回 nil，查了也只会落到 \"unknown\"。"
+`symbol-file' 对原语恒返回 nil，查了也只会落到 \"unknown\"。
+
+被测符号必须是**真 C 原语**（`primitive-function-p' 为 t 且 `native-comp-function-p'
+为 nil）。不要用 `save-buffer' —— 实测（Emacs 31.1）它是 native-comp 编译的 Lisp 函数，
+`subrp' 虽为 t，但按设计**不会**短路（见
+`-builtin-primitive-native-comp-excluded'：它走 `symbol-file' 得 `files.elc'）。"
+  ;; 两个判据函数在更老的 Emacs 上不存在，缺失时跳过（不影响本用例的核心断言）
+  (skip-unless (fboundp 'primitive-function-p))
+  (skip-unless (fboundp 'native-comp-function-p))
   (el-chronos-attrib-clear-cache)
   (let ((calls 0))
     (cl-letf (((symbol-function 'symbol-file)
                (lambda (&rest _) (setq calls (1+ calls)) nil)))
-      (should (equal "built-in" (el-chronos-attrib-package 'kill-buffer)))
-      (should (equal "built-in" (el-chronos-attrib-package 'save-buffer)))
+      (dolist (symbol '(kill-buffer car overlay-get))
+        (should (primitive-function-p (indirect-function symbol)))
+        (should-not (native-comp-function-p (indirect-function symbol)))
+        (should (equal "built-in" (el-chronos-attrib-package symbol))))
       (should (= 0 calls)))
     ;; 短路分支不写缓存（既没查文件，也就没有「无文件」结论要缓存）
     (should (= 0 (el-chronos-attrib-clear-cache)))))
@@ -156,7 +166,13 @@
 
 (ert-deftest el-chronos-attrib-test-builtin-primitive-module-excluded ()
   "动态模块函数不判 built-in：第三方模块的来源不能被 built-in 掩盖。
-`module-function-p' 在 Emacs 29 以下不存在，故按 `skip-unless' 守卫。"
+`module-function-p' 在 Emacs 29 以下不存在，故按 `skip-unless' 守卫。
+
+注意：本用例断言的是**构造态**——被测对象是 `car'（真 C 原语，`subrp' 为 t），
+靠 `cl-letf' 把 `module-function-p' 伪造成 t，模拟「既是 `subrp' 又是模块函数」的
+组合。现实中这种函数并不存在（模块函数本身不是 `subrp'），用例的价值是锁定判据里
+那条**排除分支**的存在与生效，属防御性回归保护：将来若有人删掉 `module-function-p'
+排除，本用例会失败。不要因为「现实中构造不出来」而删除它。"
   (skip-unless (fboundp 'module-function-p))
   (el-chronos-attrib-clear-cache)
   (cl-letf (((symbol-function 'module-function-p) (lambda (_function) t)))
@@ -175,6 +191,37 @@
   (should (equal "built-in"
                  (el-chronos-attrib--classify-path
                   "/usr/share/emacs/31.1/lisp/format.elc"))))
+
+(ert-deftest el-chronos-attrib-test-builtin-primitive-native-comp-excluded ()
+  "native-comp 编译的 Lisp 函数**不**判 built-in：它们的包归因必须继续走 `.eln' 反查（TD-1）。
+Emacs 30+ 的 `subrp' 对 native-comp 函数返回 t，若判据只看 `subrp'，straight 包的
+native-comp 函数会被短路成 built-in，包归因直接失效。
+实测（Emacs 31.1）：`ebox--merge-face' 这类从 `eln-cache' 加载的函数 `subrp' 与
+`native-comp-function-p' 同为 t，`symbol-file' 返回 `.eln' 路径。"
+  (skip-unless (fboundp 'native-comp-function-p))
+  (el-chronos-attrib-clear-cache)
+  ;; 1) 伪造：`car' 被视为 native-comp → 不判 built-in
+  (cl-letf (((symbol-function 'native-comp-function-p) (lambda (_fn) t)))
+    (should-not (el-chronos-attrib--builtin-primitive-p 'car)))
+  ;; 2) 完整归因链：伪造「subrp=t + native-comp=t + symbol-file 为 eln-cache 里的 .eln」，
+  ;;    必须走 `.eln' 反查分支（反查不到降级 unknown），而不是短路成 built-in
+  (el-chronos-attrib-clear-cache)
+  (cl-letf (((symbol-function 'native-comp-function-p) (lambda (_fn) t))
+            ((symbol-function 'symbol-file)
+             (lambda (&rest _)
+               "/home/u/.emacs.d/eln-cache/31.1-8806c27d/el-chronos-test-nonexistent-1234abcd.eln")))
+    (should (equal "unknown" (el-chronos-attrib-package 'car))))
+  (el-chronos-attrib-clear-cache)
+  ;; 3) 真实 native-comp 函数：`find-file' / `save-buffer' 在 `emacs -Q --batch' 下即为此类
+  ;;    （实测 Emacs 31.1：两者 `subrp' 与 `native-comp-function-p' 同为 t，`symbol-file'
+  ;;    返回 `files.elc'）—— 判据不得短路。
+  ;;    这里只断言短路判据，不断言完整归因结果：它们 `symbol-file' 返回 `.elc'，落系统
+  ;;    前缀 → 归 "built-in" 是**路径判据**的结论，与短路无关。
+  (dolist (symbol '(find-file save-buffer))
+    (should (fboundp symbol))
+    (should (subrp (indirect-function symbol)))
+    (should (native-comp-function-p (indirect-function symbol)))
+    (should-not (el-chronos-attrib--builtin-primitive-p symbol))))
 
 ;;; native-comp `.eln' 归因（TD-1）
 

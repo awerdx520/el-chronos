@@ -17,7 +17,7 @@
 
 **非目标**：自动调优/自动禁用功能、跨机器数据汇聚、源码行级采样、记录按键序列与文件内容。
 
-当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` 120 用例全绿、0 skipped，`make lint` 零告警）。
+当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` 121 用例全绿、0 skipped，`make lint` 零告警）。
 7 个源码模块 + 7 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
 剩余项是仍待实测的性能/覆盖率数字与 D1 的 GUI 实机验证（见 `openspec/tech-debt.md`）。
 计划见 `openspec/completed/el-chronos-core.md`（2026-10-24 归档）。
@@ -28,14 +28,14 @@
 |---|---|---|
 | `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 307 行（T2） |
 | `el-chronos-collect.el` | 命令计时、心跳阻塞检测（含 D1 双跑去重）、profiler 窗口聚合、启动打点 | 844 行（T5a–c） |
-| `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 331 行（T3） |
+| `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 342 行（T3） |
 | `el-chronos-store.el` | SQLite schema、批量 flush、保留策略、top-N 淘汰、purge | 532 行（T4） |
 | `el-chronos-analysis.el` | 13 个只读聚合查询（热点/慢命令/阻塞/包归因/趋势/热力/栈/会话/回归） | 482 行（T6） |
 | `el-chronos-report.el` | org 报告、周报、CSV/JSON 导出、按需高精度剖析、报告期间自观测抑制 | 832 行（T7、T11） |
 | `el-chronos-web.el` | 最小 HTTP server（13 条只读 GET 路由）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 760 行（T9） |
 | `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 165 行 |
 | `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言 | 354 行 / 15 用例 |
-| `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 324 行 / 27 用例 |
+| `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 368 行 / 28 用例 |
 | `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因 | 682 行 / 30 用例 |
 | `test/el-chronos-report-test.el` | org 报告 10 节、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0 | 456 行 / 24 用例 |
 | `test/el-chronos-store-test.el` | schema/迁移/批量写入/保留策略/top-N 淘汰/purge | 247 行 / 14 用例 |
@@ -127,10 +127,10 @@ make full-check     # check-parens + test
 
 全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。
 
-**当前基线**（实测 2026-10-25）：`make test` = **120 用例**（`Ran 120 tests, 120 results as expected, 0 unexpected`，约 11.2 秒，**0 skipped**）；
-分布：report 24 / web 10 / collect 30 / analysis 15 / store 14 / attrib 27 用例；
-行数：web 272 / report 456 / collect 682 / analysis 354 / store 247 / helper 165 / attrib 324。
-源码 7 模块 **4088 行** + 测试 7 文件 **2500 行** = 合计 **6588 行**。`make lint` **零告警**（14 个文件逐个字节编译）。
+**当前基线**（实测 2026-10-25，判据 2 排除 native-comp 后重测）：`make test` = **121 用例**（`Ran 121 tests, 121 results as expected, 0 unexpected`，约 6.9 秒，**0 skipped**）；
+分布：report 24 / web 10 / collect 30 / analysis 15 / store 14 / attrib 28 用例；
+行数：web 272 / report 456 / collect 682 / analysis 354 / store 247 / helper 165 / attrib 368。
+源码 7 模块 **4099 行** + 测试 7 文件 **2544 行** = 合计 **6643 行**。`make lint` **零告警**（14 个文件逐个字节编译）。
 新增或修改行为时基线只准上升，改测试要说明原因。
 
 **测试文件命名**：测试文件必须命名为 `test/*-test.el`；`make test` 通过 `$(sort $(wildcard test/*-test.el))` 自动发现该模式并按排序全部加载（无匹配时输出 `no test files` 并成功退出），禁止在 Makefile 里硬编码单个文件名（否则拆分测试后会静默漏跑）。
@@ -169,7 +169,7 @@ ss -lntH "sport = :8787"
 |---|---|---|
 | Web 单线程串行 | 请求在 Emacs 主线程同步处理（短连接 + `Connection: close`），并发请求排队；响应时间 = 查询时间；单请求上限 16KB（413），非 GET 405 | `docs/ui.org`「单线程串行处理的含义」 |
 | 采样是 CPU 采样 | 纯静止/纯 `sleep` 不产生样本；阻塞期只能靠心跳证明「停转了」+ 事后栈回溯 | `docs/architecture.org`「实测结论」/「已知偏差」 |
-| **采样归因口径（nil 帧与 C 原语）** | profiler 采样栈里 nil 是**填充/未解析帧**，不是函数：`--accumulate-entry` 的 leaf 与 total 门禁都用 `(and X (symbolp X))` 排除（`(symbolp nil)` 为 t，漏了会造出伪热点 `unknown`——实测曾占 38.8% 样本、total 占 98.7%）；栈序列化前 `--trim-trailing-nils` 裁掉尾部填充，全 nil 栈不写 `hourly_stacks`。**C 原语 / 内置特殊形式 / profiler 伪符号**（`redisplay_internal (C function)`、`Automatic GC`）`symbol-file` 为 nil，由 `el-chronos-attrib--builtin-primitive-p` 判为 `built-in`（实测曾被误判 `unknown`，占 37.1% 样本）。**已知不对称**：闭包叶子（非符号）仍被丢弃、不进 `hourly_functions`（只出现在 `hourly_stacks` 作 `anonymous`），未与 nil 帧统一处置（TD-14） | `docs/architecture.org`「采样归因口径」、TD-13 / TD-14 |
+| **采样归因口径（nil 帧与 C 原语）** | profiler 采样栈里 nil 是**填充/未解析帧**，不是函数：`--accumulate-entry` 的 leaf 与 total 门禁都用 `(and X (symbolp X))` 排除（`(symbolp nil)` 为 t，漏了会造出伪热点 `unknown`——实测曾占 38.8% 样本、total 占 98.7%）；栈序列化前 `--trim-trailing-nils` 裁掉尾部填充，全 nil 栈不写 `hourly_stacks`。**C 原语 / 内置特殊形式 / profiler 伪符号**（`redisplay_internal (C function)`、`Automatic GC`）`symbol-file` 为 nil，由 `el-chronos-attrib--builtin-primitive-p` 判为 `built-in`（实测曾被误判 `unknown`，占 37.1% 样本）（判据排除 `native-comp-function-p`：`subrp` 对 native-comp 函数也为 t，若漏判会把 straight 包的 native-comp 函数短路成 built-in，破坏 `.eln` 反查归因）。**已知不对称**：闭包叶子（非符号）仍被丢弃、不进 `hourly_functions`（只出现在 `hourly_stacks` 作 `anonymous`），未与 nil 帧统一处置（TD-14） | `docs/architecture.org`「采样归因口径」、TD-13 / TD-14 |
 | **阻塞提示默认静默** | `el-chronos-collect-notify-blocks` 默认 **nil**：心跳判定出阻塞后**只落库**，既不占 echo area 也不写 `*Messages*`。取值 `messages` → `(let ((inhibit-message t)) (message ...))` 只进 `*Messages*`；`t` 才真的 echo（旧语义）。**提示开关不影响采集**：三种取值下 `slow_events(kind="block")` 都照记。默认静默的原因：提示会盖住 minibuffer 候选、打断输入，而阻塞事后在 org 报告 / Web dashboard 里可查——所以「echo area 没出现提示」不是漏记，查库即可 | `docs/operations.org`「阻塞提示」 |
 | `total_ms` 口径 | 按栈内去重，与内置 `profiler-report` 的 total **不完全相等**；占比与回归判定一律 self 口径（TD-10） | `docs/architecture.org`「已知偏差」 |
 | **`pre-command-hook` 双跑陷阱（D1）** | Emacs 31 起 `pre-command-hook` auto-buffer-local：局部值是列表时**整体遮蔽**全局值，但列表中含 `t` 标记时 `run-hooks` 会**连跑**全局默认值 → 与「全局 + 局部补挂」叠加后每条命令被记两次（`ok` + `aborted`），计数/频次/中断率翻倍。修复后**只在局部值不含 `t` 时补挂**（不含 `t` 的局部值才是完整遮蔽值），并加 **1ms 去重兜底**（同 `(命令 . 时间)` 只记一次） | `docs/architecture.org`「hook 双跑陷阱（D1）」 |

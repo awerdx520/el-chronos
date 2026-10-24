@@ -200,10 +200,14 @@ eln-cache 的目录名是 `<版本>-<编译哈希>'、文件名是 `<库名>-<�
    `Automatic GC' 是 C profiler 自己 mint 的符号（`strings /usr/bin/emacs' 可查到字面串），
    既不是 fboundp 也没有源码路径。`(not (fboundp SYMBOL))' 是**必需前提**——否则任何
    名字恰好以 \" (C function)\" 结尾的真实函数会被误判（后缀带前导空格，避免误伤）。
-2. **C 原语 / 特殊形式**：`fboundp' 且 `(subrp (indirect-function SYMBOL))'。
-   排除动态模块函数（`module-function-p' 为 t）：模块来自第三方，归 built-in 会掩盖其来源；
+2. **C 原语 / 特殊形式**：`fboundp' 且 `(subrp (indirect-function SYMBOL))'，
+   **但排除 native-comp 编译的 Lisp 函数**（用 `native-comp-function-p' 判）：Emacs 30 起
+   `subrp' 对 native-comp 编译的 Lisp 函数**也返回 t**（docstring：「built-in **or
+   native-compiled** Lisp function」）。不排除的话，straight 包的 native-comp 函数会被这里
+   短路成 built-in，绕过 `.eln' 反查归因（TD-1 的成果），「归因到哪个包」直接失效。
+   同时排除动态模块函数（`module-function-p' 为 t）：模块来自第三方，归 built-in 会掩盖其来源；
    `module-function-p' 在 Emacs 29 以下不存在，故用 `fboundp' 守卫，守卫失败时按「非模块」处理
-   （那些版本还没有模块函数这一说）。
+   （那些版本还没有模块函数这一说）；`native-comp-function-p' 同理用 `fboundp' 守卫。
 
 注意：`format' 这类能查到 `format.elc' 的也在 `subrp' 之列，归 built-in 与既有
 `--classify-source' 的判定一致，不产生冲突。"
@@ -215,10 +219,17 @@ eln-cache 的目录名是 `<版本>-<编译哈希>'、文件名是 `<库名>-<�
                (let ((name (symbol-name symbol)))
                  (or (string-suffix-p " (C function)" name)
                      (string= name "Automatic GC"))))
-          ;; 2) C 原语 / 内置特殊形式（排除动态模块）
+          ;; 2) C 原语 / 内置特殊形式（排除 native-comp 与动态模块）
           (and (fboundp symbol)
                (let ((function (indirect-function symbol)))
                  (and (subrp function)
+                      ;; Emacs 30+ 起 `subrp' 对 **native-comp 编译的 Lisp 函数**也返回 t
+                      ;; （docstring：「built-in or native-compiled Lisp function」）。必须排除，
+                      ;; 否则 straight 包的 native-comp 函数会被短路成 built-in，绕过 `.eln'
+                      ;; 反查归因（TD-1 的成果），包归因直接失效。
+                      (not (and (fboundp 'native-comp-function-p)
+                                (native-comp-function-p function)))
+                      ;; 动态模块函数（第三方）也不归 built-in，不掩盖其来源。
                       (not (and (fboundp 'module-function-p)
                                 (module-function-p function)))))))
          "built-in")))

@@ -69,7 +69,7 @@
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
 | =el-chronos-attrib-file= | =(SYMBOL)= | 源码文件路径字符串或 =nil= | =symbol-file= + native-comp =.eln= 兜底；取不到返回 nil。 |
-| =el-chronos-attrib-package= | =(SYMBOL-OR-PATH)= | 包名字符串，失败为 ="unknown"= | **符号分支先**判 C 原语 / 内置特殊形式 / profiler 伪符号（=el-chronos-attrib--builtin-primitive-p=）→ =built-in=，命中即**短路**（不调 =symbol-file=、不写缓存）；未命中才走 =symbol-file= → 路径分类：straight 包 / =lisp/init-*.el= 模块 / site-lisp / =built-in=；**任何失败都返回 ="unknown"=、不抛错**（I6）。 |
+| =el-chronos-attrib-package= | =(SYMBOL-OR-PATH)= | 包名字符串，失败为 ="unknown"= | **符号分支先**判 C 原语 / 内置特殊形式 / profiler 伪符号（=el-chronos-attrib--builtin-primitive-p=）→ =built-in=，命中即**短路**（不调 =symbol-file=、不写缓存）；判据**排除** =native-comp-function-p= 为 t 的 native-comp 函数（Emacs 30+ 的 =subrp= 对它们也为 t，短路会绕过 =.eln= 反查归因——它们仍走 =symbol-file= → =.eln= 反查）；未命中才走 =symbol-file= → 路径分类：straight 包 / =lisp/init-*.el= 模块 / site-lisp / =built-in=；**任何失败都返回 ="unknown"=、不抛错**（I6）。 |
 | =el-chronos-attrib-context= | =()= | plist =(:mode MODE :project BASENAME :file PATH-or-nil)= | 当前命令上下文。=:project= 只取项目 **basename**（I7）；=:file= 仅在 =el-chronos-usage-granularity= 为 =file= 时非 nil。 |
 | =el-chronos-attrib-clear-cache= | =()=，interactive | 清除条目数 | 清空符号归因缓存（重载包之后用）。 |
 
