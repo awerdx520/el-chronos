@@ -127,6 +127,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | =total_ms= 与内置 =profiler-report= 的 total 列不一致 | 口径不同：本模块 total 按**栈内去重**，内置报告按每帧累加（TD-10） | 不是 bug。占比与回归判定都用 self 口径；跨工具对比时以 self 为准 |
 | echo area 不再弹出「主线程阻塞约 N ms」 | =el-chronos-collect-notify-blocks= 默认为 =nil=（静默），**不是漏记**——事件照旧落 =slow_events(kind="block")= 并进报告 / Web 页面 | 查库确认（见「阻塞提示」节的 SQL）；需要即时可见就把该变量设为 =messages=（只进 =*Messages*=）或 =t=（真 echo） |
 | 回归列表里出现看起来「没变慢」的函数 | 回归按 =el-chronos-regression-window-days=（默认 7 天）与自身上下窗口比较，**与页面显示范围无关**；小样本噪声由 =el-chronos-regression-min-samples= 抑制 | 看返回里的 =:current-samples= / =:previous-samples=；嫌噪就提高阈值或最小样本数 |
+| 包占比里 =built-in= 占大头（甚至过半） | **正常口径**：Emacs C 原语（=kill-buffer= / =plist-get= / =redisplay_internal= 等）与 GC 采样本就来自内核，2026-10-25 起归 =built-in= 而非 =unknown= | 无需处理；若想看用户配置的开销，按包名过滤掉 =built-in= / =GC= / =unknown= 三行即可。历史数据需 =el-chronos-purge= 后重来才是新口径 |
 
 * 验证步骤
 
@@ -136,7 +137,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 |---|---|---|---|
 | =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
 | =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
-| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 131 tests, 130 results as expected, 0 unexpected, 1 skipped= |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 120 tests, 120 results as expected, 0 unexpected= |
 | =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
 
 ** 手动 smoke（端到端，5 分钟）

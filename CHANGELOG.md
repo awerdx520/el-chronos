@@ -9,6 +9,7 @@
 
 ### 修复
 
+- **采样归因两处失真：nil 帧被当成伪函数、C 原语被当成 unknown 包**：① profiler 采样栈里的 `nil`（尾部填充与未解析帧）因 `(symbolp nil)` 为 t 被计入 self / total，落库后伪装成函数 `unknown`——实测 295,509 样本（38.8%）、其 `total_ms` 占全部样本 98.7%，长期占据热点表第 1；修法：`el-chronos-collect--accumulate-entry` 的 leaf 与 total 两处门禁都改用 `(and X (symbolp X))`，nil 帧不再计入。② `hourly_stacks` 里 93.7% 的栈尾部带 `"unknown"` 占位（含一条 `["unknown"×16]` / 295,506 样本），火焰图与调用链视图被无意义占位填满；修法：新增 `el-chronos-collect--trim-trailing-nils`，序列化前裁掉尾部 nil，全 nil 栈不写库。③ Emacs **C 原语与内置特殊形式**的 `symbol-file` 恒为 nil（`kill-buffer` / `overlay-get` / `read` / `mapc` / `plist-get` / `let` / `if` …），连同 profiler 自造的 `redisplay_internal (C function)` / `Automatic GC`（非 fboundp），曾被一律归为 `unknown` 包——实测 431 个函数 / 282,580 样本（37.1%）；修法：新增 `el-chronos-attrib--builtin-primitive-p`（非 fboundp 伪符号按名判定 + `subrp` 且非 `module-function-p`），命中即归 `built-in` 并在 `el-chronos-attrib-package` 符号分支前置短路（顺带省掉一次无谓的 `symbol-file` 调用）。**口径变化**：`overview` 的 `:samples` 不再含 nil 叶子（数值下降、更接近真实 CPU 归属）；`package_breakdown` 的 `built-in` 占比显著上升（正确口径）；`hourly_stacks` 样本总量与 `hourly_functions.samples` 本就不等（前者按完整栈去重、后者按 leaf 去重），改后方向是「栈表 ≥ 函数表」。**历史数据口径不可混算**，建议 `el-chronos-purge` 重来。新增 10 个用例（collect 4 / attrib 6），用例总数 110 → **120**。见 `openspec/completed/fix-sampling-attribution.md`。
 - **dashboard 重复打开导致内存暴涨（OOM）**：`:sessions` 查询无行数上限（一年重启数千次即数千行），
   而该表标为「不分页」，`--tables` 把整表交给 ETAF；`etaf-table` 为每行保留一个行组件，于是
   单次渲染多保留约 62 万 cons、RSS +26 MB（6 次渲染 133 MB→304 MB，隔离实例 OOM）。修法：

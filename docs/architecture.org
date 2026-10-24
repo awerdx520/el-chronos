@@ -66,6 +66,27 @@
 5. 调 =profiler-cpu-stop= + =profiler-cpu-start=（取用即重置，避免长期累积内存）；
 6. =store= 的 flush timer 在小时切换/缓冲达阈值时批量落库。
 
+** 采样归因口径（nil 帧 / C 原语 / 闭包叶子）
+
+C profiler 的栈向量有三类「不是函数」的元素，处理口径各不相同（2026-10-25 起）：
+
+| 元素 | 表现在 | 处置 | 理由 |
+|---|---|---|---|
+| =nil=（尾部填充与未解析帧） | 曾占 38.8% 样本、伪造成函数 =unknown= 并稳居热点第 1；其 =total_ms= 占全部样本 98.7% | **完全不计入** self / samples / total；栈序列化前 =--trim-trailing-nils= 裁掉尾部填充；全 nil 栈不写 =hourly_stacks= | =(symbolp nil)= 为 =t=，漏判就会造出一个不存在的"热点函数"；nil 帧本身不带任何信息 |
+| **C 原语 / 内置特殊形式 / profiler 伪符号** | 曾占 37.1% 样本的 =package= 为 =unknown=（431 个函数） | 由 =el-chronos-attrib--builtin-primitive-p= 判 =built-in=，在 =el-chronos-attrib-package= 的符号分支前置短路（不查 =symbol-file=） | =symbol-file= 对它们恒返回 nil，走路径归因必然失败；它们的归属本来就是 Emacs 内核 |
+| **闭包叶子（非符号）** | 不进 =hourly_functions=，但出现在 =hourly_stacks= 作 =anonymous= | **维持现状**（丢弃 self/total 记录） | 与 nil 帧不对称，属已知未统一项（TD-14） |
+
+判据顺序（=--builtin-primitive-p=）：① =(not (fboundp S))= 且名字以 =" (C function)"= 结尾或等于
+="Automatic GC"=（profiler 自造符号，=strings /usr/bin/emacs= 可查到字面串）；② =fboundp= +
+=(subrp (indirect-function S))= + 非 =module-function-p=（动态模块来自第三方，不能归 built-in 掩盖来源）。
+
+**这带来三处口径变化**（不是 bug）：
+1. =overview= 的 =:samples= 不再含 nil 叶子 → 数值下降，更接近真实 CPU 归属；
+2. =package_breakdown= 的 =built-in= 占比显著上升（此前几乎只有 =format= 一项）；
+3. =hourly_stacks= 的样本总量与 =hourly_functions.samples= **本就不等**——前者按完整栈去重、
+   后者按 leaf 去重；修复后方向是「栈表样本 ≥ 函数表样本」（闭包叶子、或 leaf 为 nil
+   但中间帧有符号的栈，只进栈表）。
+
 * 可视化数据流
 
 两种形态（org 报告 / 浏览器 Web dashboard）共享同一 =el-chronos-analysis= 查询层，
@@ -382,6 +403,7 @@ DELETE FROM hourly_usage WHERE dimension = 'command' AND key IN ('unknown', 'ano
 | =db-size= 只看主文件 | 不含 =-wal= / =-shm=，WAL 未 checkpoint 时主文件偏小 | 见 [[file:operations.org][docs/operations.org]]「排障」；要收敛体积跑 =el-chronos-store-vacuum= |
 | 火焰图是「按层聚合近似」 | Web 侧把栈按层级折叠，深度上限 6，宽度按样本数占比 | 不是精确 flame graph：=hourly_stacks= 只保留 top-N 栈，短栈合并；精度足以定位热点路径 |
 | 忽略 =RANGE= 的其它调用点 | =el-chronos-analysis-heatmap= 只取 =dimension='command'= | mode / project 维度不参与热力图（数据仍在 =hourly_usage= 里，可用 SQL 查） |
+| =redisplay_internal (C function)= 进入回归判定 | 该符号归 =built-in= 后不再被 =regressions= 的 SQL 排除（SQL 仅排除 =Automatic GC=）；其 self 波动超阈值会出现「回归」 | 这是正确行为——redisplay 确实是耗时大户；看回归列表时需知道 built-in 项可能命中的是 Emacs 自身而非用户配置。口径见本节「采样归因口径」 |
 
 * 待补（Phase 4 之后）
 

@@ -69,7 +69,7 @@
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
 | =el-chronos-attrib-file= | =(SYMBOL)= | 源码文件路径字符串或 =nil= | =symbol-file= + native-comp =.eln= 兜底；取不到返回 nil。 |
-| =el-chronos-attrib-package= | =(SYMBOL-OR-PATH)= | 包名字符串，失败为 ="unknown"= | 路径前缀 → straight 包 / =lisp/init-*.el= 模块 / site-lisp / =built-in=；**任何失败都返回 ="unknown"=、不抛错**（I6）。 |
+| =el-chronos-attrib-package= | =(SYMBOL-OR-PATH)= | 包名字符串，失败为 ="unknown"= | **符号分支先**判 C 原语 / 内置特殊形式 / profiler 伪符号（=el-chronos-attrib--builtin-primitive-p=）→ =built-in=，命中即**短路**（不调 =symbol-file=、不写缓存）；未命中才走 =symbol-file= → 路径分类：straight 包 / =lisp/init-*.el= 模块 / site-lisp / =built-in=；**任何失败都返回 ="unknown"=、不抛错**（I6）。 |
 | =el-chronos-attrib-context= | =()= | plist =(:mode MODE :project BASENAME :file PATH-or-nil)= | 当前命令上下文。=:project= 只取项目 **basename**（I7）；=:file= 仅在 =el-chronos-usage-granularity= 为 =file= 时非 nil。 |
 | =el-chronos-attrib-clear-cache= | =()=，interactive | 清除条目数 | 清空符号归因缓存（重载包之后用）。 |
 
@@ -183,6 +183,11 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
   =el-chronos-store--flush= / =el-chronos-collect--pre-command= / =el-chronos-analysis--range= /
   =el-chronos-report--content= / =el-chronos-web--dispatch= 等。
 - **不承诺兼容**：可随时重命名、改签名或删除；用户配置与外部集成不得依赖。
+- **采样归因口径的两处内部处置**（2026-10-25，口径见 [[file:architecture.org][docs/architecture.org]]「采样归因口径」）：
+  =el-chronos-collect--accumulate-entry= 对 nil 帧（profiler 尾部填充 / 未解析帧）**不计入**
+  self / total（判据 =(and X (symbolp X))=，因 =(symbolp nil)= 为 =t=）；栈序列化前经
+  =el-chronos-collect--trim-trailing-nils= 裁掉尾部 nil，全 nil 栈不写 =hourly_stacks=。
+  归因侧的对应处置是 =el-chronos-attrib--builtin-primitive-p=（符号分支前置短路 → =built-in=）。
 - 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
   继续，不向宿主抛错（I6）。
 

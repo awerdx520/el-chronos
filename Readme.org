@@ -126,7 +126,7 @@
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 110 用例）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 120 用例）
 make full-check     # check-parens + test
 #+END_SRC
 
@@ -137,7 +137,7 @@ make full-check     # check-parens + test
 * 当前状态
 
 - 阶段：**Phase 4（Review & Document）**。T1–T12 已实现：6 张表 SQLite 存储、命令/心跳/采样三条采集路径、
-  归因、13 个分析查询、org 报告、Web dashboard、单命令剖析、ERT 110 用例、文档全集。
+  归因、13 个分析查询、org 报告、Web dashboard、单命令剖析、ERT 120 用例、文档全集。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
 - 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 只保留 Web 可视化]]
 - 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]（含仍待实测项：P95 精度 TD-7、阻塞捕获残余缺口 TD-11；采样开销 TD-3、阻塞覆盖率 TD-2、`.eln` 归因 TD-1 已关闭；TD-5 已随可视化为 Web dashboard 单一形态而关闭）
