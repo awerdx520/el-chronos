@@ -85,6 +85,7 @@
 
 ### 新增
 
+- **采集开销实测结论**：S1 新增采集的常驻开销实测为 0.0000177%（GC 采集）与 2.18 ms 一次性（启动打点，日常为 0）；心跳降至 250ms 实测 +0.0357%（距 0.5% 预算余 14 倍），为亚秒级阻塞捕获（TD-11 建议①）在开销维度扫清障碍。同时记录 5 条方法论教训（字节编译断言、GC 污染轮丢弃、timer 唤醒的 regime 差异等）。
 - **Web dashboard 接入观测面扩展数据**：新增 4 条只读路由 `/api/gc`、`/api/startup`、`/api/health`、`/api/config-history`（路由总数 13 → 17），以及对应的 GC 与内存、启动分解、采集健康、配置变更四个面板（沿用 30 秒轮询）。
 - **CSV 导出同步覆盖**：Web 侧 CSV 区块 8 → 11，新增 startup / health / config-history 三块，字段与 org 报告侧逐列对齐。
   用例总数 **192 → 199**（web 用例 10 → 17）。
@@ -134,3 +135,4 @@
 - 分析层：13 个聚合查询（top 函数、慢命令、阻塞事件、包归因、趋势、热力、栈样本、会话、回归判定等），返回 plist 供两种可视化形态共用（`el-chronos-analysis.el`，T6）。
 - 报告层：org 报告（1/7/30 天）、周报、CSV/JSON 导出、单事件详情（`el-chronos-report.el`，T7）。
 - 入口模块：`el-chronos-mode`（global minor mode）、defcustom 全套、启停编排幂等与 SQLite 不可用降级（`el-chronos.el`，T2）。
+- 用例总数 **199 → 200**（新增 `el-chronos-report-test-csv-sections-match-web`，锁住 web 与 report 两侧 CSV 区块对齐）。
