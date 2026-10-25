@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- 阶段：Phase 2（Plan）· 进行中
+- 阶段：Phase 3（Execute）· 进行中
 - 修订：2026-10-25 按用户裁决 R1–R10 与「flush 补写」拍板定稿 —— 启动耗时改为
   「`after-init-hook` 只捕获值 + 并入下一次 flush 事务补写」（设计 7
   处置 ③ / T6）、迁移显式事务边界（设计 3 陷阱 2–3 / T1）、自监控计数器独立 defvar 与差值口径
@@ -11,13 +11,15 @@
 - 复审修订：**plan-reviewer 判「需修订」（1 blocking + 4 major + 5 minor），已按 X1–X10 全部落地** ——
   逐条落点见「设计 10. 修订记录」。其中 blocking 项 X1（新 4 表的保留策略与 purge 扩到 10 表、
   删除顺序钉死）改变了 T1 的范围与用例数（+5 例）；X2 刷新基线为 121 用例 / attrib 28。
-- 已确认：方案 ✅（用户 2026-10-25 确认）、计划 ⏳（待确认）
+- 已确认：方案 ✅（用户 2026-10-25 确认）、计划 ✅（用户 2026-10-25 确认）
 - 前置阻塞：**已解除** —— `fix-sampling-attribution` 已于 2026-10-25 归档到
   `openspec/completed/fix-sampling-attribution.md`（commit 1cece57），基线用例数与采样口径
   已回填 `AGENTS.md`。它必须是前置的原因仍然成立：该计划修复前 nil 帧占 `unknown` 样本的 38.8%、
   其 `total_ms` 占全部样本 98.7%，任何基于 `hourly_functions` 的新增查询（本期 T7 的 GC 趋势、
   T8 的 GC 与内存节）都会被那个污染带偏。
-- 下一步：独立审查（plan-reviewer）→ 用户确认计划 → 进入 Phase 3
+- 已完成：T1（schema v2 + `purge` 扩表 + 外键修复）✅ / T2（store 写入层 + `startup_ms` 补写 +
+  孤儿会话守卫）✅ / T3（变更标记）✅ / T4（GC 与内存采集）✅
+- 下一步：T7a（gc-trend 查询 + 报告节），之后按实测数据决定 T5/T6 或 T8/T9
 
 ## 目标
 
@@ -505,6 +507,18 @@ packed-refs 回退是必需路径。
   ④ **ROLLBACK 后 pending 保留**（注入 flush 失败 → pending 仍非 nil → 下一次成功 flush 补上）；
   **外加一例**：pending 是**唯一**残留（其它缓冲全空）时 flush 仍会执行并写库
   （验证 `--pending-p` 已纳入它，否则早期版本会静默早退）；
+  **外加一例（孤儿会话守卫，执行期补入）**：flush 写 `hourly_gc` / `hourly_health` /
+  `startup_phases` 前**先校验会话行存在**（`--session-known-p`），不存在则**跳过这三表**
+  并**每进程只告警一次**（`--aggregate-session` + `--aggregate-orphan-warned`）。
+  补入理由（三条，缺一不可）：① 这三张新表**不写外键**（`docs` 与设计 2 的明确选择），
+  DB 不会替我们挡孤儿 `session_id`；② `purge` 对它们的删除条件是
+  `session_id IN (SELECT id FROM sessions WHERE started_at < ?)` —— 一旦 `sessions` 行先
+  消失，子查询恒空，这些行**永远删不掉**，静默残留；③ `session_meta` 在**同一风险面**上
+  （同样无外键、同样按会话子查询删），故它的写入路径（`--record-session-meta-1'）必须保持
+  「只写已有会话行的 id」——`--ensure-session' 就是「刚插会话行、拿到 id」的唯一冷路径，
+  天然满足；未来若新增其它调用点，须先判会话存在。用例：
+  `el-chronos-store-test-flush-skips-new-aggregates-when-session-unknown`
+  （删掉会话行 → flush 后三表仍 0 行、既有 `hourly_functions` 照写、告警恰好 1 条）。
   `make test` 全绿。
   （依赖：T1）
 

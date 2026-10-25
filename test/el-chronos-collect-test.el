@@ -677,6 +677,138 @@ buffer 名**不以空格开头**：内部 buffer（空格开头）按 `--interna
       (el-chronos-collect-stop)
       (kill-buffer buf))))
 
+;;; GC 与内存采集（T4）
+;; 采集侧只用两个 Emacs 自维护的累计计数器（`gcs-done' / `gc-elapsed'）与只读的
+;; `garbage-collect-heapsize'，全部零副作用；测试用 `cl-letf' 伪造它们与 store 写接口，
+;; 既不建库也不依赖真实堆。
+
+(ert-deftest el-chronos-collect-test-collect-gc-runs-when-sampling-disabled ()
+  "profiler 未采样时 `--sample-tick' 仍采集 GC 并落库（解耦）。
+本用例锁住「`--collect-gc' 必须在 `(when el-chronos-collect--sampling-p ...)' 之外」：
+一旦把它挪进 `sampling-p' 内，`record-gc' 一次都收不到，本用例必红。
+对应错误矩阵里 profiler 启动失败（禁用采样、命令/心跳继续）时的降级契约。"
+  (let ((el-chronos-collect--sampling-p nil)
+        (el-chronos-collect--gc-baseline (cons gcs-done gc-elapsed))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heap-sample-windows 6)
+        (captured nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-gc)
+               (lambda (hour count ms heap) (push (list hour count ms heap) captured))))
+      (el-chronos-collect--sample-tick))
+    (should (= 1 (length captured)))
+    (let ((row (car captured)))
+      ;; hour-ts 是整点毫秒（与 `--flush-window' / `--finish' 同口径）
+      (should (integerp (nth 0 row)))
+      (should (= 0 (mod (nth 0 row) 3600000)))
+      ;; 基线刚建立 → 本窗口增量为 0，但仍落一次库
+      (should (= 0 (nth 1 row)))
+      (should (= 0.0 (nth 2 row)))
+      ;; 未到堆采样窗口（1 < 6）→ nil
+      (should-not (nth 3 row)))))
+
+(ert-deftest el-chronos-collect-test-collect-gc-computes-deltas ()
+  "首窗口只建基线记 0；第二窗口记 `gcs-done' / `gc-elapsed' 的差值（秒 → 毫秒）。"
+  (let ((el-chronos-collect--gc-baseline nil)
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heap-sample-windows 6)
+        (rows nil))
+    (cl-letf (((symbol-value 'gcs-done) 10)
+              ((symbol-value 'gc-elapsed) 1.0)
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (_hour count ms heap) (push (list count ms heap) rows))))
+      (el-chronos-collect--collect-gc)   ; 首窗口：初始化基线
+      (setq gcs-done 13 gc-elapsed 1.75) ; 第二个窗口：+3 次、+0.75 秒
+      (el-chronos-collect--collect-gc))
+    (should (= 2 (length rows)))
+    ;; push 逆序：nth 1 是第一次、nth 0 是第二次
+    (let ((first (nth 1 rows))
+          (second (nth 0 rows)))
+      (should (= 0 (nth 0 first)))
+      (should (= 0.0 (nth 1 first)))
+      (should (= 3 (nth 0 second)))
+      (should (= 750.0 (nth 1 second)))
+      (should-not (nth 2 second)))))
+
+(ert-deftest el-chronos-collect-test-collect-gc-handles-negative-elapsed ()
+  "`gc-elapsed' 被重置（差值变负）按 0 处理：不抛错、GC 次数照常计入。"
+  (let ((el-chronos-collect--gc-baseline (cons 10 5.0))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heap-sample-windows 6)
+        (rows nil))
+    (cl-letf (((symbol-value 'gcs-done) 12)
+              ((symbol-value 'gc-elapsed) 1.0) ; 5.0 → 1.0，明显被重置
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (_hour count ms heap) (push (list count ms heap) rows))))
+      (should-not (el-chronos-collect--collect-gc)))
+    (should (= 1 (length rows)))
+    (let ((row (car rows)))
+      (should (= 2 (nth 0 row)))       ; 次数正常
+      (should (= 0.0 (nth 1 row)))     ; 负差值被钳到 0
+      (should-not (nth 2 row)))))
+
+(ert-deftest el-chronos-collect-test-collect-gc-heap-sampled-every-n-windows ()
+  "堆采样按窗口计数稀疏化：`el-chronos-heap-sample-windows' = 2 时
+第 2 次带 heap、第 1 / 3 次传 nil（nil 由 store 的 COALESCE 保住上次观测值）。"
+  (let ((el-chronos-collect--gc-baseline (cons gcs-done gc-elapsed))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heap-sample-windows 2)
+        (rows nil))
+    (cl-letf (((symbol-function 'el-chronos-collect--heap-bytes) (lambda () 12345))
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (_hour _count _ms heap) (push heap rows))))
+      (dotimes (_ 3) (el-chronos-collect--collect-gc)))
+    (should (equal '(nil 12345 nil) (nreverse rows)))
+    ;; 采样后计数归零，再一个窗口即为 1（下一轮稀疏采样从头数）
+    (should (= 1 el-chronos-collect--heap-tick-counter))))
+
+(ert-deftest el-chronos-collect-test-collect-gc-degrades-without-heapsize ()
+  "`garbage-collect-heapsize' 不存在（Emacs 29/30）→ heap 传 nil、不报错、GC 次数照常采集。
+只对这一个符号伪造 `fboundp' 返回 nil，其余符号仍走真实实现（否则 `--safe-apply'
+自身的 `fboundp' 守卫也会失效，store 根本收不到调用）。"
+  (let ((el-chronos-collect--gc-baseline (cons 100 10.0))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heap-sample-windows 1) ; 每窗口都该采堆 → 必然走到守卫
+        (rows nil)
+        (warnings nil)
+        (real-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-value 'gcs-done) 103)
+              ((symbol-value 'gc-elapsed) 10.5)
+              ((symbol-function 'fboundp)
+               (lambda (symbol &rest args)
+                 (if (eq symbol 'garbage-collect-heapsize)
+                     nil
+                   (apply real-fboundp symbol args))))
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (_hour count ms heap) (push (list count ms heap) rows)))
+              ((symbol-function 'display-warning)
+               (lambda (&rest args) (push args warnings))))
+      (should-not (el-chronos-collect--collect-gc)))
+    (should (= 1 (length rows)))
+    (let ((row (car rows)))
+      (should (= 3 (nth 0 row)))       ; GC 次数照常（103 - 100）
+      (should (= 500.0 (nth 1 row)))   ; 10.5 - 10.0 秒
+      (should-not (nth 2 row))         ; 堆取不到 → nil
+      (should-not warnings))))
+
+(ert-deftest el-chronos-collect-test-collect-gc-stop-clears-state ()
+  "`collect-start' 初始化 GC 采集状态、`collect-stop' 清零（I5 零残留）。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600))
+    (unwind-protect
+        (progn
+          ;; start 前的脏状态必须被 start 清掉
+          (setq el-chronos-collect--gc-baseline (cons 5 1.0)
+                el-chronos-collect--heap-tick-counter 3)
+          (el-chronos-collect-start)
+          (should-not el-chronos-collect--gc-baseline)
+          (should (= 0 el-chronos-collect--heap-tick-counter))
+          ;; stop 前的脏状态必须被 stop 清掉
+          (setq el-chronos-collect--gc-baseline (cons 7 2.0)
+                el-chronos-collect--heap-tick-counter 4))
+      (el-chronos-collect-stop))
+    (should-not el-chronos-collect--gc-baseline)
+    (should (= 0 el-chronos-collect--heap-tick-counter))))
+
 (provide 'el-chronos-collect-test)
 
 ;;; el-chronos-collect-test.el ends here

@@ -61,6 +61,16 @@
   :type 'integer
   :group 'el-chronos)
 
+(defcustom el-chronos-heap-sample-windows 6
+  "每 N 个采样窗口采一次 Emacs 堆大小（默认 6；窗口默认 10 秒 → 约 60 秒一次）。
+堆大小靠 `garbage-collect-heapsize' 只读取值，**不触发 GC**；该函数仅 Emacs 31.1+
+提供，更低版本取不到值，`hourly_gc.heap_bytes' 恒为 NULL（降级不报错，I6）。
+**不要**为降低采样开销去调 `garbage-collect'：那会真的做一次 GC，等于观测器替用户
+改变了运行时行为，也污染它自己刚记录的数据（观测而不干预）。
+取 nil 或 0 等价于每个窗口都采（采集侧按至少 1 个窗口处理）。"
+  :type '(integer :tag "采样窗口数")
+  :group 'el-chronos)
+
 (defcustom el-chronos-heartbeat-seconds 1
   "心跳定时器间隔，单位秒。
 心跳用于检测「命令之外的主线程阻塞」：比较相邻两次触发的实际间隔，
@@ -143,6 +153,17 @@ I8：Web 服务只绑定 127.0.0.1，端口被占用时启动直接失败，不�
   "启用观测时是否顺带启动 Web dashboard。
 默认 nil（不自动启动）：Web 服务需要用户显式 `M-x el-chronos-web-start'。"
   :type 'boolean
+  :group 'el-chronos)
+
+(defcustom el-chronos-config-watch-globs '("early-init.el" "init.el" "lisp/init-*.el")
+  "参与计算配置指纹（`config-sig'）的配置文件 glob 列表。
+每个 glob 都**相对于 `user-emacs-directory' 展开**（`file-expand-wildcards'），
+命中的文件按「相对路径 + 修改时间 + 字节数」排序后取 sha1，落 `session_meta' 的
+`config-sig' 键（每会话一次，零子进程、零网络）。
+默认值覆盖本机 `~/.emacs.d' 的常见布局（`early-init.el' / `init.el' / `lisp/init-*.el'）；
+改成 nil 表示**关闭配置指纹采集** —— 此时 `config-sig' 键不写行（绝不写 NULL 值行）。
+只按 glob 精确展开少量文件，**不遍历整个配置目录**。"
+  :type '(repeat string)
   :group 'el-chronos)
 
 ;;; 运行时状态

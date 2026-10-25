@@ -9,6 +9,10 @@
 
 ### 修复
 
+- **`el-chronos-purge` 从 6 表扩展到 10 表**：补齐 schema v2 新增的 `hourly_gc` / `startup_phases` / `hourly_health` / `session_meta`，否则这四张表的数据永远无法通过 purge 清理。
+- **修复 `el-chronos-purge` 遇「跨界会话」整体回滚**：很早启动、当天仍在运行的会话，其 `started_at` 落在保留窗口之外而子表行落在窗口之内，删除时触发**外键冲突**，导致整个 purge 事务 ROLLBACK、一条数据都没删。
+- **`purge` 重建会话行时把 `startup_ms` 置 NULL**：避免出现「新 `started_at` 配旧启动耗时」的自相矛盾数据。
+- **五个既有测试改用隔离 fixture**：不再依赖真实的 `~/.emacs.d/.git`，测试在无 `.git` 或无真实配置的环境下同样可重复通过。
 - **采样归因两处失真：nil 帧被当成伪函数、C 原语被当成 unknown 包**：① profiler 采样栈里的 `nil`（尾部填充与未解析帧）因 `(symbolp nil)` 为 t 被计入 self / total，落库后伪装成函数 `unknown`——实测 295,509 样本（38.8%）、其 `total_ms` 占全部样本 98.7%，长期占据热点表第 1；修法：`el-chronos-collect--accumulate-entry` 的 leaf 与 total 两处门禁都改用 `(and X (symbolp X))`，nil 帧不再计入。② `hourly_stacks` 里 93.7% 的栈尾部带 `"unknown"` 占位（含一条 `["unknown"×16]` / 295,506 样本），火焰图与调用链视图被无意义占位填满；修法：新增 `el-chronos-collect--trim-trailing-nils`，序列化前裁掉尾部 nil，全 nil 栈不写库。③ Emacs **C 原语与内置特殊形式**的 `symbol-file` 恒为 nil（`kill-buffer` / `overlay-get` / `read` / `mapc` / `plist-get` / `let` / `if` …），连同 profiler 自造的 `redisplay_internal (C function)` / `Automatic GC`（非 fboundp），曾被一律归为 `unknown` 包——实测 431 个函数 / 282,580 样本（37.1%）；修法：新增 `el-chronos-attrib--builtin-primitive-p`（非 fboundp 伪符号按名判定 + `subrp` 且非 `module-function-p`），命中即归 `built-in` 并在 `el-chronos-attrib-package` 符号分支前置短路（顺带省掉一次无谓的 `symbol-file` 调用）。**口径变化**：`overview` 的 `:samples` 不再含 nil 叶子（数值下降、更接近真实 CPU 归属）；`package_breakdown` 的 `built-in` 占比显著上升（正确口径）；`hourly_stacks` 样本总量与 `hourly_functions.samples` 本就不等（前者按完整栈去重、后者按 leaf 去重），改后方向是「栈表 ≥ 函数表」。**历史数据口径不可混算**，建议 `el-chronos-purge` 重来。新增 11 个用例（collect 4 / attrib 7），用例总数 110 → **121**。（补：判据 2 排除 `native-comp-function-p` 的 native-comp 函数——Emacs 30+ 的 `subrp` 对它们也返回 t，若不排除会把 straight 包的 native-comp 函数短路成 built-in，破坏 `.eln` 反查归因。）见 `openspec/completed/fix-sampling-attribution.md`。
 - **dashboard 重复打开导致内存暴涨（OOM）**：`:sessions` 查询无行数上限（一年重启数千次即数千行），
   而该表标为「不分页」，`--tables` 把整表交给 ETAF；`etaf-table` 为每行保留一个行组件，于是
@@ -44,6 +48,7 @@
 
 ### 变更
 
+- **`hourly_gc` 的 `heap_bytes` 采用 `COALESCE` 覆盖语义**：堆大小每 N 个采样窗口才采一次，其余窗口传 NULL；若用普通覆盖写入，同一小时后到的窗口会把已采到的堆值抹成 NULL，因此改为 `COALESCE` 保留已有值。
 - **阻塞提示默认静默**：`el-chronos-collect-notify-blocks` 默认由 `t` 改为 `nil`——心跳检测到主线程
   阻塞后不再往 echo area 打「el-chronos：主线程阻塞约 N ms（已记录）」，因为该行会盖住 minibuffer
   候选、打断正在进行的输入与补全。**事件仍然照记**：三种取值下 `slow_events(kind="block")` 都照旧
@@ -65,6 +70,11 @@
 
 ### 新增
 
+- **观测面扩展 S1 采集侧（schema v2）**：新增 `hourly_gc`（GC 次数 / 耗时 / 堆大小）、`startup_phases`（启动耗时分解）、`hourly_health`（采集健康自监控）、`session_meta`（变更标记）四张表。
+- **变更标记**：每个会话记录 `git-head`（**零子进程**直接读 `.git`）与 `config-sig`（配置文件 mtime / size 指纹），用于把回归结论归因到「哪天改了什么」。
+- **GC 与内存采集**：`gcs-done` / `gc-elapsed` 增量（零副作用）＋ `garbage-collect-heapsize`（Emacs 31.1+ 可用，更低版本该字段写入 NULL），与 profiler 采样解耦。
+- **新增 defcustom**：`el-chronos-config-watch-globs`、`el-chronos-heap-sample-windows`。
+- 用例总数 **121 → 153**（`make test`，增量集中在 store 写入层与 collect 采集侧）。
 - **ETAF 可视化页面**（`el-chronos-dashboard.el`，976 行）：`*el-chronos*` 一屏呈现 10 项能力——概览卡片 6 指标、慢命令排行、热点函数排行（含包归属）、包/模块占比条形图、趋势折线、阻塞事件列表与详情、用法热力图、回归列表、会话列表与启动耗时、时间范围切换与行级下钻；快捷键 `1`/`7`/`3` 切范围、`g` 刷新、`r` 自动刷新、`d` 看完整栈、`q` 关闭。ETAF 缺失时降级为 `tabulated-list` 简版页（慢命令表 + 热点函数表 + 切范围），terminal frame 下图表降级为文本字符图（I9 / I11）。
 - **Web dashboard**（`el-chronos-web.el`，初版 692 行，现 709 行）：内置 `make-network-process` 自写最小 HTTP server + 字符串内嵌单页（HTML/CSS/JS 全内嵌，无 CDN、离线可用），**13 条只读 GET 路由**（`/` 与 `/api/summary|top-functions|slow-commands|packages|trend|heatmap|stacks|sessions|blocking|regressions|event|export.csv`）；手写 SVG 趋势/环形图、DOM 热力网格、按层聚合的火焰图近似、搜索/排序/分页（10 行/页）、下钻侧栏、自动刷新（默认 30s，可关）、CSV 导出、多会话对比。只绑 `127.0.0.1`、默认不启动、无写入路由；端口占用 `user-error` 且不换端口（I8 / I11）。
 - **单命令高精度剖析** `el-chronos-profile-command`（T11）：在 1ms CPU 采样下当场执行一次命令，输出热点 / 调用链 / 包归属 / 优化建议；profiler 已被常驻采样占用时复用共享模式（不自起自停）；`el-chronos-profile-save` 非 nil 时结果落 `slow_events(kind="profile")`。

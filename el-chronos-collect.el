@@ -144,6 +144,8 @@
 (declare-function el-chronos-store-record-function-samples "el-chronos-store"
                   (hour-ts function file package self-ms total-ms samples))
 (declare-function el-chronos-store-record-stacks "el-chronos-store" (hour-ts stacks))
+(declare-function el-chronos-store-record-gc "el-chronos-store"
+                  (hour-ts gc-count gc-ms heap-bytes))
 
 ;;; 自定义项
 
@@ -200,6 +202,16 @@
 那一次补跑的心跳会把整段渲染耗时算成一条巨型阻塞（I2 只认时间差，无法事后区分）。
 report 侧 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量报
 `void-variable'；同义重复声明无副作用。")
+
+(defvar el-chronos-collect--gc-baseline nil
+  "上一次 GC 采样的基线，形如 `(gcs-done . gc-elapsed)'；nil 表示尚未初始化。
+两个计数器都是 Emacs 自维护的**累计值**（启动至今），故首个窗口只初始化基线、
+增量记 0 —— 否则会把开机以来累计的 GC 全算进这一个采样窗口。")
+
+(defvar el-chronos-collect--heap-tick-counter 0
+  "距上次堆采样已过去的采样窗口数。
+每窗口 +1，达到 `el-chronos-heap-sample-windows' 时归零并采一次堆大小
+（默认 6 个窗口 ≈ 60 秒；其余窗口给 store 传 nil，由 COALESCE 保住上次观测值）。")
 
 (defvar el-chronos-collect--timers nil
   "本模块创建的 timer 列表（心跳 + 采样窗口），停止时逐个 cancel 并摘除登记（I5）。")
@@ -648,14 +660,80 @@ store 侧再按键（小时 + 会话 + 名字）累加，写库由 store 的 flu
     (clrhash el-chronos-collect--window-stacks))
   nil)
 
+(defun el-chronos-collect--heap-bytes ()
+  "返回当前 Emacs 堆的在用字节数；`garbage-collect-heapsize' 不可用时返回 nil。
+只读取值，**不触发 GC**：官方 docstring 说它「可能不是完全最新，除非紧跟一次完整 GC
+之后调用」，即成本可忽略（`garbage-collect` 才是会真做一次 GC 的那个）。
+Emacs 31.1 之前没有该函数 → `fboundp' 守卫返回 nil，调用方给 store 传 nil，
+`hourly_gc.heap_bytes' 保持 NULL（分析层返回 nil 序列，I6 降级不报错）。
+汇总口径：`Σ SIZE × USED`（USED 为堆中存活对象数，SIZE 为每个对象的字节数）。"
+  (condition-case err
+      (when (fboundp 'garbage-collect-heapsize)
+        (let ((info (garbage-collect-heapsize)))
+          (when (consp info)
+            (cl-loop for entry in info
+                     for size = (nth 1 entry)
+                     for used = (nth 2 entry)
+                     when (and (numberp size) (numberp used))
+                     sum (* size used)))))
+    (error (el-chronos-collect--warn "读取堆大小失败：%S" err) nil)))
+
+(defun el-chronos-collect--collect-gc ()
+  "采集本窗口的 GC 次数 / 耗时与（稀疏的）堆大小，交给 store 累加到小时桶。
+与 profiler 采样**互不依赖**：`gcs-done' / `gc-elapsed' / `garbage-collect-heapsize'
+都只读 Emacs 自维护的计数器，不需要 profiler。因此调用点在
+`--sample-tick' 的 `(when el-chronos-collect--sampling-p ...)' **之外** ——
+若绑在里面，profiler 启动失败时按错误矩阵只「禁用采样、命令/心跳继续」，
+GC 与内存趋势会跟着陪葬，而它恰恰是判断「是不是越用越胖」的唯一依据。
+
+首窗口（基线为 nil）只初始化基线、增量为 0：`gcs-done' / `gc-elapsed' 是启动至今的
+累计值，直接当增量会把开机以来的 GC 全算进一个窗口。
+`gc-elapsed' 可被重置，差值取负时按 0（沿用 `--finish' 的既有防御）。
+堆大小每 `el-chronos-heap-sample-windows' 个窗口采一次，其余窗口传 nil
+（store 侧 `heap_bytes' 用 COALESCE 保住上一次观测值）。
+自身 `condition-case'：失败只限流告警，不向宿主抛错（I6）。"
+  (condition-case err
+      (let* ((done gcs-done)
+             (elapsed gc-elapsed)
+             (baseline el-chronos-collect--gc-baseline)
+             (count 0)
+             (gc-ms 0.0))
+        (when (consp baseline)
+          ;; 两个计数器都单调递增（除非被重置），负值说明被重置过 → 按 0
+          (setq count (max 0 (- done (car baseline)))
+                gc-ms (max 0.0 (* 1000 (- elapsed (cdr baseline))))))
+        (setq el-chronos-collect--heap-tick-counter
+              (1+ el-chronos-collect--heap-tick-counter))
+        (let* ((windows (max 1 (or el-chronos-heap-sample-windows 1)))
+               (heap-bytes
+                (when (>= el-chronos-collect--heap-tick-counter windows)
+                  (setq el-chronos-collect--heap-tick-counter 0)
+                  (el-chronos-collect--heap-bytes))))
+          (el-chronos-collect--safe-apply
+           #'el-chronos-store-record-gc
+           ;; hour-ts 与 `--flush-window' / `--finish' 用同一个 `--hour-ts'（整点毫秒，
+           ;; epoch 基准），store 只把它当主键的一部分，不再做时区 / 对齐转换。
+           (list (el-chronos-collect--hour-ts) count gc-ms heap-bytes)))
+        (setq el-chronos-collect--gc-baseline (cons done elapsed)))
+    (error (el-chronos-collect--warn "GC 采集失败：%S" err)))
+  nil)
+
 (defun el-chronos-collect--sample-tick ()
   "采样窗口到期：取走 profiler 日志 → 累加 → 落库 → 清空窗口。
 `profiler-cpu-log' 取用即重置，本函数因此是采样数据的唯一出口（Emacs 单线程 timer
-保证不会重入）。自身 `condition-case'：任何异常都不得终止 timer（I6）。"
+保证不会重入）。自身 `condition-case'：任何异常都不得终止 timer（I6）。
+
+GC / 堆采集在 `(when el-chronos-collect--sampling-p ...)' **之外**调用，与 profiler
+采样互不依赖：`gcs-done' / `gc-elapsed' / `garbage-collect-heapsize' 都不需要 profiler。
+若绑在 `sampling-p' 内，profiler 启动失败时（错误矩阵：禁用采样，命令/心跳继续）
+GC 与内存趋势会一起陪葬，而它正是「是不是越用越胖」的唯一依据。"
   (condition-case err
-      (when el-chronos-collect--sampling-p
-        (el-chronos-collect--accumulate (profiler-cpu-log))
-        (el-chronos-collect--flush-window))
+      (progn
+        ;; 先采 GC/堆：不依赖 profiler，且 profiler 路径即便异常也不该吞掉它
+        (el-chronos-collect--collect-gc)
+        (when el-chronos-collect--sampling-p
+          (el-chronos-collect--accumulate (profiler-cpu-log))
+          (el-chronos-collect--flush-window)))
     (error
      ;; 异常时也要清空窗口，避免脏数据滚进下一个窗口
      (ignore-errors (clrhash el-chronos-collect--window-self))
@@ -798,6 +876,9 @@ buffer 也补挂则会让同一命令双跑（D1）。
                                  el-chronos-sample-window-seconds
                                  #'el-chronos-collect--sample-tick))))
     (setq el-chronos-collect--last-heartbeat (float-time))
+    ;; GC 基线：nil 表示未初始化，首个采样窗口只建立基线（见 `--collect-gc'）
+    (setq el-chronos-collect--gc-baseline nil
+          el-chronos-collect--heap-tick-counter 0)
     (el-chronos-collect--start-sampling)
     (setq el-chronos-collect--running-p t))
   el-chronos-collect--running-p)
@@ -806,7 +887,8 @@ buffer 也补挂则会让同一命令双跑（D1）。
   "停止采集层并清空全部状态，保证零残留（I5）。幂等。
 零残留判据：`--timers' 为 nil、两个 hook 的默认值不含本模块函数、
 **各 buffer 的局部值也不含**（`--hooked-buffers' 清空、`buffer-list-update-hook' 不含补挂函数）、
-`(profiler-cpu-running-p)' 为 nil、窗口 hash 为空、pending 清空。"
+`(profiler-cpu-running-p)' 为 nil、窗口 hash 为空、pending 清空、
+GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）。"
   (interactive)
   ;; 先取走最后一个（可能不足一个窗口的）样本，再停 profiler —— 半个窗口也不丢
   (when el-chronos-collect--sampling-p
@@ -828,6 +910,8 @@ buffer 也补挂则会让同一命令双跑（D1）。
     (setq el-chronos--active-timers (delq timer el-chronos--active-timers)))
   (setq el-chronos-collect--timers nil
         el-chronos-collect--last-heartbeat nil
+        el-chronos-collect--gc-baseline nil
+        el-chronos-collect--heap-tick-counter 0
         el-chronos-collect--pending-p nil
         el-chronos-collect--command-start nil
         el-chronos-collect--command-name nil
