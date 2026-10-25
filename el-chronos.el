@@ -111,8 +111,9 @@ I3 要求全部观测数据只写这一个文件（连同 SQLite 自动生成的
 
 (defcustom el-chronos-retention-days 30
   "明细数据保留天数。
-只作用于 `commands' 与 `slow_events' 两张明细表；`hourly_functions'、
-`hourly_usage'、`hourly_stacks' 三张聚合表永久保留，由用户手动 purge 清理。"
+只作用于 `commands' 与 `slow_events' 两张明细表；五张 hourly_* 聚合表
+（`hourly_functions'、`hourly_usage'、`hourly_stacks'、`hourly_gc'、`hourly_health'）
+永久保留，由用户手动 purge 清理。"
   :type 'integer
   :group 'el-chronos)
 

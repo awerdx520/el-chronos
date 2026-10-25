@@ -14,8 +14,9 @@
 ;;     不向宿主抛错（I6）；
 ;;   - schema 版本用 `PRAGMA user_version'：迁移前复制 .bak，失败则关句柄并用 .bak
 ;;     覆盖回原文件，不破坏原库；
-;;   - `commands' / `slow_events' 按 `el-chronos-retention-days' 清理，三张 hourly_*
-;;     聚合表永久保留、只由 `el-chronos-purge' 手动清理；
+;;   - `commands' / `slow_events' 按 `el-chronos-retention-days' 清理，五张 hourly_*
+;;     聚合表（`hourly_functions' / `hourly_usage' / `hourly_stacks' / `hourly_gc' /
+;;     `hourly_health'）永久保留、只由 `el-chronos-purge' 手动清理；
 ;;   - `hourly_stacks' 每 (hour_ts, session_id) 只留 samples 最大的 top-N 条。
 ;; 单位（I4）：时间戳与耗时用毫秒，采样间隔用纳秒；数据只写 `el-chronos-db-path'。
 
@@ -57,7 +58,12 @@
 不写外键：同 `el-chronos-store--ddl-hourly-gc'。")
 (defconst el-chronos-store--ddl-session-meta
   "CREATE TABLE IF NOT EXISTS session_meta (session_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (session_id, key));"
-  "v2 新增：会话级元数据 KV（git-head / config-sig / mode-start 等），加一个键无需再迁移。
+  "v2 新增：会话级元数据 KV，加一个键无需再迁移。
+**实际写入的键只有两个**：`git-head'（会话启动时的仓库提交 sha）与 `config-sig'
+（配置文件 mtime/size 的 sha1 指纹），由 `el-chronos-store--ensure-session' 每会话
+写一次；取不到值的键**不写行**（不写 NULL 值行）。
+`mode-start' **不在本表** —— 它是 `startup_phases.phase' 的取值（模式启用锚点），
+查启动分解请查 `startup_phases'。
 不写外键：同 `el-chronos-store--ddl-hourly-gc'。")
 (defconst el-chronos-store--schema-ddl
   (concat "
@@ -1147,7 +1153,9 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
 
 (defun el-chronos-store--prune ()
   "按 `el-chronos-retention-days' 清理明细表。
-只删 `commands' 与 `slow_events'；三张 hourly_* 聚合表永久保留，只由 purge 清理。"
+只删 `commands' 与 `slow_events'；**五张** hourly_* 聚合表（`hourly_functions' /
+`hourly_usage' / `hourly_stacks' / `hourly_gc' / `hourly_health'）永久保留，
+只由 `el-chronos-purge' 清理。"
   (when el-chronos-store--db
     (let ((cutoff (- (el-chronos-store--now-ms)
                      (* (or el-chronos-retention-days 30) 86400000))))

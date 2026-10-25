@@ -186,7 +186,8 @@ PHASE 取 `mode-start' / `after-init' / `startup' / `first-idle'，包加载明�
 
 (defun el-chronos-test--insert-session-meta (session-id key value)
   "插入一条会话级元数据 KV：SESSION-ID / KEY / VALUE（VALUE 为 nil 时落 NULL）。
-KEY 取 `git-head' / `config-sig' / `mode-start' 等；主键是 (session_id, key)。"
+实际写入的 KEY 只有 `git-head' / `config-sig'；主键是 (session_id, key)。
+（`mode-start' 是 `startup_phases.phase' 的取值，不是本表键。）"
   (el-chronos-test--exec
    "INSERT INTO session_meta (session_id, key, value) VALUES (?, ?, ?)"
    (list session-id key value)))
