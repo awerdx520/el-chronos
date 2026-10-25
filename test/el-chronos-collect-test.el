@@ -1199,6 +1199,364 @@ buffer 名**不以空格开头**：内部 buffer（空格开头）按 `--interna
       (should (= 0 el-chronos-collect--startup-load-count))
       (should (= 0 (hash-table-count el-chronos-collect--startup-loads))))))
 
+;;; 心跳判定单一函数 `--heartbeat-check'：三处调用点与两档阈值
+;; （ADR-0005 D1 / D4 / D4a / D6 / D7）
+
+;; 本组用例一律用「显式 now 注入 + 显式基线偏移」而不是真实 timer：
+;; `--heartbeat-check' 的 NOW 参数就是为此准备的，于是 gap 完全确定，
+;; 既不用等待也不会因 timer 相位抖动而 flaky（计划 4.4 的「四档边界」要求）。
+
+(defmacro el-chronos-collect-test--with-capture (capture-var &rest body)
+  "把四个 store 写接口换成「压入 CAPTURE-VAR 后返回 nil」的桩，再执行 BODY。
+CAPTURE-VAR 需由调用方 `let' 绑定为 nil（本宏不绑定它，以便用例在宏外读结果）；
+每次调用压入 `(类别 . 参数表)'，类别取 `command' / `usage' / `slow' / `drift'，
+参数表一律是**列表**（故 `(car 参数表)' 恒为该次调用的第一个实参）。"
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'el-chronos-store-record-command)
+              (lambda (event) (push (cons 'command (list event)) ,capture-var)))
+             ((symbol-function 'el-chronos-store-record-usage)
+              (lambda (&rest args) (push (cons 'usage args) ,capture-var)))
+             ((symbol-function 'el-chronos-store-record-slow-event)
+              (lambda (event) (push (cons 'slow (list event)) ,capture-var)))
+             ((symbol-function 'el-chronos-store-record-drift)
+              (lambda (&rest args) (push (cons 'drift args) ,capture-var))))
+     ,@body))
+
+(defun el-chronos-collect-test--calls (capture kind)
+  "返回 CAPTURE 里类别为 KIND 的调用参数表（按实际发生顺序）。
+`drift' 类别的参数表形如 `(HOUR-TS GAP-MS)'。"
+  (cl-loop for entry in (reverse capture)
+           when (eq (car entry) kind)
+           collect (cdr entry)))
+
+(defun el-chronos-collect-test--slow-kinds (capture)
+  "返回 CAPTURE 里慢事件的 kind 列表（按实际发生顺序）。"
+  (mapcar (lambda (args) (plist-get (car args) :kind))
+          (el-chronos-collect-test--calls capture 'slow)))
+
+(ert-deftest el-chronos-collect-test-heartbeat-and-drift-defaults ()
+  "两个 defcustom 的基线与硬约束：心跳 0.25s、drift 500ms，type 均为 `number'。
+硬约束「drift 阈值 > 心跳间隔」与「drift 阈值 < block 阈值」若被改坏，
+判定链会退化成「每次正常心跳都记 drift」或「drift 永远没机会命中」。"
+  (should (= 0.25 (default-value 'el-chronos-heartbeat-seconds)))
+  (should (= 500 (default-value 'el-chronos-drift-threshold-ms)))
+  (should (eq 'number (get 'el-chronos-heartbeat-seconds 'custom-type)))
+  (should (eq 'number (get 'el-chronos-drift-threshold-ms 'custom-type)))
+  (should (> (default-value 'el-chronos-drift-threshold-ms)
+             (* 1000 (default-value 'el-chronos-heartbeat-seconds))))
+  (should (< (default-value 'el-chronos-drift-threshold-ms)
+             (default-value 'el-chronos-block-threshold-ms))))
+
+(ert-deftest el-chronos-collect-test-command-internal-block-records-no-block ()
+  "命令内的停转只记 `kind=\"command\"'：`--finish' 重置基线后 block 与 drift 都不记。
+**双记消除的核心守门用例**（TD-11 ③ / ADR-0005 D7）：伪造命令执行 3s（远超 block
+阈值 2000ms）→ 结算 → 慢事件里只有一条 `command'，drift 一次都没被调用。
+反向验证：把 `--finish' 的纯重置改成调 `--heartbeat-check' → 本例必红（双记复活）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--command-name nil)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-gc-elapsed nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-slow-command-threshold-ms 200)
+        (el-chronos-usage-granularity 'command))
+    (setq el-chronos-collect--command-name "slow-cmd"
+          el-chronos-collect--command-start (- (float-time) 3.0)
+          el-chronos-collect--command-gc-elapsed gc-elapsed
+          el-chronos-collect--last-heartbeat (- (float-time) 3.0))
+    (el-chronos-collect-test--with-capture cap
+      (el-chronos-collect--finish 'ok))
+    (should (equal '("command") (el-chronos-collect-test--slow-kinds cap)))
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    ;; 基线已推进到「命令刚结束」：下一次心跳只会看到 ≤一个心跳间隔的 gap
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.05))))
+
+(ert-deftest el-chronos-collect-test-finish-resets-baseline ()
+  "`--finish' 把心跳基线推进到当前时刻（命令执行时间被切出 gap）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat (- (float-time) 3.0))
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--command-name "cmd")
+        (el-chronos-collect--command-start (- (float-time) 3.0))
+        (el-chronos-collect--command-gc-elapsed gc-elapsed)
+        (el-chronos-slow-command-threshold-ms 200))
+    (el-chronos-collect-test--with-capture cap
+      (el-chronos-collect--finish 'ok))
+    (should (< (abs (- (float-time) el-chronos-collect--last-heartbeat)) 0.05))))
+
+(ert-deftest el-chronos-collect-test-finish-without-name-also-resets-baseline ()
+  "无主命令（`--command-name' 为 nil）与 `aborted' 路径同样重置基线。
+重置语句必须在 `(when (and (numberp start) name) …)' **之外** —— 否则这类早退路径
+会把「上一条命令 + 命令间隙」整段留给下一次心跳，重新引入命令内时间。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat (- (float-time) 3.0))
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--command-name nil)
+        (el-chronos-collect--command-start nil))
+    (el-chronos-collect-test--with-capture cap
+      (el-chronos-collect--finish 'aborted))
+    (should-not (el-chronos-collect-test--calls cap 'command))
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.05))))
+
+(ert-deftest el-chronos-collect-test-finish-does-not-call-check ()
+  "`--finish' 绝不经过 `--heartbeat-check'（本设计的唯一硬禁令）。
+那里调 check 会让 gap 恰等于刚执行完的命令时长 → 命令时长被记成 block / drift。"
+  (let ((check-calls 0)
+        (cap nil)
+        (el-chronos-collect--last-heartbeat (- (float-time) 3.0))
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--command-name "cmd")
+        (el-chronos-collect--command-start (- (float-time) 3.0))
+        (el-chronos-collect--command-gc-elapsed gc-elapsed)
+        (el-chronos-slow-command-threshold-ms 200))
+    (cl-letf (((symbol-function 'el-chronos-collect--heartbeat-check)
+               (lambda (&optional _now) (cl-incf check-calls))))
+      (el-chronos-collect-test--with-capture cap
+        (el-chronos-collect--finish 'ok)))
+    (should (= 0 check-calls))
+    (should (= 0 (length (el-chronos-collect-test--calls cap 'drift))))))
+
+(ert-deftest el-chronos-collect-test-pre-command-detects-pre-command-gap ()
+  "命令开始前补判：1.5s 的命令外间隙记一条 drift，且基线被推进、新命令计时已开始。
+这条覆盖「timer 被饿死 → 用户立刻按键 → `--finish' 的重置把整段吞掉」的漏检
+（ADR-0005 D4a 的核心场景）。"
+  (let ((cap nil)
+        (now (float-time))
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-name nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500)
+        (this-command 'some-cmd))
+    (el-chronos-collect-test--with-capture cap
+      (setq el-chronos-collect--last-heartbeat (- now 1.5))
+      (el-chronos-collect--pre-command))
+    (let ((drift (el-chronos-collect-test--calls cap 'drift)))
+      (should (= 1 (length drift)))
+      ;; 参数形态：整点毫秒（整数） + 浮点毫秒 gap
+      (should (integerp (car (car drift))))
+      (should (floatp (cadr (car drift))))
+      (should (>= (cadr (car drift)) 1400)))
+    (should-not (el-chronos-collect-test--slow-kinds cap))
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.5))
+    ;; 补判在 `--command-start' 赋值之前，故新命令照常开始计时
+    (should el-chronos-collect--pending-p)
+    (should (equal "some-cmd" el-chronos-collect--command-name))))
+
+(ert-deftest el-chronos-collect-test-pre-command-detects-block-gap ()
+  "命令开始前补判同样覆盖 block 档：2.5s 的命令外间隙记 block 且不记 drift。"
+  (let ((cap nil)
+        (now (float-time))
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-name nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-collect-notify-blocks nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500)
+        (this-command 'some-cmd))
+    (el-chronos-collect-test--with-capture cap
+      (setq el-chronos-collect--last-heartbeat (- now 2.5))
+      (el-chronos-collect--pre-command))
+    (should (equal '("block") (el-chronos-collect-test--slow-kinds cap)))
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    (should-not (plist-get (car (car (el-chronos-collect-test--calls cap 'slow)))
+                           :command))))
+
+(ert-deftest el-chronos-collect-test-pre-command-settles-pending-before-check ()
+  "补判写在 `(--finish 'aborted)' **之后**：先结算上一条（并因此重置基线），再补判。
+于是 `aborted' 分支上补判看到的是「结算 → 命令开始」的 µs 级间隙，什么都不会记。
+反向验证：把补判挪到 `(--finish 'aborted)' **之前** → 兜底门看到 `--pending-p' 仍为 t
+→ 什么都不记（看似相同）；但若同时把 `--finish' 移除或改序，这里会冒出 1.2s 的
+drift / block —— 两种错法都让本例的可观测断言不成立。"
+  (let ((cap nil)
+        (now (float-time))
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-name "previous-cmd")
+        (el-chronos-collect--command-gc-elapsed nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-slow-command-threshold-ms 200)
+        (this-command 'next-cmd))
+    (setq el-chronos-collect--command-start (- now 0.05))
+    (el-chronos-collect-test--with-capture cap
+      (setq el-chronos-collect--last-heartbeat (- now 1.2))
+      (el-chronos-collect--pre-command))
+    ;; 上一条按 aborted 结算（顺序断言）
+    (should (equal '("aborted")
+                   (mapcar (lambda (args) (plist-get (car args) :outcome))
+                           (el-chronos-collect-test--calls cap 'command))))
+    ;; `--finish' 已把基线推进，故 aborted 分支上的补判不记录（µs 级间隙）
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    (should-not (el-chronos-collect-test--slow-kinds cap))
+    ;; 新命令照常开始计时
+    (should (eq t el-chronos-collect--pending-p))
+    (should (equal "next-cmd" el-chronos-collect--command-name))))
+
+(ert-deftest el-chronos-collect-test-suppress-blocks-drift ()
+  "抑制门覆盖 drift：`--suppress-block-p' 为 t 时 1s 间隙既不记 drift 也不记 block，
+但基线**仍推进**（否则解除抑制后会把整段渲染耗时算成一次 gap）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat (- (float-time) 1.0))
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--suppress-block-p t)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (el-chronos-collect-test--with-capture cap
+      (el-chronos-collect--heartbeat-check))
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    (should-not (el-chronos-collect-test--slow-kinds cap))
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.5))))
+
+(ert-deftest el-chronos-collect-test-suppress-blocks-block ()
+  "抑制门同样覆盖 block 档（3s 间隙在抑制期间不记；drift 更不可能有）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat (- (float-time) 3.0))
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--suppress-block-p t)
+        (el-chronos-collect-notify-blocks nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (el-chronos-collect-test--with-capture cap
+      (el-chronos-collect--heartbeat-check))
+    (should-not (el-chronos-collect-test--slow-kinds cap))
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.5))))
+
+(ert-deftest el-chronos-collect-test-pending-p-blocks-judgement ()
+  "兜底门：`--pending-p' 为真时 1.2s 与 3s 间隙都不判定（两档同时被挡住），基线推进。
+这是「命令中途让出主线程」（`sleep-for' / 同步 IO / 等待输入）时的心跳泄漏防线。"
+  (let ((cap nil)
+        (el-chronos-collect--pending-p t)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (dolist (gap '(1.2 3.0))
+      (setq el-chronos-collect--last-heartbeat (- (float-time) gap))
+      (el-chronos-collect-test--with-capture cap
+        (el-chronos-collect--heartbeat-check))
+      (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.5)))
+    (should-not (el-chronos-collect-test--calls cap 'drift))
+    (should-not (el-chronos-collect-test--slow-kinds cap))))
+
+(ert-deftest el-chronos-collect-test-drift-threshold-four-bands ()
+  "命令外四档阈值（注入确定性 now，不依赖 timer 相位）：
+0.3s 不记 / 0.6s 记 drift / 1.2s 记 drift / 2.5s 记 block 且不记 drift。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (el-chronos-collect-test--with-capture cap
+      (dolist (gap '(0.3 0.6 1.2 2.5))
+        (let ((now 1000000.0))
+          (setq el-chronos-collect--last-heartbeat (- now gap))
+          (el-chronos-collect--heartbeat-check now))))
+    (let ((drift (el-chronos-collect-test--calls cap 'drift)))
+      ;; 只有 0.6s 与 1.2s 两档进 drift（2.5s 走 block 档，两档互斥）
+      (should (= 2 (length drift)))
+      (should (equal '(600 1200)
+                     (mapcar (lambda (args) (round (cadr args))) drift))))
+    (should (equal '("block") (el-chronos-collect-test--slow-kinds cap)))
+    ;; block 的 :command 恒为 nil（它只记命令外停转，回填上一条命令名会误导）
+    (should-not (plist-get (car (car (el-chronos-collect-test--calls cap 'slow)))
+                           :command))))
+
+(ert-deftest el-chronos-collect-test-drift-does-not-write-slow-events ()
+  "drift 只进小时桶，绝不写 `slow_events'（ADR-0005 D2：亚秒级不配当「重要事件」）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (el-chronos-collect-test--with-capture cap
+      (let ((now 1000000.0))
+        (setq el-chronos-collect--last-heartbeat (- now 0.6))
+        (el-chronos-collect--heartbeat-check now)))
+    (should (= 1 (length (el-chronos-collect-test--calls cap 'drift))))
+    (should (= 0 (length (el-chronos-collect-test--calls cap 'slow))))))
+
+(ert-deftest el-chronos-collect-test-drift-recorded-with-hour-ts-and-ms ()
+  "drift 落库参数形态：`(--hour-ts)' 的整点毫秒（整数，3600000 的整数倍）+ 浮点毫秒 gap。
+store 侧 `-record-drift' 的签名是 `(hour-ts gap-ms)'，单位是毫秒而非秒（I4）。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500))
+    (el-chronos-collect-test--with-capture cap
+      (let ((now (float-time)))
+        (setq el-chronos-collect--last-heartbeat (- now 0.75))
+        (el-chronos-collect--heartbeat-check now)))
+    (let* ((args (car (el-chronos-collect-test--calls cap 'drift)))
+           (hour-ts (nth 0 args))
+           (gap-ms (nth 1 args)))
+      (should (integerp hour-ts))
+      (should (= 0 (mod hour-ts 3600000)))
+      (should (= hour-ts (el-chronos-collect--hour-ts)))
+      (should (floatp gap-ms))
+      (should (<= 700 gap-ms 800)))))
+
+(ert-deftest el-chronos-collect-test-heartbeat-check-is-single-source-of-truth ()
+  "三处调用点共享同一个判定函数：timer（`--heartbeat'）与 `--pre-command' 各一次，
+`--finish' 零次 —— 计数 = 2。反向验证：让 `--finish' 也调 check → 计数变 3 → 本例必红。"
+  (let ((check-calls 0)
+        (cap nil)
+        (el-chronos-collect--last-heartbeat (float-time))
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-name nil)
+        (this-command 'cmd))
+    (cl-letf (((symbol-function 'el-chronos-collect--heartbeat-check)
+               (lambda (&optional _now) (cl-incf check-calls))))
+      (el-chronos-collect-test--with-capture cap
+        (el-chronos-collect--heartbeat)
+        (should (= 1 check-calls))
+        (el-chronos-collect--pre-command)
+        (should (= 2 check-calls))
+        (el-chronos-collect--finish 'ok)))
+    (should (= 2 check-calls))))
+
+(ert-deftest el-chronos-collect-test-heartbeat-check-condition-case-internal ()
+  "`condition-case' 必须在 `--heartbeat-check' **内部**（I6）：内部抛错不逃出函数。
+`--pre-command' 自身没有 `condition-case'，异常若逃出去会经 `pre-command-hook'
+抛进命令循环、**中断用户正在执行的命令**。
+反向验证：把 `condition-case' 移到 `--heartbeat' 薄壳 → 直接调用 check 会 signal → 本例必红。
+另外断言「异常前基线已推进」：否则同一段 gap 会在每次心跳上反复被判。"
+  (let ((cap nil)
+        (el-chronos-collect--last-heartbeat nil)
+        (el-chronos-collect--pending-p nil)
+        (el-chronos-collect--command-start nil)
+        (el-chronos-collect--command-name nil)
+        (el-chronos-collect--suppress-block-p nil)
+        (el-chronos-block-threshold-ms 2000)
+        (el-chronos-drift-threshold-ms 500)
+        (this-command 'cmd))
+    (cl-letf (((symbol-function 'el-chronos-collect--hour-ts)
+               (lambda () (error "boom"))))
+      (el-chronos-collect-test--with-capture cap
+        (setq el-chronos-collect--last-heartbeat (- (float-time) 1.0))
+        ;; 直接调用：异常必须被 check 内部吞掉
+        (should-not (condition-case err
+                        (progn (el-chronos-collect--heartbeat-check) nil)
+                      (error err)))
+        ;; 经 `--pre-command' 调用：异常同样不得抛进命令循环
+        (setq el-chronos-collect--last-heartbeat (- (float-time) 1.0))
+        (should-not (condition-case err
+                        (progn (el-chronos-collect--pre-command) nil)
+                      (error err)))))
+    ;; 异常发生前基线已推进（否则会反复判定同一段 gap）
+    (should (< (- (float-time) el-chronos-collect--last-heartbeat) 0.5))
+    (should-not (el-chronos-collect-test--calls cap 'drift))))
+
 (provide 'el-chronos-collect-test)
 
 ;;; el-chronos-collect-test.el ends here

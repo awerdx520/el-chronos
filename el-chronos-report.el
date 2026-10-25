@@ -372,6 +372,37 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
                               (if (plist-get item :changed) "✓" "-")))))))
 
 
+(defun el-chronos-report--drift-line (drift)
+  "渲染「命令外停转」汇总行；DRIFT 为 `el-chronos-analysis-drift-trend' 的结果或 nil。
+返回以 `- ' 开头、以换行结尾的单行文本，形如 `- 命令外停转（500–2000 ms）：本期 37 次，
+累计 24.10 s，最坏 1.82 s（累计与最坏为高估值…；命令内停转见「慢命令」节，两者不可相加）'。
+区间上下界分别取 `el-chronos-drift-threshold-ms' 与 `el-chronos-block-threshold-ms'，
+高估上界取 `el-chronos-heartbeat-seconds' 换算的毫秒 —— 三个都是可调 defcustom，写死会
+与实际判定脱节。
+
+三处措辞口径（不可删改，这是本改动最容易被误读的地方）：
+① 必须带「命令外」限定：`hourly_drift' 只记命令之外的停转，`commands' 覆盖命令内部，
+   两者是互补集合，**相加会重复计数**；
+② 必须标注高估：单次时长以「发现时距上次心跳基线的间隔」计时，每次最多多算一个心跳间隔；
+③ 无数据时给可见降级文案（I11），且降级文案同样带「命令内停转见慢命令」的指引 ——
+   否则用户会以为「命令外的卡顿也没被记录」。"
+  (let* ((drift-ms (or (bound-and-true-p el-chronos-drift-threshold-ms) 500))
+         (block-ms (or (bound-and-true-p el-chronos-block-threshold-ms) 2000))
+         (heartbeat-ms (* 1000.0 (or (bound-and-true-p el-chronos-heartbeat-seconds) 0.25)))
+         (band (format "%s–%s ms" (el-chronos-report--num drift-ms)
+                       (el-chronos-report--num block-ms)))
+         (count (or (plist-get drift :drift-total) 0)))
+    (if (or (null drift) (not (numberp count)) (zerop count))
+        (format "- 命令外停转（%s）：本期无记录（命令内停转见「慢命令」节；两者不可相加）\n"
+                band)
+      (format (concat "- 命令外停转（%s）：本期 %s 次，累计 %s，最坏 %s"
+                      "（累计与最坏为高估值，每次最多多算一个心跳间隔 %.0f ms；"
+                      "命令内停转见「慢命令」节，两者不可相加）\n")
+              band (el-chronos-report--num count)
+              (el-chronos-report--ms->human (plist-get drift :ms-total))
+              (el-chronos-report--ms->human (plist-get drift :slowest-ms))
+              heartbeat-ms))))
+
 (defun el-chronos-report--usage-rows (range)
   "构造「用法 TOP」行（plist `:name' `:count' `:total-ms'）。
 次数与总耗时都取自 `hourly_usage' 的 command 维度热力图（前 20 个命令跨桶求和），
@@ -398,6 +429,8 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
          (blocking (cl-sort (copy-sequence (el-chronos-analysis-blocking-events
                                             range el-chronos-report--blocking-rows))
                             #'> :key (lambda (r) (or (plist-get r :ts) 0))))
+         ;; 「命令外停转」趋势：不算独立一节，只在「阻塞事件」节内加一行汇总（见下）
+         (drift (el-chronos-analysis-drift-trend range))
          (sessions (el-chronos-analysis-sessions range))
          ;; 三个「本期健康/环境」视角的节：都在「GC 与内存」之后、「阻塞事件」之前。
          ;; 与趋势族相邻的理由：它们回答的是「这台机器这个时期的状态如何」，而不是单点明细。
@@ -431,11 +464,20 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
      (el-chronos-report--section-startup startup)
      (el-chronos-report--section-health health)
      (el-chronos-report--section-config config-history)
-     (el-chronos-report--table-section
-      "阻塞事件" '("时间" "时长" "命令" "mode" "project")
-      (el-chronos-report--rows
-       (cl-subseq blocking 0 (min el-chronos-report--blocking-rows (length blocking)))
-       '(:ts :duration-ms :command :mode :project) '(time ms str str str)))
+     ;; 「阻塞事件」节内先给一行「命令外停转」汇总，再列 block 明细：两者同属「命令之外的
+     ;; 停转」，只有放在一起读者才看得到完整图景（drift 覆盖 [500ms, 2000ms) 区间，block
+     ;; 覆盖 ≥2000ms）。**刻意不新增节**：报告已有 14 节，再拆一节只增加阅读负担，还会连带
+     ;; 改一堆按节数断言的老用例。drift 摘要是独立信息 —— 即使下面的表格因无数据降级为
+     ;; `（无数据）'，这一行也必须出现（I11：可见降级）。
+     (concat
+      "* 阻塞事件\n"
+      (el-chronos-report--drift-line drift)
+      (el-chronos-report--table
+       '("时间" "时长" "命令" "mode" "project")
+       (el-chronos-report--rows
+        (cl-subseq blocking 0 (min el-chronos-report--blocking-rows (length blocking)))
+        '(:ts :duration-ms :command :mode :project) '(time ms str str str)))
+      "\n")
      (el-chronos-report--table-section
       ;; 回归窗口由 `el-chronos-regression-window-days' 决定、与显示范围无关，
       ;; 标题必须动态标注真实天数，否则容易让人误以为是「近 RANGE 天」判出来的。
@@ -581,12 +623,31 @@ HISTORY 为 nil 时只输出表头。"
                           (plist-get item :config-sig)
                           (if (plist-get item :changed) "1" "0")))))
 
+(defun el-chronos-report--csv-drift (drift)
+  "生成「命令外停转」CSV 区块（`# section: drift'）。
+列：`bucket_ms' / `count' / `total_ms' / `max_ms'，行取自 analysis drift 趋势的桶列表，
+字段保持原始值（毫秒、计数）。
+
+两处口径与 org 报告同源，不得省略：
+① 本区块只含**命令之外**的停转，与 `commands' / `blocking-events' 的耗时不可相加；
+② `total_ms' / `max_ms' 是高估值（每次最多多算一个心跳间隔）。
+DRIFT 为 nil 或无桶时**只输出表头**（I11：无数据不省略区块，否则下游会误判成「这一版
+根本没有 drift 能力」）。
+
+区块位置固定在 CSV 末尾（config-history 之后）：report 与 web 两处内联实现的区块名与顺序
+必须一致，`el-chronos-report-test-csv-sections-match-web' 会逐项比对。"
+  (el-chronos-report--csv-block
+   "drift" '("bucket_ms" "count" "total_ms" "max_ms")
+   (el-chronos-report--rows (plist-get drift :buckets)
+                            '(:bucket :count :total-ms :max-ms) '(raw raw raw raw))))
+
 (defun el-chronos-report--csv-string (range)
-  "生成 RANGE 的 CSV 全文：8 个区块用 `# section:' 注释行分隔；字段保持原始值。
+  "生成 RANGE 的 CSV 全文：9 个区块用 `# section:' 注释行分隔；字段保持原始值。
 前 5 个区块由 `el-chronos-report--csv-sections' 的通用规格生成（查询 → 行 → 列）；
-后 3 个（startup / health / config-history）返回结构不齐整 —— 启动分解是两段嵌套列表、
-采集健康是扁平 plist、配置变更嵌在 `:sessions' 里，且启动分解不吃 RANGE —— 各自手写
-区块生成函数，而不是硬塞进通用规格。"
+后 4 个（startup / health / config-history / drift）返回结构不齐整 —— 启动分解是两段嵌套
+列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 的桶在 `:buckets' 键下，
+且启动分解不吃 RANGE —— 各自手写区块生成函数，而不是硬塞进通用规格。
+drift 放在末尾：它与 web 侧的同名区块必须**位置一致**（顺序也是被断言的不变量）。"
   (concat
    (mapconcat
     (lambda (spec)
@@ -598,7 +659,9 @@ HISTORY 为 nil 时只输出表头。"
     el-chronos-report--csv-sections "")
    (el-chronos-report--csv-startup (el-chronos-analysis-startup-breakdown nil))
    (el-chronos-report--csv-health (el-chronos-analysis-health range))
-   (el-chronos-report--csv-config-history (el-chronos-analysis-config-history range))))
+   (el-chronos-report--csv-config-history (el-chronos-analysis-config-history range))
+   ;; 命令外停转（drift）：与 org 报告「阻塞事件」节内的那一行汇总同源
+   (el-chronos-report--csv-drift (el-chronos-analysis-drift-trend range))))
 
 (defun el-chronos-report--json-value (value)
   "把 VALUE 递归转成 `json-serialize' 友好形态。
@@ -617,7 +680,9 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
 (defun el-chronos-report--json-string (range)
   "生成 RANGE 的 JSON 全文（单个对象，含 overview 与各明细区块）。
 键名沿用既有 snake_case 风格（`slow_commands' / `blocking_events'）；
-三个新查询对应 `startup' / `health' / `config_history'。"
+三个新查询对应 `startup' / `health' / `config_history'；
+`drift' 是「命令外停转」汇总（`bucket_span' / `total' / `ms_total' / `slowest_ms' /
+`buckets'，窗口本身由外层 `range' / `days' 表达），**不可与 `slow_commands' 的耗时相加**。"
   (concat
    (json-serialize
     (el-chronos-report--json-value
@@ -629,6 +694,16 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
            :packages (el-chronos-analysis-package-breakdown range nil)
            :trend (el-chronos-analysis-trend range)
            :blocking_events (el-chronos-analysis-blocking-events range 100)
+           ;; 命令外停转（drift）：analysis 的 `:range' 是 cons (START . END)，
+           ;; `--json-value' 无法序列化 dotted pair（会对它调 mapcar 而报错），故这里只取
+           ;; 标量与桶列表 —— 窗口本身已由外层的 `:range' / `:days' 表达，不必重复。
+           ;; **不可与 `:slow_commands' / `:blocking_events' 的耗时相加**（互补集合）。
+           :drift (let ((drift (el-chronos-analysis-drift-trend range)))
+                    (list :bucket_span (plist-get drift :bucket-span)
+                          :total (plist-get drift :drift-total)
+                          :ms_total (plist-get drift :ms-total)
+                          :slowest_ms (plist-get drift :slowest-ms)
+                          :buckets (plist-get drift :buckets)))
            :regressions (el-chronos-analysis-regressions range 100)
            :usage (el-chronos-analysis-heatmap range 20)
            :sessions (el-chronos-analysis-sessions range)

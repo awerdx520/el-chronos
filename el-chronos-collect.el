@@ -154,6 +154,7 @@
                   (hour-ts key value))
 (declare-function el-chronos-store-record-startup-phase "el-chronos-store"
                   (session-id phase ms))
+(declare-function el-chronos-store-record-drift "el-chronos-store" (hour-ts gap-ms))
 (declare-function el-chronos-store-note-startup-ms "el-chronos-store" (ms))
 
 ;;; 自定义项
@@ -201,14 +202,19 @@
   "当前命令是否抛错：advice 置 t，`pre-command-hook' 清零，结算时读。")
 
 (defvar el-chronos-collect--last-heartbeat nil
-  "上一次心跳的实际触发时刻（`float-time'）；nil 表示尚无基线。")
+  "上一次「命令外时间」的结算时刻（`float-time'）；nil 表示尚无基线。
+由三处推进：心跳 timer / `--pre-command' 的补判（都经
+`el-chronos-collect--heartbeat-check'）、以及 `--finish' 的**纯重置**（结算命令时把
+命令执行时间从 gap 中切掉）。语义仍是「上一次结算时刻」，不是「上一次真实心跳」。")
 
 (defvar el-chronos-collect--suppress-block-p nil
-  "非 nil 时心跳跳过阻塞判定，只推进基线（抑制自观测假阳性）。
+  "非 nil 时心跳跳过判定（block 与 drift **两档都跳过**），只推进基线（抑制自观测假阳性）。
 由 `el-chronos-report' 在渲染期间 `let' 绑定为 t；
-`el-chronos-collect--heartbeat' 用 `bound-and-true-p' 读取并据此跳过阻塞判定，
+`el-chronos-collect--heartbeat-check' 用 `bound-and-true-p' 读取并据此跳过判定，
 同时把 `el-chronos-collect--last-heartbeat' 推进到当前时刻 —— 否则解除绑定后
 那一次补跑的心跳会把整段渲染耗时算成一条巨型阻塞（I2 只认时间差，无法事后区分）。
+drift 判定与 block 判定写在同一个 `unless' 之内，故本变量对两档一视同仁；
+抑制宏第 2 层（`let' 抬高 `el-chronos-block-threshold-ms'）只对 block 档生效。
 report 侧 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量报
 `void-variable'；同义重复声明无副作用。")
 
@@ -224,7 +230,7 @@ report 侧 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量�
 
 (defvar el-chronos-collect--last-sample-tick nil
   "上一次采样窗口实际触发的时刻（`float-time'）；nil 表示尚无基线。
-**不复用 `el-chronos-collect--last-heartbeat'**：两个 timer 独立调度（心跳 1 秒、
+**不复用 `el-chronos-collect--last-heartbeat'**：两个 timer 独立调度（心跳 0.25 秒、
 采样窗口 10 秒），语义也不同 —— 心跳基线用于判定「主线程被占多久」，
 本基线用于判定「采样窗口是否整窗丢失」。共用一个变量会让两条 timer 互相推进对方的基线，
 两边的判定同时失真（心跳永远不超阈值、窗口永远不丢）。
@@ -406,7 +412,11 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 被别人改成带 `t' 的情形。
 命名比较口径：`--command-name' 存的是**字符串**（落库口径），而 `this-command' 是符号，
 故判等用「把命令名归一后 `equal'」而不是 `eq'（符号与字符串 `eq' 恒为 nil，
-那样判据永远不成立，等于没有防护）。"
+那样判据永远不成立，等于没有防护）。
+
+**命令开始前补判一次心跳**（`el-chronos-collect--heartbeat-check'，位置见注释）：
+结清「命令外时间」，补上「timer 被饿死跑不了、而 `--finish' 的重置又会把整段吞掉」
+的那一段 —— 卡顿结束后立刻按键是最常见的用户行为，只靠 timer + `--finish' 会稳定漏检。"
   (let ((name (el-chronos-collect--command-label)))
     ;; D1 兜底：同一命令被同一 hook 双跑时不结算、不重置（见 docstring）
     (unless (and el-chronos-collect--pending-p
@@ -415,6 +425,19 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
                  (< (- (float-time) el-chronos-collect--command-start) 0.001))
       (when el-chronos-collect--pending-p
         (el-chronos-collect--finish 'aborted))
+      ;; 命令开始前补判一次「命令外停转」（ADR-0005 D4a）。**位置不可移动**：
+      ;; ① 必须在上面 `(--finish 'aborted)' 之后 —— 否则 `--pending-p' 仍为 t，
+      ;;    兜底门会跳过判定，补判等于白跑；先结算再补判，gap 才是「上一条命令结束 →
+      ;;    这一条开始」的命令外间隙。aborted 结算自身的开销（µs–ms 级）会计入该次
+      ;;    gap，**明确接受**（远低于 drift 阈值，且只在 C-g / 异常中断路径发生）。
+      ;; ② 必须在下面的 `--command-start' 赋值之前 —— 它度量的是「命令开始**之前**」的
+      ;;    时间，放在赋值之后语义就变成「命令开始后又判了一次心跳」。
+      ;; ③ 在 D1 双跑守卫（上面的 `unless'）之外：守卫命中说明没有真实间隙，
+      ;;    保持「每条真实命令开始时都结清一次」的简单不变式。
+      ;; 外层 `ignore-errors' 是双保险：check 内部已有 `condition-case'（I6），
+      ;; 但这里是 `pre-command-hook' 的历史上第一个判定调用点，异常逃出去会中断用户
+      ;; 正在执行的命令。
+      (ignore-errors (el-chronos-collect--heartbeat-check))
       (if (null name)
           ;; 命令名取不到：清状态、不开始计时（不产生无主行）
           (setq el-chronos-collect--command-start nil
@@ -446,10 +469,26 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 命令（命令循环在 post 之后才把它们滚进 `last-command'），此刻回读会把上一条命令的名字
 安到本条上。`--command-name' 为 nil（无主命令）时整条不落库，也不记 `anonymous' ——
 理由同 `el-chronos-collect--pre-command'：无主行会污染 top-N 与中断率分母，而正常路径
-下 `--command-name' 与 `--command-start' 同时设置，不会出现该状态。"
+下 `--command-name' 与 `--command-start' 同时设置，不会出现该状态。
+
+结算一开始先做一次**纯基线重置**（`(setq el-chronos-collect--last-heartbeat
+(float-time))'）：把命令执行时间从心跳 gap 中切掉，使 block / drift 两档只覆盖
+「命令外停转」（ADR-0005 D4 / D7）。`--pending-p' 兜底门只是补充，**不是主判据**。
+此处**不得**调 `el-chronos-collect--heartbeat-check' —— 那会让 gap 恰等于刚执行完的
+命令时长，命令时长被记成 block / drift，双记立刻复活。"
   (let ((start el-chronos-collect--command-start)
         (name el-chronos-collect--command-name)
         (gc-start el-chronos-collect--command-gc-elapsed))
+    ;; 心跳基线重置（**纯 `setq'，此处绝不能调 `--heartbeat-check'**）：把命令执行时间
+    ;; 从 gap 里切掉，使 block / drift 只覆盖「命令外停转」；`--pending-p' 兜底门只是
+    ;; 补充，不是主判据 —— 主判据就是这一行。若在此调 check，gap 恰好等于刚执行完的
+    ;; 命令时长 → 命令时长会被记成 block / drift，双记立刻复活（ADR-0005 D4 唯一硬禁令）。
+    ;; 位置三条理由：① 紧贴命令真实结束时刻（越往后放，结算自身的归因 / 取栈 / 写库开销
+    ;; 越会被悄悄切到基线之外）；② 早于下面的状态清空 —— 结算过程中若心跳被触发，
+    ;; `--pending-p' 仍为 t，兜底门会跳过判定，而基线已是 now，不会把结算耗时算成 gap；
+    ;; ③ 在下面的 `(when (and (numberp start) name) …)' 之外，故 `aborted' 与无主命令
+    ;; 路径同样重置基线（否则 aborted 会把「上一条命令 + 命令间隙」整段留给下一次心跳）。
+    (setq el-chronos-collect--last-heartbeat (float-time))
     ;; 先清状态再干活：即使下面的记录失败（已被吞掉），也不会留下粘住的 pending
     (setq el-chronos-collect--pending-p nil
           el-chronos-collect--command-start nil
@@ -499,34 +538,76 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 
 ;;; T5b 心跳阻塞
 
-(defun el-chronos-collect--heartbeat ()
-  "心跳：比较相邻两次触发的实际间隔，漂移超阈值即记一条阻塞事件。
-心跳迟到说明主线程在两次触发之间被占住（原生代码、未分批 IO、长 timer 回调）；
-阻塞期间无可靠 Lisp 回调，只能事后按时间差反推（I2）。自身 `condition-case'。
+(defun el-chronos-collect--heartbeat-check (&optional now)
+  "结算一次「命令外停转」判定，并推进心跳基线。
+NOW 默认取 `(float-time)'，仅供测试注入确定性时刻（避免依赖 timer 真实相位）。
 
-`el-chronos-collect--suppress-block-p' 非 nil 时不判定阻塞，只推进基线 ——
-报告 / 页面渲染是用户主动触发的重查询，其耗时不该混进「待排查的卡顿」（自观测抑制）。"
+三处调用点，职责各不相同 —— **不许「统一一下」**（见 ADR-0005 D4）：
+1. 心跳 timer（`el-chronos-collect--heartbeat'，每
+   `el-chronos-heartbeat-seconds' 秒）→ 判定 + 重置：覆盖「两条命令之间迟迟没有
+   下一条命令」的停转（此时没有 `pre-command-hook' 可挂钩）；
+2. `el-chronos-collect--pre-command'（每条命令开始前）→ 补判 + 重置：在开始新命令计时
+   之前结清「命令外时间」，补上「timer 被饿死、而 `--finish' 的重置又会把整段吞掉」
+   的漏检（卡顿结束立刻按键是最常见的用户行为）；
+3. `el-chronos-collect--finish'（命令结算）→ **只重置基线，绝不调用本函数**：那里的
+   gap 恰好是刚执行完的命令时长，判定会把命令时长记成 block / drift，双记立刻复活。
+
+判定链（两个门，block 与 drift **共用**，任何「只给一档加门」的写法都会造出可被静默
+污染的档位，见 ADR-0005 D1 / D6）：
+- 先**无条件**推进基线 `(setq --last-heartbeat now)' —— 抑制期间与兜底门跳过判定时同样
+  推进，否则解除抑制后会把整段抑制耗时算成一次 gap；
+- **抑制门**：`el-chronos-collect--suppress-block-p' 非 nil（报告 / Web 自观测抑制）→
+  只推进基线、不判定；
+- **兜底门**：`el-chronos-collect--pending-p' 非 nil（命令中途让出主线程时心跳真的跑了
+  起来，此后命令内若再停转，gap 会跨过命令边界）→ 跳过判定、只推进基线。
+  它是**兜底而非主判据**：主判据是 `--finish' 的重置（命令时间根本不进 gap）；
+- 门内按 gap（毫秒）分档：> `el-chronos-block-threshold-ms' → 记
+  `slow_events(kind=\"block\")' 明细（`:command' 恒 nil：它只记命令外停转，回填上一条
+  命令名会把「命令外停转」误导成「某条命令内的停转」）；否则 >
+  `el-chronos-drift-threshold-ms' → 累加到 `hourly_drift' 小时桶（不写明细）；
+  都不满足 → 什么都不做。
+
+`condition-case' **必须留在本函数内部**（I6）：`el-chronos-collect--pre-command' 自身
+没有 `condition-case'，异常若从这里逃出去会经 `pre-command-hook' 抛进命令循环，
+**直接中断用户正在执行的命令**，比丢一条数据严重一个量级。"
   (condition-case err
-      (let* ((now (float-time))
+      (let* ((now (or now (float-time)))
              (last el-chronos-collect--last-heartbeat))
+        ;; 基线推进在两道门之外（无条件）：抑制 / 兜底跳过判定时也必须推进
         (setq el-chronos-collect--last-heartbeat now)
         (unless (bound-and-true-p el-chronos-collect--suppress-block-p)
-          (when-let* ((gap-ms (and (numberp last) (* 1000 (- now last))))
-                      ((> gap-ms el-chronos-block-threshold-ms)))
-            (let ((context (or (el-chronos-collect--safe-funcall
-                                #'el-chronos-attrib-context)
-                               (list :mode nil :project nil))))
-              (el-chronos-collect--safe-apply
-               #'el-chronos-store-record-slow-event
-               (list (list :duration-ms gap-ms :kind "block" :command nil
-                           :stack nil :context context)))
-              ;; 提示开关只管「提示」这一层：上面已落库，三种取值都不影响记录。
-              ;; `messages' 用 `inhibit-message' 只写 `*Messages*'，不占 echo area。
-              (when-let* ((notify el-chronos-collect-notify-blocks))
-                (let ((inhibit-message (eq notify 'messages)))
-                  (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms)))))))
+          (unless el-chronos-collect--pending-p
+            (when-let* ((gap-ms (and (numberp last) (* 1000 (- now last)))))
+              (cond
+               ((> gap-ms el-chronos-block-threshold-ms)
+                (let ((context (or (el-chronos-collect--safe-funcall
+                                    #'el-chronos-attrib-context)
+                                   (list :mode nil :project nil))))
+                  (el-chronos-collect--safe-apply
+                   #'el-chronos-store-record-slow-event
+                   (list (list :duration-ms gap-ms :kind "block" :command nil
+                               :stack nil :context context)))
+                  ;; 提示开关只管「提示」这一层：上面已落库，三种取值都不影响记录。
+                  ;; `messages' 用 `inhibit-message' 只写 `*Messages*'，不占 echo area。
+                  (when-let* ((notify el-chronos-collect-notify-blocks))
+                    (let ((inhibit-message (eq notify 'messages)))
+                      (message "el-chronos：主线程阻塞约 %.0f ms（已记录）" gap-ms)))))
+               ((> gap-ms el-chronos-drift-threshold-ms)
+                ;; 亚秒级只进小时桶：不写 slow_events（ADR-0005 D2），也不发提示
+                (el-chronos-collect--safe-apply
+                 #'el-chronos-store-record-drift
+                 (list (el-chronos-collect--hour-ts) gap-ms))))))))
     (error (el-chronos-collect--warn "心跳检测失败：%S" err)))
   nil)
+
+(defun el-chronos-collect--heartbeat ()
+  "心跳 timer 回调：薄壳，只做一次 `el-chronos-collect--heartbeat-check'。
+心跳迟到说明主线程在两次触发之间被占住（原生代码、未分批 IO、长 timer 回调）；
+阻塞期间无可靠 Lisp 回调，只能事后按时间差反推（I2）。
+
+判定链、两道门与三处调用点的分工全部见 `el-chronos-collect--heartbeat-check'；
+本函数只保留 timer 入口这一层（异常保护也在 check 内部，不在此处）。"
+  (el-chronos-collect--heartbeat-check))
 
 ;;; T5c 采样窗口聚合
 
@@ -747,7 +828,7 @@ NOW 为本次 tick 的时刻（`float-time'，默认现取）。基线取 `--las
 为什么需要这个计数：`--sample-tick' 由 timer 驱动，主线程被长任务占住期间 timer 不触发，
 那段时间**完全没有采样数据**；库里看不出「这里是空窗」还是「这里真的没跑代码」。
 `sample-misses' 就是「我的数据有洞」的自证信号（落 `hourly_health'）。
-基线**不复用** `--last-heartbeat'：两条 timer 周期不同（心跳 1s / 采样 10s），
+基线**不复用** `--last-heartbeat'：两条 timer 周期不同（心跳 0.25s / 采样 10s），
 共用会互相推进对方的基线，两边的判定同时失真。
 自身不抛错（`--safe-apply' 兜底，I6）：采样主流程不得因自监控失败而中断。"
   (let* ((now (or now (float-time)))

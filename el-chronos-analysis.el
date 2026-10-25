@@ -658,7 +658,7 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
               (setq previous marks))))
         (list :sessions (nreverse items) :changes changes)))))
 
-;;; 阻塞事件与单条下钻
+;;; 阻塞事件、命令外漂移与单条下钻
 (defun el-chronos-analysis-blocking-events (range &optional limit)
   "窗口 RANGE 内的命令外阻塞事件列表，按耗时降序。
 元素 `(:id N :ts MS :duration-ms X :kind K :command C :mode M :project P)'；
@@ -679,6 +679,67 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
                              :kind kind :command command
                              :mode (plist-get context :mode)
                              :project (plist-get context :project))))))
+
+(defun el-chronos-analysis-drift-trend (range &optional buckets)
+  "窗口 RANGE 内按桶聚合的「命令外停转」（drift）趋势。
+返回 plist：`:range' 是归一化后的半开区间 (START . END)（毫秒）、`:bucket-span' 是桶宽
+（毫秒）、`:buckets' 是按桶起点升序的桶列表、`:drift-total' 是窗口内 drift 次数合计、
+`:ms-total' 是窗口内累计停转毫秒、`:slowest-ms' 是窗口内单次最长停转（三者无数据时为
+0 / 0.0 / 0.0）。
+
+`:buckets' 的元素是 `(:bucket START-MS :count N :total-ms X :max-ms Y)'：
+`:count' 与 `:total-ms' 为桶内求和、`:max-ms' 取桶内最大值。BUCKETS 省略时与
+`el-chronos-analysis-gc-trend' 用同一套默认（`el-chronos-analysis--range-buckets'），并
+同样受 `el-chronos-analysis--bucket-span' 的整小时倍数合并约束。SQL 只做窗口过滤、不做
+聚合，聚合在 Elisp 层完成（与 gc-trend 同款取舍）。空桶不返回；无数据时 `:buckets' 为
+nil 而整体仍返回 plist（不返回 nil，避免调用方判空分支分叉）。
+
+三点口径必须知晓，否则会把有意为之当 bug 修：
+① **语义是「命令之外停转」**：`hourly_drift' 只统计命令执行之外的停转（心跳判定，命令
+   开始前与结算时都会重置基线，把命令执行时间从间隔里切掉）。命令**内部**的停转由
+   `commands' 表的耗时天然覆盖、经 `slow_events(kind='command')' 呈现，属「慢命令」节。
+   因此 `hourly_drift' 的时长与 `commands' 的耗时**不可相加、也不该相加** —— 两者是
+   不相交集合，相加会得到重复的总卡顿时长；
+② `:total-ms' 与 `:max-ms' 都是**高估值**：单次时长以「发现时距上次基线的间隔」计时，
+   每次最多多算一个心跳间隔（默认 250ms，见 `el-chronos-heartbeat-seconds'），所以
+   `:max-ms' 减掉至多一个间隔才是真实停转下界；
+③ `hourly_drift' 属六张永久保留的聚合表之一（不受 `el-chronos-retention-days' 约束），
+   长时间窗口的趋势不会被保留清理削平 —— 但也因此不会随时间自动瘦身，需手动 purge。"
+  (el-chronos-analysis--guard 'drift-trend
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((buckets (max 1 (or buckets (el-chronos-analysis--range-buckets start end))))
+             (span (el-chronos-analysis--bucket-span start end buckets))
+             (table (make-hash-table :test #'equal)))
+        ;; 两列累加、一列取最值 —— 与 `el-chronos-store--sql-upsert-drift' 的三列语义
+        ;; 一一对应，因此跨会话、跨批次的同一小时行在这里同样是「求和 + 最大值」
+        (dolist (row (el-chronos-analysis--select
+                      db
+                      (concat "SELECT hour_ts, count, total_ms, max_ms FROM hourly_drift"
+                              " WHERE hour_ts >= ? AND hour_ts < ?"
+                              " ORDER BY hour_ts, session_id")
+                      (list start end)))
+          (cl-destructuring-bind (ts count total maximum) row
+            (let* ((bucket (- ts (% ts span)))
+                   (cell (or (gethash bucket table)
+                             (puthash bucket (vector 0 0.0 0.0) table))))
+              (aset cell 0 (+ (aref cell 0) (or count 0)))
+              (aset cell 1 (+ (aref cell 1) (float (or total 0))))
+              (aset cell 2 (max (aref cell 2) (float (or maximum 0)))))))
+        (let ((items (cl-sort
+                      (cl-loop for bucket being the hash-keys of table
+                               using (hash-values cell)
+                               collect (list :bucket bucket :count (aref cell 0)
+                                             :total-ms (aref cell 1) :max-ms (aref cell 2)))
+                      #'< :key (lambda (i) (plist-get i :bucket)))))
+          (list :range (cons start end)
+                :bucket-span span
+                :buckets items
+                :drift-total (cl-loop for i in items sum (plist-get i :count))
+                :ms-total (cl-loop for i in items sum (plist-get i :total-ms))
+                ;; 空列表时 `maximize' 无返回值 → 显式兜底 0.0，保持「无数据也是数字」
+                :slowest-ms (or (cl-loop for i in items maximize (plist-get i :max-ms))
+                                0.0)))))))
 
 (defun el-chronos-analysis-event (id)
   "按 ID 取单条慢事件（含 block 与 command）的完整 plist；不存在返回 nil。

@@ -21,8 +21,9 @@
 ;;   6. 报告结构：14 个 `* 标题' 节、空库 8 处 `（无数据）'、正文不出现 `nil' 字面量；
 ;;      新增三节（启动分解 / 采集健康 / 配置变更）各自的有数据与降级渲染，
 ;;      其中「采集健康」区分「没采集」（`:rows' 为 0）与「没异常」（`:ok-p' 为 t）。
-;;   9. 导出：CSV 的 8 个 `# section:' 区块（既有 5 + startup / health / config-history）
-;;      与 JSON 的三个新键；断言覆盖行内容而非只认标题。
+;;   9. 导出：CSV 的 9 个 `# section:' 区块（既有 5 + startup / health / config-history /
+;;      drift）与 JSON 的新键；断言覆盖行内容而非只认标题。
+;;      另有一条「阻塞事件」节内的「命令外停转」汇总行（不新增节，故节数仍为 14）。
 ;;   7. 报告期间抑制自观测阻塞：`--without-block-events' 的绑定/恢复 + 关键行为断言
 ;;      （重查询后心跳不新增 `block' 行；对照组直接跑重查询则确实会新增）。
 ;;   8. Web：500 分支不回显内部错误（含绝对路径）、改走 `display-warning'、之后仍可服务；
@@ -343,6 +344,48 @@
                                     (point-min) (point-max))))))
         (kill-buffer buffer)))))
 
+
+;;; 「命令外停转」汇总行（在「阻塞事件」节内，不新增节）
+
+(ert-deftest el-chronos-report-test-report-drift-summary-in-blocking-section ()
+  "「阻塞事件」节内出现一行「命令外停转」汇总：有数据时含次数 / 累计 / 最坏与口径标注，
+无数据时给可见降级文案（I11），且该节本身始终存在。
+断言的是**节内一行**而不是新节 —— 报告节数必须保持 14（drift 只加一行，不膨胀结构）。
+阈值断言用 defcustom 默认值（drift 500 / block 2000）。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (now (el-chronos-test--now-ms)))
+      ;; ① 无数据：降级文案可见，「阻塞事件」节与它的（无数据）表格都还在
+      (let ((empty (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* 阻塞事件$" empty))
+        (should (string-match-p
+                 (concat "^- 命令外停转（500–2000 ms）：本期无记录"
+                         "（命令内停转见「慢命令」节；两者不可相加）$")
+                 empty))
+        (should (= 14 (el-chronos-report-test--count-matches "^\\* " empty))))
+      ;; ② 有数据：一行汇总，次数 / 累计 / 最坏都用可读单位
+      (el-chronos-test--insert-slow-event now 2500.0 "block")
+      (el-chronos-test--exec
+       "INSERT INTO hourly_drift (hour_ts, session_id, count, total_ms, max_ms)\
+ VALUES (?, ?, ?, ?, ?)"
+       (list hour 0 3 4200.0 1800.0))
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* 阻塞事件$" content))
+        (should (string-match-p
+                 "命令外停转（500–2000 ms）：本期 3 次，累计 4\\.20 s，最坏 1\\.80 s"
+                 content))
+        ;; 口径三要素缺一不可：命令外限定 / 高估标注 / 命令内停转指引
+        (should (string-match-p "命令外停转" content))
+        (should (string-match-p "高估值" content))
+        (should (string-match-p "命令内停转见「慢命令」节" content))
+        (should (string-match-p "两者不可相加" content))
+        ;; drift 汇总行出现在「阻塞事件」标题之后、明细表头之前（同一节内）
+        (let ((title (string-match-p "^\\* 阻塞事件$" content))
+              (line (string-match-p "命令外停转（500–2000 ms）：本期 3 次" content))
+              (table (string-match-p "| 时间 | 时长 | 命令 | mode | project |" content)))
+          (should (< title line))
+          (should (< line table)))
+        (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))))))
 
 ;;; 启动分解 / 采集健康 / 配置变更三节
 

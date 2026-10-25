@@ -244,6 +244,7 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
     ("/api/stacks" . el-chronos-web--route-stacks)
     ("/api/sessions" . el-chronos-web--route-sessions)
     ("/api/blocking" . el-chronos-web--route-blocking)
+    ("/api/drift" . el-chronos-web--route-drift)
     ("/api/regressions" . el-chronos-web--route-regressions)
     ("/api/gc" . el-chronos-web--route-gc)
     ("/api/startup" . el-chronos-web--route-startup)
@@ -252,7 +253,7 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
     ("/api/event" . el-chronos-web--route-event)
     ("/api/export.csv" . el-chronos-web--route-export-csv))
   "路由表：路径 → 处理函数。全部只读，没有任何写入 / 执行入口。
-共 17 条（1 条 HTML + 15 条 JSON + 1 条 CSV）；新增路由必须同步 `docs/ui.org' 的路由表。")
+共 18 条（1 条 HTML + 16 条 JSON + 1 条 CSV）；新增路由必须同步 `docs/ui.org' 的路由表。")
 
 (defun el-chronos-web--dispatch (req)
   "把解析后的请求 REQ 分发到路由，返回响应 plist。
@@ -455,14 +456,28 @@ HISTORY 为 nil 时只输出表头；此处**不做** `/api/config-history' 的 
                           (if (plist-get item :changed) "1" "0")))))
 
 
+(defun el-chronos-web--csv-drift (drift)
+  "生成「命令外停转」CSV 区块（`# section: drift'）。
+列：`bucket_ms' / `count' / `total_ms' / `max_ms'，行取自 analysis drift 趋势的桶列表，
+字段保持原始值（毫秒、计数）。
+
+与 `el-chronos-report--csv-drift' 是**内联重复实现**（web 不 require report，见文件头取舍）：
+区块名、表头、列顺序、位置（CSV 末尾）必须两处一致；DRIFT 为 nil 或无桶时只输出表头
+（I11：无数据不省略区块）。口径同 org 报告：只含命令之外的停转（与 `commands' 不可相加），
+`total_ms' / `max_ms' 为高估值（每次最多多算一个心跳间隔）。"
+  (el-chronos-web--csv-block
+   "drift" '("bucket_ms" "count" "total_ms" "max_ms")
+   (el-chronos-web--csv-rows (plist-get drift :buckets)
+                             '(:bucket :count :total-ms :max-ms))))
+
 (defun el-chronos-web--csv-string (range)
-  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块 + 3 个新查询区块，共 11 个 `# section:'。
+  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块 + 4 个手写区块，共 12 个 `# section:'。
 字段一律保持原始值（毫秒/计数），便于下游脚本解析。
 前 8 个区块由 `el-chronos-web--csv-sections' 的通用规格生成（查询 → 行 → 列）；
-后 3 个（startup / health / config-history）返回结构不齐整（启动分解是两段嵌套列表、
-采集健康是扁平 plist、配置变更嵌在 `:sessions' 里，且启动分解不吃 RANGE），各自手写
-区块生成函数 —— 与 `el-chronos-report--csv-string' 同款取舍，字段口径见那三个函数的
-docstring（两处需同步）。"
+后 4 个（startup / health / config-history / drift）返回结构不齐整（启动分解是两段嵌套
+列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 的桶在 `:buckets' 键下，
+且启动分解不吃 RANGE），各自手写区块生成函数 —— 与 `el-chronos-report--csv-string' 同款
+取舍，字段口径见那几个函数的 docstring（两处需同步，区块顺序也被用例断言）。"
   (let ((overview (el-chronos-analysis-overview range)))
     (concat
      (el-chronos-web--csv-block
@@ -479,7 +494,9 @@ docstring（两处需同步）。"
       el-chronos-web--csv-sections "")
      (el-chronos-web--csv-startup (el-chronos-analysis-startup-breakdown nil))
      (el-chronos-web--csv-health (el-chronos-analysis-health range))
-     (el-chronos-web--csv-config-history (el-chronos-analysis-config-history range)))))
+     (el-chronos-web--csv-config-history (el-chronos-analysis-config-history range))
+     ;; 命令外停转（drift）：位置与 report 侧一致（末尾），区块名/表头逐字对齐
+     (el-chronos-web--csv-drift (el-chronos-analysis-drift-trend range)))))
 
 ;;; 路由处理函数
 
@@ -539,6 +556,37 @@ KIND 取 `range'（QUERY 只接受 range，如 sessions）、`all'（range + nil
 (defun el-chronos-web--route-blocking (params)
   "GET /api/blocking：命令外阻塞事件列表。"
   (el-chronos-web--list-response params #'el-chronos-analysis-blocking-events))
+
+(defun el-chronos-web--route-drift (params)
+  "GET /api/drift：窗口内按桶聚合的「命令外停转」（drift）趋势。
+查询参数 `range'（1d / 7d / 30d）与 `buckets'（正整数；省略时由 analysis 按窗口长度选择，
+并受整小时倍数合并约束，与 `/api/gc' 同一套）。
+
+响应键：`:range' 归一化范围字符串、`:bucket-count' 请求的桶数（省略时为 null）、
+`:bucket-span' 桶宽（毫秒）、`:drift-total' 窗口内次数合计、`:ms-total' 累计停转毫秒、
+`:slowest-ms' 窗口内单次最长停转（三者无数据时为 0 / 0.0 / 0.0）、`:items' 桶列表
+`[{:bucket :count :total-ms :max-ms}]'（即 analysis 的 `:buckets'，改名以与其它列表接口
+的 `:items' 同形）、`:threshold-ms' 当前判定阈值（取自
+`el-chronos-drift-threshold-ms'，供页面文案使用；写死会与实际判定脱节）。
+
+**口径必须随响应一起传达**（页面已标注）：本端点只含**命令之外**的停转，命令内部的
+停转在 `/api/slow-commands'（`commands' 表），两者**不可相加**；`:ms-total' / `:slowest-ms'
+是高估值（每次最多多算一个心跳间隔，默认 250ms）。
+analysis 返回 nil（库打不开 / 查询失败）时降级为空结构（`:items' 为 null），仍返回 200。"
+  (let* ((range (el-chronos-web--range-param params))
+         (buckets (el-chronos-web--int-param params "buckets" nil))
+         (trend (el-chronos-analysis-drift-trend range buckets)))
+    (el-chronos-web--json-response
+     (list :range (format "%s" range)
+           :bucket-count buckets
+           :bucket-span (plist-get trend :bucket-span)
+           ;; 判定阈值随响应下发：页面文案里的「≥N ms」由 defcustom 决定，写死会与实际
+           ;; 判定脱节（`el-chronos-drift-threshold-ms' 是可调项，见 operations 文档）
+           :threshold-ms (or (bound-and-true-p el-chronos-drift-threshold-ms) 500)
+           :drift-total (or (plist-get trend :drift-total) 0)
+           :ms-total (or (plist-get trend :ms-total) 0.0)
+           :slowest-ms (or (plist-get trend :slowest-ms) 0.0)
+           :items (plist-get trend :buckets)))))
 
 (defun el-chronos-web--route-regressions (params)
   "GET /api/regressions：按 `el-chronos-regression-window-days' 判定的回归列表。"
@@ -767,7 +815,7 @@ tbody tr:hover{background:#1c212b;cursor:pointer}tfoot td{border:0;color:var(--m
 <section><h2>用法热力</h2><div class='hm' id='heat'></div></section>
 <section><h2>慢命令</h2><input id='q-slow' placeholder='搜索命令…'><table id='t-slow'></table></section>
 <section><h2>热点函数</h2><input id='q-func' placeholder='搜索函数 / 包…'><table id='t-func'></table></section>
-<section><h2>阻塞事件</h2><table id='t-block'></table></section>
+<section><h2>阻塞事件</h2><div id='drift'></div><table id='t-block'></table></section>
 <section><h2>回归</h2><table id='t-reg'></table></section>
 <section><h2>采集健康</h2><div id='health'></div></section>
 <section><h2>配置变更</h2><div id='conf'></div></section>
@@ -777,7 +825,8 @@ tbody tr:hover{background:#1c212b;cursor:pointer}tfoot td{border:0;color:var(--m
 <aside id='panel'><button id='panel-close'>关闭</button><div id='panel-body'></div></aside>
 "
   "内嵌页面结构（顶栏 → 概览 → 趋势 → GC 与内存 → 启动分解 → 占比 → 热力 → 慢命令 →
-热点函数 → 阻塞 → 回归 → 采集健康 → 配置变更 → 会话 → 火焰图 + 下钻侧栏）。")
+热点函数 → 阻塞事件（含「命令外停转」汇总与明细）→ 回归 → 采集健康 → 配置变更 → 会话 →
+火焰图 + 下钻侧栏）。")
 
 (defconst el-chronos-web--script
   "
@@ -879,6 +928,23 @@ function gcLegend(items){
   el.innerHTML=(allZero?`<span>${esc('本期只有基线桶（GC 计数与耗时全为 0，不代表没有发生 GC）')}</span>`:'')
     +(noHeap?`<span>${esc('无堆大小样本：Emacs 31.1 以下不采集（该列显示 -）')}</span>`:'')
     +`<span>${list.length} 桶</span>`;}
+function driftPanel(d){
+  // 「阻塞事件」面板顶部的一行汇总 + 最近若干小时的小表。
+  // 口径必须显式标注（与 report 侧 `--drift-line' 同一套措辞）：只含**命令之外**的停转，
+  // 与「慢命令」的耗时不可相加；累计与最坏是高估值（每个样本最多多算一个心跳间隔）。
+  const el=$('drift'),items=(d&&Array.isArray(d.items))?d.items:[];
+  const th=Number((d&&d['threshold-ms'])||500),total=Number((d&&d['drift-total'])||0);
+  if(!items.length){
+    el.innerHTML=`<p class='mut'>${esc('本期无命令外停转记录（≥'+nf(th)+'ms；命令内停转见「慢命令」表，两者不可相加）')}</p>`;
+    return;}
+  const rows=items.slice(-24);
+  el.innerHTML=`<p class='ok'>${esc('命令外停转（≥'+nf(th)+'ms）：本期 '+nf(total)+' 次，累计 '
+      +ms(d['ms-total']||0)+'，最坏 '+ms(d['slowest-ms']||0))}</p>`
+    +miniTable(['小时','次数','累计','最坏'],
+      rows.map(x=>[ts(x.bucket),nf(x.count),ms(x['total-ms']),ms(x['max-ms'])]),'（无数据）')
+    +`<p class='mut'>${esc('口径：仅命令之外的停转；累计与最坏为高估值（每个样本最多多算一个心跳间隔 250ms）。命令内停转见上表，两者不可相加')}</p>`
+    +(items.length>rows.length
+      ?`<p class='mut'>${esc('仅显示最近 '+rows.length+' 个桶（共 '+items.length+' 个）')}</p>`:'');}
 function startupPanel(d){
   const el=$('startup'),s=d||{};
   if(s['session-id']==null){
@@ -965,16 +1031,17 @@ async function openEvent(id){
 async function load(){
   $('status').textContent='加载中…';
   try{
-    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg,gcD,suD,heD,cfD]=await Promise.all([
+    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg,gcD,suD,heD,cfD,drD]=await Promise.all([
       getJSON('/api/summary'),getJSON('/api/top-functions',{limit:50}),getJSON('/api/slow-commands',{limit:50}),
       getJSON('/api/packages'),getJSON('/api/trend'),getJSON('/api/heatmap',{limit:12}),
       getJSON('/api/stacks',{limit:40}),getJSON('/api/sessions'),getJSON('/api/blocking',{limit:30}),
       getJSON('/api/regressions',{limit:30}),
-      getJSON('/api/gc'),getJSON('/api/startup'),getJSON('/api/health'),getJSON('/api/config-history')]);
+      getJSON('/api/gc'),getJSON('/api/startup'),getJSON('/api/health'),getJSON('/api/config-history'),
+      getJSON('/api/drift')]);
     S.data={sum:sum,func:func,slow:slow,pkg:pkg,trend:tr,heat:hm,stacks:st,sess:sess,block:block,reg:reg,
-      gc:gcD,startup:suD,health:heD,conf:cfD};
+      gc:gcD,startup:suD,health:heD,conf:cfD,drift:drD};
     cards(sum.overview||{});trend(tr.items||[]);donut(pkg.items||[]);heat(hm.items||[]);flame(st.items||[]);
-    gcLegend(gcD.items||[]);startupPanel(suD);healthPanel(heD);confPanel(cfD);
+    gcLegend(gcD.items||[]);startupPanel(suD);healthPanel(heD);confPanel(cfD);driftPanel(drD);
     ['slow','func','block','reg','sess','gc'].forEach(table);
     $('status').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){$('status').textContent='加载失败：'+e.message;}}

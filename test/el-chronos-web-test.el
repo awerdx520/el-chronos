@@ -405,9 +405,49 @@
           (should (= 2 (plist-get parsed :total-sessions)))
           (should (eq :false (plist-get parsed :truncated))))))))
 
+(ert-deftest el-chronos-web-test-api-drift ()
+  "GET /api/drift 返回 200 + 合法 JSON：空库 items 为 null、汇总键为 0、阈值随响应下发；
+有数据时按桶聚合，汇总字段（次数 / 累计 / 最坏）与桶内容一致。
+`:threshold-ms' 是页面文案「≥N ms」的来源 —— 缺了它前端只能写死 500，与可调 defcustom 脱节。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((empty-resp (el-chronos-web-test--http "GET" "/api/drift?range=1d&buckets=4"))
+             (empty (el-chronos-web-test--json empty-resp)))
+        (should (equal 200 (plist-get empty-resp :status)))
+        (should (string-match-p "application/json" (plist-get empty-resp :headers)))
+        (should (equal "1d" (plist-get empty :range)))
+        (should (= 4 (plist-get empty :bucket-count)))
+        ;; 空数组经 `--json-value' 序列化为 null（nil 分支），前端按 `items||[]' 处理
+        (should (eq :null (plist-get empty :items)))
+        (should (= 0 (plist-get empty :drift-total)))
+        (should (= 0.0 (plist-get empty :ms-total)))
+        (should (= 0.0 (plist-get empty :slowest-ms)))
+        (should (= 500 (plist-get empty :threshold-ms)))
+        (should (integerp (plist-get empty :bucket-span))))
+      (el-chronos-test--exec
+       "INSERT INTO hourly_drift (hour_ts, session_id, count, total_ms, max_ms)\
+ VALUES (?, ?, ?, ?, ?)"
+       (list (el-chronos-test--hour-ts) 0 3 4200.0 1800.0))
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/drift?range=1d"))
+             (parsed (el-chronos-web-test--json resp))
+             (items (plist-get parsed :items))
+             (first (aref items 0)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (= 1 (length items)))
+        (should (= 3 (plist-get first :count)))
+        (should (= 4200.0 (plist-get first :total-ms)))
+        (should (= 1800.0 (plist-get first :max-ms)))
+        (should (= 3 (plist-get parsed :drift-total)))
+        (should (= 4200.0 (plist-get parsed :ms-total)))
+        (should (= 1800.0 (plist-get parsed :slowest-ms)))
+        ;; buckets 省略时由 analysis 按窗口长度决定，响应里为 null（不是 0）
+        (should (plist-member parsed :bucket-count))
+        (should (eq :null (plist-get parsed :bucket-count)))))))
+
 (ert-deftest el-chronos-web-test-export-csv-new-sections ()
-  "GET /api/export.csv 含 11 个 `# section:'，其中 startup / health / config-history 三块齐备。
-三个新块的区块名、表头与 report 侧逐字一致（两处内联重复实现，改动需同步）。"
+  "GET /api/export.csv 含 12 个 `# section:'，其中 startup / health / config-history / drift
+四块齐备。四个手写块的区块名、表头与 report 侧逐字一致（两处内联重复实现，改动需同步）。"
   (el-chronos-web-test--with-temp-db
     (el-chronos-web-test--open-fixture-db)
     (el-chronos-web-test--with-server
@@ -419,22 +459,24 @@
         (should (string-match-p "^# section: startup$" body))
         (should (string-match-p "^# section: health$" body))
         (should (string-match-p "^# section: config-history$" body))
+        (should (string-match-p "^# section: drift$" body))
         ;; 表头逐字对齐 report 侧
         (should (string-match-p "^kind,name,ms$" body))
         (should (string-match-p "^metric,value$" body))
         (should (string-match-p "^session_id,started_at_ms,git_head,config_sig,changed$" body))
+        (should (string-match-p "^bucket_ms,count,total_ms,max_ms$" body))
         ;; health 必带 rows 行（区分「没采集」与「没异常」）
         (should (string-match-p "^rows," body))
-        (should (= 11 (length (cl-remove-if-not
+        (should (= 12 (length (cl-remove-if-not
                                (lambda (line) (string-prefix-p "# section: " line))
                                (split-string body "\n")))))))))
 
 (ert-deftest el-chronos-web-test-routes-count ()
-  "路由表共 17 条且四个新查询路由已注册、无重复键。
+  "路由表共 18 条且五个新查询路由已注册、无重复键。
 新增路由必须同步 `docs/ui.org' 的 16 条 API 路由表（T10）。"
-  (should (= 17 (length el-chronos-web--routes)))
-  (should (= 17 (length (delete-dups (mapcar #'car el-chronos-web--routes)))))
-  (dolist (path '("/api/gc" "/api/startup" "/api/health" "/api/config-history"))
+  (should (= 18 (length el-chronos-web--routes)))
+  (should (= 18 (length (delete-dups (mapcar #'car el-chronos-web--routes)))))
+  (dolist (path '("/api/gc" "/api/startup" "/api/health" "/api/config-history" "/api/drift"))
     (should (assoc path el-chronos-web--routes))))
 
 (provide 'el-chronos-web-test)

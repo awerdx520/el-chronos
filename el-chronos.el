@@ -82,16 +82,48 @@
                  (const :tag "不记录包加载明细" nil))
   :group 'el-chronos)
 
-(defcustom el-chronos-heartbeat-seconds 1
+(defcustom el-chronos-heartbeat-seconds 0.25
   "心跳定时器间隔，单位秒。
-心跳用于检测「命令之外的主线程阻塞」：比较相邻两次触发的实际间隔，
-漂移超过 `el-chronos-block-threshold-ms' 时记一次阻塞事件（I2）。"
+心跳用于检测「命令之外的主线程停转」：比较相邻两次触发的实际间隔，超过
+`el-chronos-block-threshold-ms' 记一条 block 明细，超过
+`el-chronos-drift-threshold-ms' 累加到 `hourly_drift' 小时桶（I2）。
+
+默认 250ms 的目的是把两档的**高估上界压到 250ms**：记录的是「到上一次心跳或命令结算
+为止的总 gap」，不是停转本身，故真实停转与记录值之间有一个 ∈ [0, 一个心跳间隔] 的偏移。
+心跳从 1s 降到 250ms 后，block 的高估上界从 1000ms 收到 250ms，drift 的检出下界从
+「500 + 0~1000 抖动」收敛到 250–500ms。
+
+开销依据：250ms 间隔实测相对开销 +0.0357%（`docs/architecture.org`「实测结论 13」，
+噪声地板 ±0.0003% 的 119 倍，距 0.5% 预算余 14 倍）。该数字是 `emacs -Q --batch` 下
+测得的，**GUI 主循环未验证**，只能作为上界估计。
+
+调档约束（代码不做断言，取运行中可改）：本值必须**小于**
+`el-chronos-drift-threshold-ms'，否则每一次正常心跳间隔都会被判成 drift。
+调档指引见 `docs/operations.org'。"
   :type 'number
   :group 'el-chronos)
 
 (defcustom el-chronos-block-threshold-ms 2000
   "判定一次阻塞事件的漂移阈值，单位毫秒。
 心跳延迟超过该值即认为主线程被长时间占住（例如未分批的 IO 或原生代码）。"
+  :type 'number
+  :group 'el-chronos)
+
+(defcustom el-chronos-drift-threshold-ms 500
+  "判定一次「命令外漂移」的阈值，单位毫秒。
+命令之外的主线程停转超过该值即累加到 `hourly_drift' 小时聚合（只记次数 / 累计时长 /
+最大值，**不记明细**，也不发任何提示 —— 亚秒级不值得占用 echo area）。
+
+**语义限定「命令之外」**：命令内的停转由 `commands' 表的精确 `duration_ms' 负责
+（≥ `el-chronos-slow-command-threshold-ms' 时另有 `slow_events(kind=\"command\")'），
+不进本表；因此 `hourly_drift' 的时长与 `commands' 的耗时**不可相加、也不该相加**，
+它们是两个不相交的集合。命令内停转进不了 drift 的机制不是判据，而是
+`el-chronos-collect--finish' 结算时把心跳基线重置到当前时刻 —— 命令时间根本不进入 gap。
+
+硬约束：本值必须**大于** `el-chronos-heartbeat-seconds'（换算成毫秒），否则每次正常
+心跳间隔都会被判成 drift。代码不做断言，调档时自行遵守；建议**上线观察一周**后按实际
+`hourly_drift' 频率与 `max_ms' 分布调档（`docs/operations.org' 有调档指引）。
+判定链上两档互斥：超过 `el-chronos-block-threshold-ms' 时记 block，不进本档。"
   :type 'number
   :group 'el-chronos)
 
@@ -111,9 +143,9 @@ I3 要求全部观测数据只写这一个文件（连同 SQLite 自动生成的
 
 (defcustom el-chronos-retention-days 30
   "明细数据保留天数。
-只作用于 `commands' 与 `slow_events' 两张明细表；五张 hourly_* 聚合表
-（`hourly_functions'、`hourly_usage'、`hourly_stacks'、`hourly_gc'、`hourly_health'）
-永久保留，由用户手动 purge 清理。"
+只作用于 `commands' 与 `slow_events' 两张明细表；六张 hourly_* 聚合表
+（`hourly_functions'、`hourly_usage'、`hourly_stacks'、`hourly_gc'、`hourly_health'、
+`hourly_drift'）永久保留，由用户手动 purge 清理。"
   :type 'integer
   :group 'el-chronos)
 

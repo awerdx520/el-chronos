@@ -319,6 +319,75 @@
         (should-not (plist-get trend :heap-latest))
         (should (= 3 (plist-get trend :gc-total)))))))
 
+;;; 命令外停转（drift）趋势
+
+(defun el-chronos-analysis-test--insert-drift (hour-ts count total-ms max-ms
+                                                        &optional session-id)
+  "插入一条 `hourly_drift' 聚合行：HOUR-TS / COUNT / TOTAL-MS / MAX-MS / SESSION-ID。
+SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键是 (hour_ts, session_id)）。"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_drift (hour_ts, session_id, count, total_ms, max_ms)\
+ VALUES (?, ?, ?, ?, ?)"
+   (list hour-ts (or session-id 0) count (float total-ms) (float max-ms))))
+
+(ert-deftest el-chronos-analysis-test-drift-trend-aggregates ()
+  "drift 趋势按桶对 count / total-ms 求和、max-ms 取桶内最大值，并给出窗口汇总。
+跨会话（同小时两行）必须累加：`hourly_drift' 主键是 (hour_ts, session_id)，多次 flush
+会让同一小时出现多行，只取最后一行会让次数凭空缩水。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (prev (- hour 3600000))
+           (trend nil))
+      ;; 上一小时：2 次 / 700ms / 单次最长 400ms
+      (el-chronos-analysis-test--insert-drift prev 2 700.0 400.0)
+      ;; 当前小时两个会话：1 次 1800ms + 3 次 2000ms（单次最长 900ms）
+      (el-chronos-analysis-test--insert-drift hour 1 1800.0 1800.0)
+      (el-chronos-analysis-test--insert-drift hour 3 2000.0 900.0 999)
+      (setq trend (el-chronos-analysis-drift-trend window))
+      (let ((items (plist-get trend :buckets)))
+        (should (= 2 (length items)))          ; 空桶不返回
+        (should (equal (mapcar (lambda (i) (plist-get i :bucket)) items) (list prev hour)))
+        (should (cl-every (lambda (i) (zerop (mod (plist-get i :bucket) 3600000))) items))
+        (should (= 2 (plist-get (car items) :count)))
+        (should (= 700.0 (plist-get (car items) :total-ms)))
+        (should (= 400.0 (plist-get (car items) :max-ms)))
+        (should (= 4 (plist-get (nth 1 items) :count)))         ; 1 + 3，跨会话累加
+        (should (= 3800.0 (plist-get (nth 1 items) :total-ms))) ; 1800 + 2000
+        (should (= 1800.0 (plist-get (nth 1 items) :max-ms)))   ; max(1800, 900)
+        (should (= 6 (plist-get trend :drift-total)))
+        (should (= 4500.0 (plist-get trend :ms-total)))
+        (should (= 1800.0 (plist-get trend :slowest-ms)))
+        (should (equal (cons (- hour (* 3600000 23)) (+ hour 3600001))
+                       (plist-get trend :range)))
+        (should (integerp (plist-get trend :bucket-span))))
+      ;; 显式要求 2 桶：分组变粗但汇总不变（桶数只影响分组，不影响合计）
+      (let ((coarse (el-chronos-analysis-drift-trend window 2)))
+        (should (<= (length (plist-get coarse :buckets)) 2))
+        (should (= 6 (plist-get coarse :drift-total)))
+        (should (= 4500.0 (plist-get coarse :ms-total)))
+        (should (= 1800.0 (plist-get coarse :slowest-ms)))))))
+
+(ert-deftest el-chronos-analysis-test-drift-trend-empty ()
+  "无 drift 数据时返回与有数据同构的空 plist（不是 nil），汇总键为 0 / 0.0。
+调用方（报告 / Web）因此不必为「空」单独分叉。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (empty (el-chronos-analysis-drift-trend window)))
+      (should (listp empty))
+      (should-not (plist-get empty :buckets))
+      (should (= 0 (plist-get empty :drift-total)))
+      (should (= 0.0 (plist-get empty :ms-total)))
+      (should (= 0.0 (plist-get empty :slowest-ms)))
+      (should (consp (plist-get empty :range)))
+      (should (integerp (plist-get empty :bucket-span)))
+      ;; 有数据时键集合完全一致（同构）
+      (el-chronos-analysis-test--insert-drift (el-chronos-test--hour-ts) 1 600.0 600.0)
+      (let ((filled (el-chronos-analysis-drift-trend window)))
+        (should (equal (cl-loop for (key _v) on empty by #'cddr collect key)
+                       (cl-loop for (key _v) on filled by #'cddr collect key)))
+        (should (plist-get filled :buckets))))))
+
 ;;; 热力图
 
 (ert-deftest el-chronos-analysis-test-heatmap ()
