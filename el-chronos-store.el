@@ -186,11 +186,64 @@ KEY 是固定枚举字符串（`dropped-commands' / `dropped-events' / `flush-fa
 通常已经消费；真被丢弃的只是一个标量（下次启动会重算），与既有 5 秒 flush 窗口的崩溃
 丢失同级，故不告警。")
 
+;;; 采集器自监控计数器
+;;
+;; 这 5 个计数器**一律用独立 defvar**，既不放 `--clear-aggregates' 清空的那批 hash，
+;; 也不挂 `--buffer' / `--slow-events' 上。理由是设计 §6 的「已知悖论」：
+;; 这些容器会在 flush 成功（本批已处理）与 flush 失败（ROLLBACK，本批丢弃）两条路径上
+;; 被清空，而「刚刚丢了多少 / 失败了几次」恰恰要在失败**之后**仍然可观测 —— 挂上去就等于
+;; 「失败了」这件事永远不可见。生命周期与缓冲彻底解耦之后，归零点只由本模块自己的上报点
+;; （COMMIT 成功）控制。
+
+(defvar el-chronos-store--dropped-commands 0
+  "因 `--max-buffer-items' 截断而丢弃的命令事件数（整数，单调累加）。
+**不进 `--clear-aggregates' 清空的容器**：那批容器的清空点是「本批已处理」/「本批已丢弃」，
+一次 flush 失败就会把「刚丢了多少条」一并抹掉，而 flush 失败正是唯一需要这个数字的时刻。
+也**不挂 `--buffer'**：那个容器本身会被 ROLLBACK 置 nil，计数随之消失。
+归零只在 COMMIT 成功后减去已上报部分（见 `el-chronos-store-flush'），失败路径一分不减。")
+
+(defvar el-chronos-store--dropped-events 0
+  "因 `--max-buffer-items' 截断而丢弃的慢事件数（整数，单调累加）。
+与 `--dropped-commands' **分开计**：`--push-event' 同时服务命令缓冲与慢事件缓冲，
+合并成一个计数会让「慢事件丢了」看起来像「命令丢了」。
+**不进 `--clear-aggregates' 清空的容器**、也不挂 `--slow-events'（同 `--dropped-commands'
+的理由：那两个位置都会在 flush 失败时被清掉，而失败后必须仍能看到丢弃量）。")
+
+(defvar el-chronos-store--flush-failures 0
+  "`el-chronos-store-flush' 失败（ROLLBACK / 抛错）次数（整数，单调累加）。
+**不进 `--clear-aggregates' 清空的容器**：这是最不能放进去的一个 —— flush 失败路径必然
+执行 `--clear-aggregates'，计数放那儿等于「失败一次、清零一次」，库里的
+`flush-failures' 永远是最新一次的 0 或 1。独立 defvar 才能在失败后保留值，
+由下一次成功 flush 补写（eventual 语义，写库失败时无法记录失败本身）。
+失败分支里 +1，成功路径一分不减（只在成功时减去「已上报」的旧值）。")
+
+(defvar el-chronos-store--flush-count 0
+  "已成功的 flush 次数（整数）。
+**滞后一个周期上报**：本变量只在 COMMIT 之后 +1，而快照是在 COMMIT 之前取的，所以本次
+flush **不**计入本次上报，而是进下一次快照 —— 否则「上报的动作」会改变「被上报的值」，
+出现自指（写库时不知道这次算不算成功）。
+**非零不参与 `--pending-p'**：flush 之后它恒 ≥ 1，纳入会让 `--pending-p' 永远为真 →
+flush timer 每 5 秒都发现「有待写数据」→ 无限 flush 循环（每轮再 +1，永远非零）。
+故它只随别的待写数据一起被带出去，单独残留时留在内存等下一次（close 时丢弃）。")
+
+(defvar el-chronos-store--flush-ms-total 0.0
+  "已成功 flush 的累计耗时（毫秒，浮点）。
+**滞后一个周期上报**：与 `--flush-count' 同理 —— 本次耗时在 COMMIT 之后才累加，
+故进下一次快照（`flush-ms' 键）。
+**非零不参与 `--pending-p'**：一次 flush 之后它通常 > 0 且单调增长，纳入会让
+`--pending-p' 恒为真 → 无限 flush 循环（同 `--flush-count'）。")
+
 ;;; 小工具
 
 (defun el-chronos-store--now-ms ()
   "当前 epoch 毫秒（整数）；I4 要求时间戳一律毫秒。"
   (truncate (* 1000 (float-time))))
+(defun el-chronos-store--hour-ts ()
+  "当前整点的时间戳（毫秒，I4），自监控计数快照按它归属小时。
+与 collect 的 `el-chronos-collect--hour-ts' 同口径（整点毫秒、epoch 基准）。
+store 侧自带一份而不是反向 require collect：依赖方向是 collect → store，
+store 是底层，不能为了一个整点换算引入反向依赖。"
+  (* 3600000 (floor (/ (float-time) 3600))))
 (defun el-chronos-store--warn (format-string &rest args)
   "限流告警：每 `el-chronos-store--warn-interval-seconds' 秒最多一次，绝不抛错。"
   (let ((now (float-time)))
@@ -267,14 +320,38 @@ KEY 是固定枚举字符串（`dropped-commands' / `dropped-events' / `flush-fa
   (when value
     (condition-case nil (json-serialize (el-chronos-store--json-value value))
       (error nil))))
+(defun el-chronos-store--note-dropped (slot count)
+  "按 SLOT 把本批因截断而丢弃的 COUNT 条事件累加到对应自监控计数器。
+`el-chronos-store--buffer' → `--dropped-commands'、
+`el-chronos-store--slow-events' → `--dropped-events'。
+**必须按 SLOT 分流**：`--push-event' 同时服务两个缓冲，不分开就会把慢事件记进命令计数，
+「命令丢了多少」这个数字从此不可信。未知 SLOT 不计数、不抛错（I6）。
+这些计数器是独立 defvar（不进 `--clear-aggregates'、不挂缓冲），见其 docstring。"
+  (cond
+   ((eq slot 'el-chronos-store--buffer)
+    (setq el-chronos-store--dropped-commands
+          (+ el-chronos-store--dropped-commands count)))
+   ((eq slot 'el-chronos-store--slow-events)
+    (setq el-chronos-store--dropped-events
+          (+ el-chronos-store--dropped-events count)))
+   (t nil)))
+
 (defun el-chronos-store--push-event (slot event)
-  "把 EVENT（plist）补齐 `:ts' 后推入符号 SLOT 的缓冲，超上限丢最旧项。"
-  (let ((plist (copy-sequence event))
-        (buffer (cons nil (symbol-value slot))))
+  "把 EVENT（plist）补齐 `:ts' 后推入符号 SLOT 的缓冲，超上限丢最旧项。
+截断时把**丢弃条数**记进自监控计数器，口径是**差值**：
+「本次 push 后的长度 − `--max-buffer-items'」。当前每次 push 只加一条，正常状态下
+差值恒为 1，与「每事件 +1」完全等价；采用差值口径是**防御性**的 —— 将来若改成批量 push
+（一次补多条），逐条 +1 的写法会漏计或需要额外遍历，而差值口径天然正确。"
+  (let* ((plist (copy-sequence event))
+         (buffer (cons nil (symbol-value slot)))
+         (new-length (1+ (length (symbol-value slot)))))
     (plist-put plist :ts (or (plist-get plist :ts) (el-chronos-store--now-ms)))
     (setcar buffer plist)
-    (when (> (length (cdr buffer)) el-chronos-store--max-buffer-items)
-      (setcdr (nthcdr (1- el-chronos-store--max-buffer-items) buffer) nil))
+    (when (> new-length el-chronos-store--max-buffer-items)
+      (setcdr (nthcdr (1- el-chronos-store--max-buffer-items) buffer) nil)
+      ;; 差值 = 截断前长度 − 上限（截断前长度即 new-length）
+      (el-chronos-store--note-dropped
+       slot (- new-length el-chronos-store--max-buffer-items)))
     (set slot buffer)))
 
 ;;; schema 与迁移
@@ -553,7 +630,14 @@ PATH 省略时用 `el-chronos-db-path'。同路径已打开时直接返回现有
 遇到已取消的 timer，也避免登记表在反复 open/close 后无限增长。
 `el-chronos-store--pending-startup-ms' 与孤儿会话告警标志一并清零（I5 零残留）：
 前者是「未消费即丢弃」的标量（close 首行的 flush 通常已消费它），后者描述的是当前库里
-会话行是否存在这一具体事实，重开库后需要重新判定。"
+会话行是否存在这一具体事实，重开库后需要重新判定。
+5 个自监控计数器（`--dropped-commands' / `--dropped-events' / `--flush-failures' /
+`--flush-count' / `--flush-ms-total'）一并清零，且**这里是它们唯一的无条件清零点**：
+它们与 `--clear-aggregates' 刻意分离 —— 后者是 flush 路径的「本批数据已处理 / 已丢弃」
+语义（每次 flush 都跑，成功失败都跑），本处是 close 路径的「进程内状态归零」语义。
+混在一起会出两种错：同进程反复 open/close 时把上一轮的计数带进新会话；
+或某条 flush 路径顺手抹掉「已丢了多少」。close 前已有一次 flush，正常情况已上报；
+未上报的部分随 close 丢弃，与既有 5 秒 flush 窗口的崩溃丢失同级，故不告警。"
   (ignore-errors (el-chronos-store-flush))
   (when el-chronos-store--flush-timer
     (ignore-errors (cancel-timer el-chronos-store--flush-timer))
@@ -577,6 +661,15 @@ PATH 省略时用 `el-chronos-db-path'。同路径已打开时直接返回现有
         ;; `startup_ms' 补写标量「未消费即丢弃」：close 首行已 flush 过一次，通常已消费；
         ;; 真被丢弃的只是一个标量（下次启动会重算），与 5 秒 flush 窗口的崩溃丢失同级，不告警
         el-chronos-store--pending-startup-ms nil
+        ;; 5 个自监控计数器归零（I5 零残留）。**必须与 `--clear-aggregates' 分开**：
+        ;; 那个函数是 flush 路径「本批已处理/已丢弃」的语义，每次 flush 都会跑；
+        ;; 这里是 close 路径「进程内状态归零」的语义。混用会让 flush 顺手抹掉
+        ;; 「丢了多少 / 失败几次」，而这两件事恰恰要在失败之后仍可观测。
+        el-chronos-store--dropped-commands 0
+        el-chronos-store--dropped-events 0
+        el-chronos-store--flush-failures 0
+        el-chronos-store--flush-count 0
+        el-chronos-store--flush-ms-total 0.0
         ;; 孤儿会话告警标志重置：它描述「当前库里那个会话行还在不在」，重开库后该事实可能
         ;; 已变，重置才能让新问题重新可见（I5：关闭后不留状态）
         el-chronos-store--aggregate-orphan-warned nil)
@@ -741,7 +834,16 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
 逐一列出：`el-chronos-store-flush' 的第一道门是 `(and db (--pending-p))'，漏掉任何一个都会让
 「只有该类数据待写」时 flush 直接早退 —— 数据永不落库且没有任何报错（静默丢数据）。
 `--pending-startup-ms' 最容易漏：空闲会话（启动后没人敲命令、profiler 也采不到样本）里
-它是**唯一**残留，漏了补写就永远不发生。"
+它是**唯一**残留，漏了补写就永远不发生。
+
+自监控计数器里**只列 `--dropped-commands' / `--dropped-events' / `--flush-failures'**
+三个：它们表示「有数据还没进库」（丢弃量与失败次数都是待补写的真实信息），单独残留时
+必须触发一次 flush 才能补写。
+**`--flush-count' / `--flush-ms-total' 绝不能列进来**：它们每次成功 flush 之后都变成非零
+且单调不减，纳入会让 `--pending-p' **恒为真** → flush timer 每 5 秒都判定「有待写数据」
+并跑一次事务，而每次成功又继续 +1 / 累加 → 永远非零 → 无限 flush 循环（空转事务、
+磁盘与 CPU 都被白烧，且 `flush-count' 的值本身被自己的上报行为无限推高）。
+它们只搭别的待写数据的便车上报；单独残留时留在内存（eventual，close 时丢弃）。"
   (or el-chronos-store--buffer el-chronos-store--slow-events
       (> (hash-table-count el-chronos-store--usage) 0)
       (> (hash-table-count el-chronos-store--functions) 0)
@@ -749,7 +851,10 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
       (> (hash-table-count el-chronos-store--gc) 0)
       (> (hash-table-count el-chronos-store--health) 0)
       (> (hash-table-count el-chronos-store--startup) 0)
-      el-chronos-store--pending-startup-ms))
+      el-chronos-store--pending-startup-ms
+      (> el-chronos-store--dropped-commands 0)
+      (> el-chronos-store--dropped-events 0)
+      (> el-chronos-store--flush-failures 0)))
 (defun el-chronos-store--aggregates-pending-p ()
   "三个新聚合 hash（gc / health / startup）是否有待写数据。"
   (or (> (hash-table-count el-chronos-store--gc) 0)
@@ -763,6 +868,33 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
      'el-chronos
      "会话行不存在，本次已跳过 hourly_gc / hourly_health / startup_phases 写入。"
      :warning)))
+
+;;; 自监控计数的上报快照
+
+(defun el-chronos-store--health-snapshot ()
+  "取自监控计数快照：((KEY . VALUE) ...)，**只含非零项**。
+为什么只写非零值：空闲会话里多数计数器长期为 0，无条件写会让每小时
+都多出几行恒 0 的 `hourly_health' 行 ——「0 次丢弃」没有信息量，
+反而让「这一小时没有任何自监控数据」与「有数据但都是 0」在查询层
+不可区分。
+为什么在事务开始**之前**取：COMMIT 成功后要按这份快照把已上报部分从
+计数器里**减掉**（不是无条件置 0）。若在事务中间或之后取，
+上报期间新发生的丢弃会被一并抹掉。
+键名与 `el-chronos-store-record-health' 的枚举一致，集中定义在本函数
+与该函数 docstring 里以避免拼写漂移：
+`dropped-commands' / `dropped-events' / `flush-failures' /
+`flush-count' / `flush-ms'。"
+  (delq nil
+        (list (when (> el-chronos-store--dropped-commands 0)
+                (cons "dropped-commands" el-chronos-store--dropped-commands))
+              (when (> el-chronos-store--dropped-events 0)
+                (cons "dropped-events" el-chronos-store--dropped-events))
+              (when (> el-chronos-store--flush-failures 0)
+                (cons "flush-failures" el-chronos-store--flush-failures))
+              (when (> el-chronos-store--flush-count 0)
+                (cons "flush-count" el-chronos-store--flush-count))
+              (when (> el-chronos-store--flush-ms-total 0)
+                (cons "flush-ms" el-chronos-store--flush-ms-total)))))
 (defun el-chronos-store--upsert (db key value sql plain-middle-p)
   "把聚合 VALUE 按其键 KEY 用 SQL UPSERT 进 DB，返回解析出的 (HOUR 中间段 名字)。
 PLAIN-MIDDLE-P 为 t 时中间段原样绑定（usage 的 dimension），否则按会话 ID 转整数。"
@@ -794,7 +926,13 @@ PLAIN-MIDDLE-P 为 t 时中间段原样绑定（usage 的 dimension），否则�
 把 hash 换成新表而不是 `clrhash'，避免仍在遍历旧表的 `maphash' 回调看到被清空的内容。
 六个聚合 = 既有 usage / functions / stacks + 新增 gc / health / startup：
 它们同一批被 flush 写入同一事务，故成败路径都必须同批清空（否则成功路径会重复累加，
-失败路径会无界增长）。"
+失败路径会无界增长）。
+**自监控计数器（`--dropped-commands' / `--dropped-events' / `--flush-failures' /
+`--flush-count' / `--flush-ms-total'）刻意不在这里**：本函数的两个调用点分别是
+「本批已处理」（COMMIT 成功）与「本批已丢弃」（ROLLBACK），两者都要清掉「这批数据」，
+而计数器描述的是「发生过多少次丢弃/失败」这一跨批次事实 —— 清掉它等于让 flush 失败
+这件事永远不可观测（设计 §6 的「已知悖论」）。它们的归零点由 `el-chronos-store-flush'
+在 COMMIT 之后单独控制（减去已上报部分，不是无条件清零）。"
   (setq el-chronos-store--slow-events nil
         el-chronos-store--usage (make-hash-table :test #'equal)
         el-chronos-store--functions (make-hash-table :test #'equal)
@@ -842,7 +980,11 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
            (session-known (and session (el-chronos-store--session-known-p
                                         el-chronos-store--db session)))
            (startup-written nil)
-           (groups nil))
+           (groups nil)
+           ;; 自监控计数：快照在事务前取，COMMIT 成功后才按它减去（见 `--health-snapshot'）
+           (health-snapshot (el-chronos-store--health-snapshot))
+           (health-written nil)
+           (flush-start (float-time)))
       (condition-case err
           (progn
             (sqlite-execute db "BEGIN")
@@ -908,6 +1050,15 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
                          (el-chronos-store--upsert db key (vector value)
                                                    el-chronos-store--sql-upsert-health nil))
                        el-chronos-store--health)
+              ;; 自监控计数快照：与上面各表**同一事务**提交，故「库里有值」与
+              ;; 「本批数据确实落库」严格同态（不存在「计数写了、数据回滚了」的半态）。
+              ;; 会话行存在才写（`hourly_health' 无外键，孤儿行 purge 删不掉），
+              ;; 与三张新表同一判定；会话未知时计数器**一分不减**，等下次补写。
+              (dolist (entry health-snapshot)
+                (sqlite-execute db el-chronos-store--sql-upsert-health
+                                (list (el-chronos-store--hour-ts) session
+                                      (car entry) (float (cdr entry)))))
+              (setq health-written t)
               ;; 启动阶段的键是 session|phase，只在第一个 "|" 处切分（phase 可含 "|"）
               (maphash (lambda (key value)
                          (let ((parts (el-chronos-store--split-startup-key key)))
@@ -936,11 +1087,48 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
             ;; **COMMIT 成功之后**才算消费掉 pending：ROLLBACK 或补写失败都不清，留待下次
             ;; （eventual 语义：值可能晚到一次 flush 周期，但不会丢）。
             (when startup-written (setq el-chronos-store--pending-startup-ms nil))
+            ;; 自监控计数（同样只在 COMMIT 成功之后才动）：
+            ;; ① 把**已上报**的部分从计数器里**减去** —— 不是无条件置 0。上报期间（本事务
+            ;;    期间）新发生的丢弃/失败必须留住；置 0 会把它们静默吞掉，库里就少记了。
+            ;; ② 再把**本次** flush 的耗时与次数累加进去。这两步都排在快照之后，所以本次
+            ;;    flush 只会在**下一次**被上报（滞后一个周期）—— 否则「上报的动作」会改变
+            ;;    「被上报的值」，构成自指（写库那一刻还不知道这次算不算成功）。
+            ;; 库内该键的累计值 + 内存里的未上报差额 = 真实总量。
+            (when health-written
+              (dolist (entry health-snapshot)
+                (let ((value (cdr entry)))
+                  (cond
+                   ((equal (car entry) "dropped-commands")
+                    (setq el-chronos-store--dropped-commands
+                          (- el-chronos-store--dropped-commands value)))
+                   ((equal (car entry) "dropped-events")
+                    (setq el-chronos-store--dropped-events
+                          (- el-chronos-store--dropped-events value)))
+                   ((equal (car entry) "flush-failures")
+                    (setq el-chronos-store--flush-failures
+                          (- el-chronos-store--flush-failures value)))
+                   ((equal (car entry) "flush-count")
+                    (setq el-chronos-store--flush-count
+                          (- el-chronos-store--flush-count value)))
+                   ((equal (car entry) "flush-ms")
+                    (setq el-chronos-store--flush-ms-total
+                          (- el-chronos-store--flush-ms-total value)))))))
+            (setq el-chronos-store--flush-count (1+ el-chronos-store--flush-count)
+                  el-chronos-store--flush-ms-total
+                  (+ el-chronos-store--flush-ms-total
+                     (* 1000.0 (- (float-time) flush-start))))
             (when session (setq el-chronos-store--buffer nil))
             (el-chronos-store--clear-aggregates)
             t)
         (error
          (ignore-errors (sqlite-execute db "ROLLBACK"))
+         ;; 自监控：失败次数 +1，其余 4 个计数器**一分不减**（丢弃量、已成功的 flush 次数与
+         ;; 累计耗时都不因本次失败而改变）。特别注意别在这里调用任何会清计数器的逻辑 ——
+         ;; 下面紧跟的 `--clear-aggregates' 清的是「本批数据」容器，计数器不在其中（见其
+         ;; docstring）。这些值等下一次成功 flush 补写（eventual，滞后上限一次成功 flush
+         ;; 的间隔；库长期不可写时无上限）。
+         (setq el-chronos-store--flush-failures
+               (1+ el-chronos-store--flush-failures))
          ;; 按计划丢弃本批：数据此时本就无法落库，保留会无界增长。
          ;; 注意这里与**成功路径**的差异是**有意的**，不是漏写会话守卫：
          ;;   - 成功路径在 `session' 为 nil 时保留命令缓冲（会话就绪后还能补落库）；

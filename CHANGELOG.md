@@ -48,6 +48,7 @@
 
 ### 变更
 
+- **`startup_ms` 在 mode 早于 `after-init-hook` 启用时改为「钩子捕获 + 下一次 flush 补写」**：这类会话里 `--ensure-session` 建会话行时 `after-init-time` 仍是 nil（`startup.el` 先 `setq after-init-time` 再跑 `after-init-hook`，两行都在 init 文件加载之后），`startup_ms` 落 NULL 且事后无人能补。现在由 `after-init-hook` 一次性回调算出 `before-init-time` → `after-init-time` 的毫秒差，调 `el-chronos-store-note-startup-ms` **纯内存登记**；真正的 `UPDATE sessions SET startup_ms = ? WHERE id = ? AND startup_ms IS NULL`（`IS NULL` 守卫防覆盖已正确写入的值）由 store 的下一次 flush 在**既有事务内**完成，COMMIT 成功才清 pending、ROLLBACK 保留。因此**启动期零 IO**（`busy_timeout=2000ms` 最坏把启动拖住 2s 的风险归零）、不新增 timer（复用既有 5 秒 flush）。代价：补写延迟 ≤ 一个 flush 周期，其间读 `startup_ms` 仍为 NULL。同时 `el-chronos-collect-stop` 的清理顺序改为「先摘启动打点钩子与 timer → 再 `--sample-tick` 收尾 → 再摘其余钩子」：补写回调若在清理途中被触发，会往「正在关闭」的会话里再登记一次 pending，`store-close` 的 flush 就把它写进库了。
 - **org 报告节数 10 → 11**：新增「GC 与内存」节，位置在「趋势」之后、「阻塞事件」之前；无数据时该节显示可见降级说明而非静默省略。
 - **`hourly_gc` 的 `heap_bytes` 采用 `COALESCE` 覆盖语义**：堆大小每 N 个采样窗口才采一次，其余窗口传 NULL；若用普通覆盖写入，同一小时后到的窗口会把已采到的堆值抹成 NULL，因此改为 `COALESCE` 保留已有值。
 - **阻塞提示默认静默**：`el-chronos-collect-notify-blocks` 默认由 `t` 改为 `nil`——心跳检测到主线程
@@ -71,6 +72,11 @@
 
 ### 新增
 
+- **启动耗时分解（T6）**：新增采集侧「启动打点」，落 `startup_phases` 表。① **3 个确定性锚点**：`mode-start`（`collect-start` 记，即观测起点）/ `after-init`（`after-init-hook`）/ `startup`（`emacs-startup-hook`），值均为相对 `before-init-time` 的毫秒偏移；`first-idle` 为**可选**锚点（仅在能注册 idle timer 时记一次），因 idle 时机受用户活动影响、不可预期，**不参与任何判定**。② **包加载明细**：挂内置 `after-load-functions`，把相邻两次触发的 `float-time` 差值记成「这次 load 的耗时」（**近似归因**，差值里含前一个文件的收尾逻辑与它触发的钩子执行），落 `load:<library>`；内存保存全部记录，**只在写库前**按毫秒降序截断到 top-N（新 defcustom `el-chronos-startup-top-n`，默认 50，`0`/`nil` = 不记明细只记锚点）。③ 摘钩用**确定性三元**（`emacs-startup-hook` 已触发 / 累计 load 次数达 `4 × top-n` / 30 秒一次性 timer，任一满足即摘并落库），不依赖 idle 时机，`mode -1` 后零残留（I5）。
+  **物理边界（务必照此理解数据）**：用户通常在 init 末尾（或用 `emacs-startup-hook`）才开启 mode，此时启动已基本结束 → **只记 `mode-start` 锚点，无任何包加载明细，也没有 `after-init` / `startup` 锚点**（钩子**一个都不挂**，因为强行挂上只会把「启动后的日常加载」冒充成启动耗时）；要覆盖完整启动，必须把 `(el-chronos-mode 1)` 提前到 `early-init.el`。这一判断使本机这类配置的启动打点开销为零。
+  用例总数 **167 → 179**（T6a 8 例：不挂判据 / 累计语义 / top-N 截断 / 摘钩 / 幂等 / 次数上限 / 锚点 / 安装清理；T6b 4 例：`startup_ms` 零 IO 捕获 / 时间缺失跳过 / `collect-stop` 顺序 / 清理完整性），含两个反向验证（去掉「启动已结束就不挂」→ 用例必红；去掉 top-N 截断 → 用例必红）。
+- **采集器自监控计数（T5）**：`dropped-commands` / `dropped-events`（缓冲截断丢弃量，按 SLOT 分流、按差值口径累计）、`flush-failures`（flush 失败次数）、`flush-count` / `flush-ms`（flush 次数与累计耗时，**滞后一个周期**上报以避免「上报动作改变被上报值」的自指）、`sample-misses`（采样窗口整窗丢失），统一落 `hourly_health`。store 侧 5 类计数用**独立 defvar**——刻意不进 `--clear-aggregates` 清空的容器（否则 flush 失败会把「失败了几次」一并抹掉，那正是唯一需要它的时刻）；COMMIT 成功后才减去已上报部分，失败路径一分不减、等下一次成功 flush 补写（eventual）。
+- 用例总数 **159 → 167**（新增 store 自监控 7 例 + collect 采样窗口 1 例）。同步调整 `el-chronos-store-test-flush-failure-clears-buffers` 的 `--pending-p` 断言：失败计数被刻意纳入 `--pending-p'，故失败后 `--pending-p' 仍为真，但唯一原因是待补写的 `flush-failures`（数据层面的「本批已丢弃」断言全部保留）。`--flush-count` / `--flush-ms-total` **不**纳入 `--pending-p'`，否则它们每次 flush 后都非零 → 恒 pending → 无限 flush 循环（已用反向验证锁住）。
 - **GC 与内存趋势**：新增只读查询 `el-chronos-analysis-gc-trend`，按时间桶聚合 `hourly_gc`（GC 次数与耗时求和、堆大小取桶内最后一个非 NULL 值），并在 org 报告中新增第 11 节「GC 与内存」。
 - 用例总数 **153 → 159**（`make test`，增量集中在 analysis 查询与 report 渲染两侧：analysis 4 例 + report 2 例）。
 - **观测面扩展 S1 采集侧（schema v2）**：新增 `hourly_gc`（GC 次数 / 耗时 / 堆大小）、`startup_phases`（启动耗时分解）、`hourly_health`（采集健康自监控）、`session_meta`（变更标记）四张表。

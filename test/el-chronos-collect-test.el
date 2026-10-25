@@ -809,6 +809,396 @@ buffer 名**不以空格开头**：内部 buffer（空格开头）按 `--interna
     (should-not el-chronos-collect--gc-baseline)
     (should (= 0 el-chronos-collect--heap-tick-counter))))
 
+(ert-deftest el-chronos-collect-test-sample-miss-recorded-when-window-exceeded ()
+  "相邻两次 tick 间隔 > 2×采样窗口时记 `sample-misses'；正常间隔与首个 tick 都不记。
+伪造 `--last-sample-tick' 为很久以前，把 `el-chronos-sample-window-seconds' 设成 10 秒
+（阈值 20 秒）；同时覆盖「基线推进后紧接一次 tick 不再重复计数」与
+「`collect-stop' 清零基线」（I5）。"
+  (let ((el-chronos-collect--last-sample-tick (- (float-time) 100))
+        (el-chronos-sample-window-seconds 10)
+        (el-chronos-collect--gc-baseline (cons gcs-done gc-elapsed))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-heartbeat-seconds 3600)
+        (health nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-health)
+               (lambda (hour key value) (push (list hour key value) health)))
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (&rest _args) nil)))
+      ;; ① 间隔 100 秒 > 20 秒 → 记一次
+      (el-chronos-collect--sample-tick)
+      (should (= 1 (length health)))
+      (let ((entry (car health)))
+        (should (equal "sample-misses" (nth 1 entry)))
+        (should (= 1 (nth 2 entry)))
+        ;; hour-ts 与其它聚合同口径：整点毫秒
+        (should (integerp (nth 0 entry)))
+        (should (= 0 (mod (nth 0 entry) 3600000))))
+      ;; ② 基线已推进 → 紧接着再 tick 不重复记
+      (el-chronos-collect--sample-tick)
+      (should (= 1 (length health)))
+      ;; ③ 首个 tick（基线为 nil）只建立基线、不计 miss
+      (setq el-chronos-collect--last-sample-tick nil
+            health nil)
+      (el-chronos-collect--sample-tick)
+      (should-not health)
+      (should el-chronos-collect--last-sample-tick)
+      ;; ④ start 初始化 / stop 清零（I5）
+      (el-chronos-collect-start)
+      (should el-chronos-collect--last-sample-tick)
+      (el-chronos-collect-stop)
+      (should-not el-chronos-collect--last-sample-tick))))
+
+;;; T6a 启动打点（after-load-functions + 阶段锚点 + top-N）
+
+(defmacro el-chronos-collect-test--with-startup (top-n &rest body)
+  "在干净的启动打点状态下执行 BODY，`el-chronos-startup-top-n' 绑为 TOP-N。
+`after-init-time' 绑为 nil 表示「mode 在 `after-init-hook' 之前启用」（启动尚未结束），
+这是启动打点唯一需要挂钩子的前提。各状态量都 `let' 绑定成新对象，
+避免用例之间互相污染全局 hash / timer。"
+  (declare (indent 1) (debug t))
+  `(let ((el-chronos-startup-top-n ,top-n)
+         (el-chronos-collect--startup-loads (make-hash-table :test #'equal))
+         (el-chronos-collect--startup-last-load-ts nil)
+         (el-chronos-collect--startup-load-count 0)
+         (el-chronos-collect--startup-hook-done nil)
+         (el-chronos-collect--startup-timer nil)
+         (el-chronos-collect--startup-idle-timer nil)
+         (after-init-time nil))
+     ,@body))
+
+(ert-deftest el-chronos-collect-test-startup-instrument-not-installed-when-init-done ()
+  "启动已结束（`after-init-time' 非 nil）时一个启动钩子都不挂、也不注册兜底 timer。
+反向验证的靶子：去掉这层前置判定后，本机这类配置（`(add-hook 'emacs-startup-hook
+#'el-chronos-mode)'）会把**日常加载冒充成启动耗时**。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600)
+        (after-init-time (current-time))
+        (el-chronos-collect--startup-loads (make-hash-table :test #'equal))
+        (el-chronos-collect--startup-timer nil)
+        (el-chronos-collect--startup-idle-timer nil)
+        (el-chronos-collect--startup-hook-done nil)
+        (el-chronos--active-timers nil)
+        (anchors nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (_session phase _ms) (push phase anchors))))
+      (unwind-protect
+          (progn
+            (should (eq t (el-chronos-collect-start)))
+            (should-not (memq #'el-chronos-collect--after-load
+                              after-load-functions))
+            (should-not (memq #'el-chronos-collect--startup-after-init
+                              after-init-hook))
+            (should-not (memq #'el-chronos-collect--startup-on-startup
+                              emacs-startup-hook))
+            (should-not el-chronos-collect--startup-timer)
+            (should-not el-chronos-collect--startup-idle-timer)
+            ;; 只记 `mode-start' 锚点，不倒填 after-init / startup
+            (should (equal '(mode-start) anchors)))
+        (el-chronos-collect-stop)))))
+
+(ert-deftest el-chronos-collect-test-startup-instrument-installs-when-startup-pending ()
+  "启动未结束时挂钩子 + 注册 30 秒兜底 timer；`collect-stop' 全部摘净（I5）。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((el-chronos-heartbeat-seconds 3600)
+          (el-chronos-sample-window-seconds 3600)
+          (el-chronos--active-timers nil)
+          (anchors nil))
+      (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase _ms) (push phase anchors))))
+        (unwind-protect
+            (progn
+              (should (eq t (el-chronos-collect-start)))
+              (should (memq #'el-chronos-collect--after-load
+                            after-load-functions))
+              (should (memq #'el-chronos-collect--startup-after-init
+                            after-init-hook))
+              (should (memq #'el-chronos-collect--startup-on-startup
+                            emacs-startup-hook))
+              (should (timerp el-chronos-collect--startup-timer))
+              (should (memql el-chronos-collect--startup-timer timer-list))
+              (should (equal '(mode-start) anchors)))
+          (el-chronos-collect-stop))
+        ;; 停止后零残留
+        (should-not (memq #'el-chronos-collect--after-load after-load-functions))
+        (should-not (memq #'el-chronos-collect--startup-after-init after-init-hook))
+        (should-not (memq #'el-chronos-collect--startup-on-startup
+                          emacs-startup-hook))
+        (should-not el-chronos-collect--startup-timer)
+        (should-not el-chronos-collect--startup-idle-timer)
+        (should-not el-chronos-collect--startup-last-load-ts)
+        (should (= 0 el-chronos-collect--startup-load-count))
+        (should (= 0 (hash-table-count el-chronos-collect--startup-loads)))))))
+
+(ert-deftest el-chronos-collect-test-startup-after-load-accumulates ()
+  "首次只建基线（不记录）；之后把与上次的时间差累加到本次 load 的文件名下。
+库名从 `after-load-functions' 的文件名剥目录与扩展名：`.el' / `.elc' / `.eln' 一致。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((now 100.0))
+      (cl-letf (((symbol-function 'float-time) (lambda () now)))
+        ;; ① 首次：只建基线，不产生记录（否则第一条带上「mode 启动到首次 load」的间隔）
+        (el-chronos-collect--after-load "/x/a.el")
+        (should-not (gethash "a" el-chronos-collect--startup-loads))
+        (should (= 0 el-chronos-collect--startup-load-count))
+        (should (= 100.0 el-chronos-collect--startup-last-load-ts))
+        ;; ② `.elc' → 500ms
+        (setq now 100.5)
+        (el-chronos-collect--after-load "/y/b.elc")
+        (should (= 500.0 (gethash "b" el-chronos-collect--startup-loads)))
+        ;; ③ `.eln' → 250ms，同库第二次触发时**累加**
+        (setq now 100.75)
+        (el-chronos-collect--after-load "/z/c.eln")
+        (setq now 101.0)
+        (el-chronos-collect--after-load "/z/c.eln")
+        (should (= 500.0 (gethash "c" el-chronos-collect--startup-loads)))
+        (should-not (gethash "a" el-chronos-collect--startup-loads))
+        (should (= 2 (hash-table-count el-chronos-collect--startup-loads)))
+        (should (= 3 el-chronos-collect--startup-load-count))))))
+
+(ert-deftest el-chronos-collect-test-startup-finish-writes-top-n ()
+  "10 条记录、top-n = 2 → 只写最大的 2 条；top-n 为 0 时一条明细都不写。
+截断必须发生在**写库前**（内存记全量），否则「保留 top-N」会变成「只采 top-N」。"
+  (el-chronos-collect-test--with-startup 2
+    (dotimes (i 10)
+      (puthash (format "lib%d" i) (* 10.0 (1+ i))
+               el-chronos-collect--startup-loads))
+    (should (= 10 (hash-table-count el-chronos-collect--startup-loads)))
+    (let ((written nil))
+      (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase ms) (push (cons phase ms) written))))
+        (el-chronos-collect--startup-finish)
+        (setq written (nreverse written))
+        (should (= 2 (length written)))
+        (should (equal '("load:lib9" "load:lib8")
+                       (mapcar #'car written)))
+        (should (equal '(100.0 90.0) (mapcar #'cdr written)))
+        ;; 收尾后内存清空（I5）
+        (should (= 0 (hash-table-count el-chronos-collect--startup-loads))))
+      ;; top-n 为 0 → 不记明细（只记锚点）
+      (let ((el-chronos-startup-top-n 0)
+            (more nil))
+        (puthash "lib-x" 1.0 el-chronos-collect--startup-loads)
+        (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+                   (lambda (&rest args) (push args more))))
+          (el-chronos-collect--startup-finish))
+        (should-not more)
+        (should (= 0 (hash-table-count el-chronos-collect--startup-loads)))))))
+
+(ert-deftest el-chronos-collect-test-startup-finish-removes-hook-and-timer ()
+  "`--startup-finish' 摘钩、取消 timer（并从登记表摘除）、清空内存状态。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((timer (run-with-timer 3600 nil #'ignore)))
+      (unwind-protect
+          (progn
+            (add-hook 'after-load-functions #'el-chronos-collect--after-load)
+            (setq el-chronos-collect--startup-timer timer
+                  el-chronos-collect--startup-last-load-ts 123.0
+                  el-chronos-collect--startup-load-count 7
+                  el-chronos--active-timers (list timer))
+            (puthash "foo" 5.0 el-chronos-collect--startup-loads)
+            (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+                       (lambda (&rest _args) nil)))
+              (el-chronos-collect--startup-finish))
+            (should-not (memq #'el-chronos-collect--after-load
+                              after-load-functions))
+            (should-not el-chronos-collect--startup-timer)
+            (should-not (memql timer timer-list))
+            (should-not (memql timer el-chronos--active-timers))
+            (should-not el-chronos-collect--startup-last-load-ts)
+            (should (= 0 el-chronos-collect--startup-load-count))
+            (should (= 0 (hash-table-count el-chronos-collect--startup-loads))))
+        (ignore-errors (cancel-timer timer))))))
+
+(ert-deftest el-chronos-collect-test-startup-finish-idempotent ()
+  "连调两次 `--startup-finish'：不报错、不重复写、不重复清。"
+  (el-chronos-collect-test--with-startup 50
+    (puthash "foo" 12.0 el-chronos-collect--startup-loads)
+    (let ((written nil))
+      (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase ms) (push (cons phase ms) written))))
+        (el-chronos-collect--startup-finish)
+        (should (= 1 (length written)))
+        (should (equal "load:foo" (caar written)))
+        (should (= 12.0 (cdar written)))
+        ;; 第二次：钩子已摘、timer 已取消、hash 已空 → 一条都不写
+        (el-chronos-collect--startup-finish)
+        (should (= 1 (length written)))))))
+
+(ert-deftest el-chronos-collect-test-startup-load-count-limit-triggers-finish ()
+  "累计 load 次数达到 `4 × el-chronos-startup-top-n' 时自动摘钩收尾
+（模拟 `emacs-startup-hook' 永不触发：这条上限是防「无限累积」的确定性下界）。"
+  (el-chronos-collect-test--with-startup 2      ; 上限 8 次
+    (let ((now 0.0)
+          (written nil))
+      (cl-letf (((symbol-function 'float-time) (lambda () now))
+                ((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase ms) (push (cons phase ms) written))))
+        (add-hook 'after-load-functions #'el-chronos-collect--after-load)
+        ;; 1 次建基线 + 7 次记录 = count 7，尚未到上限
+        (dotimes (_ 8)
+          (setq now (+ now 0.01))
+          (el-chronos-collect--after-load "/x/lib.el"))
+        (should (= 7 el-chronos-collect--startup-load-count))
+        (should (memq #'el-chronos-collect--after-load after-load-functions))
+        (should-not written)
+        ;; 第 8 次记录：count = 8 = 4 × 2 → 自动收尾并落库
+        (setq now (+ now 0.01))
+        (el-chronos-collect--after-load "/x/lib.el")
+        (should-not (memq #'el-chronos-collect--after-load after-load-functions))
+        (should (= 1 (length written)))
+        (should (equal "load:lib" (caar written)))
+        (should (= 80.0 (cdar written)))        ; 8 次 × 10ms
+        (should (= 0 el-chronos-collect--startup-load-count))
+        (should (= 0 (hash-table-count el-chronos-collect--startup-loads)))))))
+
+(ert-deftest el-chronos-collect-test-startup-anchor-records-three-phases ()
+  "三个确定性锚点各自算出相对 `before-init-time' 的毫秒偏移并交给 store；
+`before-init-time' 不存在（交互式启动后的会话）时跳过且不报错、不倒填。"
+  (let ((before-init-time (time-subtract (current-time) 2))
+        (phases nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (_session phase ms) (push (cons phase ms) phases))))
+      (el-chronos-collect--startup-anchor 'mode-start)
+      (el-chronos-collect--startup-anchor 'after-init)
+      (el-chronos-collect--startup-anchor 'startup))
+    (should (= 3 (length phases)))
+    (should (equal '(startup after-init mode-start) (mapcar #'car phases)))
+    (dolist (entry phases)
+      (should (floatp (cdr entry)))
+      (should (>= (cdr entry) 2000.0))))
+  ;; `before-init-time' 为 nil → 不记、不报错
+  (let ((before-init-time nil)
+        (phases nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (&rest args) (push args phases))))
+      (should-not (el-chronos-collect--startup-anchor 'mode-start)))
+    (should-not phases)))
+
+;;; T6b 启动耗时补写（after-init 钩子）+ collect-stop 顺序
+
+(ert-deftest el-chronos-collect-test-startup-after-init-captures-startup-ms-without-io ()
+  "`after-init' 回调把 before/after-init 的差值登记为 pending，且**一次 sqlite 调用都没有**。
+锁住「启动期零 IO」：若回调里直接 `sqlite-execute'（最坏受 busy_timeout=2000ms 拖累），
+本用例的 `sqlite-calls' 断言必红；若忘了把 pending 交给 store，第二组断言必红。"
+  (let ((el-chronos-startup-top-n 50)
+        (before-init-time (time-subtract (current-time) 3))
+        (after-init-time (time-subtract (current-time) 1))
+        (el-chronos-store--db :fake-db)
+        (el-chronos--session-id 7)
+        (el-chronos-store--pending-startup-ms nil)
+        (sqlite-calls 0)
+        (anchors nil))
+    (cl-letf (((symbol-function 'sqlite-execute)
+               (lambda (&rest _args) (cl-incf sqlite-calls) 0))
+              ((symbol-function 'sqlite-select)
+               (lambda (&rest _args) (cl-incf sqlite-calls) nil))
+              ((symbol-function 'sqlite-open)
+               (lambda (&rest _args) (cl-incf sqlite-calls) :fake-db))
+              ((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (_session phase _ms) (push phase anchors))))
+      (el-chronos-collect--startup-after-init))
+    ;; ① 零 IO
+    (should (= 0 sqlite-calls))
+    ;; ② pending 已置，值 ≈ 2000ms（3 秒前 → 1 秒前）
+    (should el-chronos-store--pending-startup-ms)
+    (should (< 1900.0 el-chronos-store--pending-startup-ms 2100.0))
+    ;; ③ 锚点照记、钩子已自摘
+    (should (equal '(after-init) anchors))
+    (should-not (memq #'el-chronos-collect--startup-after-init after-init-hook))))
+
+(ert-deftest el-chronos-collect-test-startup-after-init-skips-when-times-missing ()
+  "`before-init-time' / `after-init-time' 任一为 nil 时不置 pending、不报错（只记锚点）。
+后者属防御性判断：正常情况下本钩子只在 `after-init-time' 为 nil 时才会被挂上。"
+  (let ((el-chronos-store--db :fake-db)
+        (el-chronos--session-id 7)
+        (el-chronos-store--pending-startup-ms nil)
+        (anchors nil))
+    (cl-letf (((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (_session phase _ms) (push phase anchors)))
+              ((symbol-function 'sqlite-execute)
+               (lambda (&rest _args) (ert-fail "不应有 sqlite 调用"))))
+      ;; ① `before-init-time' 缺失（交互式启动后的会话）：锚点与 pending 都不产出
+      (let ((before-init-time nil)
+            (after-init-time (current-time)))
+        (should-not (el-chronos-collect--startup-after-init))
+        (should-not el-chronos-store--pending-startup-ms))
+      (should-not anchors)
+      ;; ② `after-init-time' 缺失：算不出差值，pending 保持 nil，也不报错
+      (let ((before-init-time (time-subtract (current-time) 2))
+            (after-init-time nil))
+        (should-not (el-chronos-collect--startup-after-init))
+        (should-not el-chronos-store--pending-startup-ms))
+      ;; ② 的锚点照记（`before-init-time' 在，只是终点还没到）
+      (should (equal '(after-init) anchors)))))
+
+(ert-deftest el-chronos-collect-test-collect-stop-removes-startup-hooks-before-sample-tick ()
+  "`collect-stop' 必须**先摘启动钩子**再跑 `--sample-tick' 收尾（顺序即语义）。
+在 `--sample-tick' 被调用的那一刻检查两个 hook：若清理被挪到它之后，
+补写 / 计时回调就会在「正在关闭」的会话上再触发一次 —— 本用例必红。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600)
+        (el-chronos--active-timers nil)
+        (el-chronos-collect--startup-loads (make-hash-table :test #'equal))
+        (el-chronos-collect--startup-timer nil)
+        (el-chronos-collect--startup-idle-timer nil)
+        (observed nil))
+    ;; batch 下 `after-init-time' 非 nil → `collect-start' 不会挂启动钩子；
+    ;; 此处手工挂回去，让「摘钩位置」单独被测，不依赖启动是否真的未结束。
+    (add-hook 'after-load-functions #'el-chronos-collect--after-load)
+    (add-hook 'after-init-hook #'el-chronos-collect--startup-after-init)
+    (setq el-chronos-collect--sampling-p t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'el-chronos-collect--sample-tick)
+                   (lambda ()
+                     (setq observed
+                           (list :after-load
+                                 (and (memq #'el-chronos-collect--after-load
+                                            after-load-functions)
+                                      t)
+                                 :after-init
+                                 (and (memq #'el-chronos-collect--startup-after-init
+                                            after-init-hook)
+                                      t))))))
+          (el-chronos-collect-stop))
+      (setq el-chronos-collect--sampling-p nil)
+      (el-chronos-collect-stop))
+    (should (equal '(:after-load nil :after-init nil) observed))))
+
+(ert-deftest el-chronos-collect-test-collect-stop-startup-cleanup-complete ()
+  "`collect-stop' 后启动打点零残留（I5）：钩子摘净、两个 timer 取消、状态量归零、hash 清空。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600)
+        (el-chronos-collect--sampling-p nil)
+        (el-chronos--active-timers nil)
+        (el-chronos-collect--startup-loads (make-hash-table :test #'equal))
+        (el-chronos-collect--startup-timer (run-with-timer 3600 nil #'ignore))
+        (el-chronos-collect--startup-idle-timer
+         (run-with-idle-timer 3600 nil #'ignore))
+        (el-chronos-collect--startup-hook-done t)
+        (el-chronos-collect--startup-load-count 5)
+        (el-chronos-collect--startup-last-load-ts 12.0))
+    (let ((normal-timer el-chronos-collect--startup-timer)
+          (idle-timer el-chronos-collect--startup-idle-timer))
+      (puthash "lib" 3.0 el-chronos-collect--startup-loads)
+      (add-hook 'after-load-functions #'el-chronos-collect--after-load)
+      (add-hook 'after-init-hook #'el-chronos-collect--startup-after-init)
+      (add-hook 'emacs-startup-hook #'el-chronos-collect--startup-on-startup)
+      (setq el-chronos--active-timers (list normal-timer idle-timer))
+      (el-chronos-collect-stop)
+      (should-not (memq #'el-chronos-collect--after-load after-load-functions))
+      (should-not (memq #'el-chronos-collect--startup-after-init after-init-hook))
+      (should-not (memq #'el-chronos-collect--startup-on-startup
+                        emacs-startup-hook))
+      (should-not (memql normal-timer timer-list))
+      (should-not (memql idle-timer timer-list))
+      (should-not (memql normal-timer el-chronos--active-timers))
+      (should-not (memql idle-timer el-chronos--active-timers))
+      (should-not el-chronos-collect--startup-timer)
+      (should-not el-chronos-collect--startup-idle-timer)
+      (should-not el-chronos-collect--startup-hook-done)
+      (should-not el-chronos-collect--startup-last-load-ts)
+      (should (= 0 el-chronos-collect--startup-load-count))
+      (should (= 0 (hash-table-count el-chronos-collect--startup-loads))))))
+
 (provide 'el-chronos-collect-test)
 
 ;;; el-chronos-collect-test.el ends here

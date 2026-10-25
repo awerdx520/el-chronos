@@ -18,9 +18,11 @@
   其 `total_ms` 占全部样本 98.7%，任何基于 `hourly_functions` 的新增查询（本期 T7 的 GC 趋势、
   T8 的 GC 与内存节）都会被那个污染带偏。
 - 已完成：T1（schema v2 + `purge` 扩表 + 外键修复）✅ / T2（store 写入层 + `startup_ms` 补写 +
-  孤儿会话守卫）✅ / T3（变更标记）✅ / T4（GC 与内存采集）✅ / T7a（`gc-trend` 查询 +
-  报告「GC 与内存」节，基线 153 → 159 用例）✅
-- 下一步：T8 剩余节（采集健康 / 启动分解）或 T9（Web 路由），之后 T5 / T6
+  孤儿会话守卫）✅ / T3（变更标记）✅ / T4（GC 与内存采集）✅ / T5（采集器自监控）✅ /
+  T6（启动打点：`after-load-functions` 近似归因 + 3 个确定性锚点 + top-N 明细 +
+  `startup_ms` 补写钩子 + `collect-stop` 顺序重排；基线 167 → 179 用例）✅ /
+  T7a（`gc-trend` 查询 + 报告「GC 与内存」节，基线 153 → 159 用例）✅
+- 下一步：T7b–T10（analysis 剩余查询 → 报告 3 节 → Web 路由 → 文档同步与归档）
 
 ## 目标
 
@@ -597,7 +599,7 @@ packed-refs 回退是必需路径。
   `make test` 全绿。
   （依赖：T2）
 
-- [ ] **T6 启动打点（after-load-functions + 阶段锚点 + top-N）**
+- [x] **T6 启动打点（after-load-functions + 阶段锚点 + top-N）**
   改动文件：`/home/thomas/Workspace/el-chronos/el-chronos.el`（defcustom
   `el-chronos-startup-top-n`）、`/home/thomas/Workspace/el-chronos/el-chronos-collect.el`、
   `/home/thomas/Workspace/el-chronos/test/el-chronos-collect-test.el`

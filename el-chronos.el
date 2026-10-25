@@ -71,6 +71,17 @@
   :type '(integer :tag "采样窗口数")
   :group 'el-chronos)
 
+(defcustom el-chronos-startup-top-n 50
+  "启动加载明细保留的条数上限。
+启动期包加载耗时（`load:<library>'）在**内存里保存全部记录**，只在**写库前**
+按毫秒降序截断到该条数 —— 一次启动通常几百条记录，全量入库只会让
+`startup_phases' 行数膨胀，而明细的用处集中在头部。
+`0' 或 nil 表示**不记录包加载明细**（只记 `mode-start' / `after-init' /
+`startup' 等阶段锚点）：截断成 0 条，不再写任何 `load:*' 行。"
+  :type '(choice (natnum :tag "条数")
+                 (const :tag "不记录包加载明细" nil))
+  :group 'el-chronos)
+
 (defcustom el-chronos-heartbeat-seconds 1
   "心跳定时器间隔，单位秒。
 心跳用于检测「命令之外的主线程阻塞」：比较相邻两次触发的实际间隔，

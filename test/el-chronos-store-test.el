@@ -303,12 +303,24 @@ AUTOINCREMENT，SQLite 会额外建 `sqlite_sequence'。"
                      (apply original db sql args)))))
         ;; 失败只降级为告警，不抛错
         (should-not (el-chronos-store-flush)))
-      (should-not (el-chronos-store--pending-p))
+      ;; T5 起 `--pending-p' 在失败后**仍为真**，但唯一原因是 `--flush-failures' = 1
+      ;; 有待补写（eventual 语义：写库失败时无法记录失败本身，只能留内存等下一轮）。
+      ;; 旧断言 `(should-not (pending-p))` 因此失效 —— 那是「本批数据已丢弃」的等价说法，
+      ;; 而现在 `--pending-p' 还承载「有自监控计数没进库」。数据层面的断言全部保留在下面。
+      (should (= 1 el-chronos-store--flush-failures))
+      (should (el-chronos-store--pending-p))
       (should-not el-chronos-store--buffer)
       (should-not el-chronos-store--slow-events)
       (should (= 0 (hash-table-count el-chronos-store--usage)))
       (should (= 0 (hash-table-count el-chronos-store--functions)))
       (should (= 0 (hash-table-count el-chronos-store--stacks)))
+      ;; 其余 4 个自监控计数器一分不减（丢弃量没发生、成功的 flush 次数与耗时不变）
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 0 el-chronos-store--dropped-events))
+      (should (= 0 el-chronos-store--flush-count))
+      (should (= 0.0 el-chronos-store--flush-ms-total))
+      ;; 失败时库中没有任何 health 行（写库本身就是失败的那件事）
+      (should (= 0 (el-chronos-test--count "hourly_health")))
       ;; 事务已回滚，明细表没有半批数据
       (should (= 0 (el-chronos-test--count "commands")))
       (should (= 0 (el-chronos-test--count "slow_events"))))))
@@ -805,6 +817,166 @@ fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init �
       (should (= 0 (hash-table-count el-chronos-store--gc)))
       (should (= 0 (hash-table-count el-chronos-store--health)))
       (should (= 0 (hash-table-count el-chronos-store--startup)))
+      (should-not (el-chronos-store--pending-p)))))
+
+;;; 自监控计数（T5）
+
+(ert-deftest el-chronos-store-test-flush-counter-not-cleared-by-clear-aggregates ()
+  "直接调 `--clear-aggregates' 后 5 个自监控计数器**一个也不变**。
+这是「独立 defvar」的反向验证正面形态：一旦把它们塞进被清空的容器
+（`--usage' / `--health' ... 或直接挂 `--buffer' / `--slow-events'），本用例必红 ——
+那正是「flush 失败把失败计数一并抹掉」的退化路径，也是设计 §6「已知悖论」的核心陷阱。"
+  (el-chronos-test-with-db
+    (setq el-chronos-store--dropped-commands 3
+          el-chronos-store--dropped-events 2
+          el-chronos-store--flush-failures 1
+          el-chronos-store--flush-count 4
+          el-chronos-store--flush-ms-total 12.5)
+    (el-chronos-store--clear-aggregates)
+    (should (= 3 el-chronos-store--dropped-commands))
+    (should (= 2 el-chronos-store--dropped-events))
+    (should (= 1 el-chronos-store--flush-failures))
+    (should (= 4 el-chronos-store--flush-count))
+    (should (= 12.5 el-chronos-store--flush-ms-total))
+    ;; 对照断言：本批数据容器确实被清空了（证明函数真的跑过，不是被 cl-letf 掉）
+    (should (= 0 (hash-table-count el-chronos-store--health)))
+    (should-not el-chronos-store--slow-events)))
+
+(ert-deftest el-chronos-store-test-dropped-commands-counted-by-difference ()
+  "命令缓冲超 `--max-buffer-items' 时 `--dropped-commands' 等于溢出条数。
+用 `cl-letf' 把上限压到 2（真实上限 50000，撑满它要 5 万条且毫无额外信息），
+再推 5 条 → 丢 3 条。差值口径（截断前长度 − 上限）在当前「每次推一条」的实现下
+恒为 1，本用例同时验证**累计**正确（3 次截断 = 3）。"
+  (el-chronos-test-with-db
+    (cl-letf (((symbol-value 'el-chronos-store--max-buffer-items) 2))
+      (dotimes (i 5)
+        (el-chronos-store-record-command
+         (list :name (format "c%d" i) :duration-ms 1.0)))
+      (should (= 3 el-chronos-store--dropped-commands))
+      (should (= 2 (length el-chronos-store--buffer)))
+      ;; 慢事件计数器不受影响（按 SLOT 分流）
+      (should (= 0 el-chronos-store--dropped-events)))))
+
+(ert-deftest el-chronos-store-test-dropped-events-counted-separately ()
+  "慢事件缓冲截断只累加 `--dropped-events'，`--dropped-commands' 不变。
+锁住 `--push-event' 里的 SLOT 分流：同一函数服务两个缓冲，不分流就会把慢事件
+记进命令计数（「命令丢了多少」从此不可信）。"
+  (el-chronos-test-with-db
+    (cl-letf (((symbol-value 'el-chronos-store--max-buffer-items) 1))
+      (dotimes (_ 4)
+        (el-chronos-store-record-slow-event (list :duration-ms 900.0 :kind "block")))
+      (should (= 3 el-chronos-store--dropped-events))
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 1 (length el-chronos-store--slow-events))))))
+
+(ert-deftest el-chronos-store-test-flush-reports-counters-and-resets-after-commit ()
+  "flush 在事务内把计数器快照写进 `hourly_health'，COMMIT 后把已上报部分减掉；
+`flush-count' / `flush-ms' **滞后一个周期**上报（本次 flush 只进下一次快照）。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (setq el-chronos-store--dropped-commands 3
+            el-chronos-store--dropped-events 2
+            el-chronos-store--flush-failures 1)
+      (should (el-chronos-store-flush))
+      ;; 三个「有数据没进库」性质的计数已上报
+      (should (= 3 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'dropped-commands'")))
+      (should (= 2 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'dropped-events'")))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'flush-failures'")))
+      ;; 上报后归零（减去已上报部分）
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 0 el-chronos-store--dropped-events))
+      (should (= 0 el-chronos-store--flush-failures))
+      ;; 本次 flush 的 count / ms 在快照之后才写入计数器 → 库里**还没有**它们
+      (should (= 1 el-chronos-store--flush-count))
+      (should (> el-chronos-store--flush-ms-total 0.0))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM hourly_health WHERE key = 'flush-count'")))
+      ;; 第二次 flush（用一条待写数据驱动）→ 上一轮的 count / ms 被带上
+      (el-chronos-store-record-health hour "sample-misses" 1)
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'flush-count'")))
+      (should (> (el-chronos-test--scalar
+                  "SELECT value FROM hourly_health WHERE key = 'flush-ms'")
+                 0.0))
+      ;; 上报后仍是 1（减去已上报的 1，再加本次的 1 —— 不是归零，也不是累加到 2）
+      (should (= 1 el-chronos-store--flush-count)))))
+
+(ert-deftest el-chronos-store-test-flush-failure-keeps-counters ()
+  "flush 中途报错 → 计数器**一分不减**、`--flush-failures' +1、库中无 health 行；
+下一次成功 flush 才把失败次数与丢弃量一起补写（eventual 语义）。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (setq el-chronos-store--dropped-commands 3
+            el-chronos-store--dropped-events 2)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (error "mock commit failure")
+                     (apply original db sql args)))))
+        ;; 失败只降级为告警，不抛错
+        (should-not (el-chronos-store-flush))))
+    (should (= 1 el-chronos-store--flush-failures))
+    (should (= 3 el-chronos-store--dropped-commands))
+    (should (= 2 el-chronos-store--dropped-events))
+    (should (= 0 el-chronos-store--flush-count))
+    (should (= 0.0 el-chronos-store--flush-ms-total))
+    ;; 写库本身就是失败的那件事 → 库里一行 health 都没有
+    (should (= 0 (el-chronos-test--count "hourly_health")))
+    ;; 下一次成功 flush 补写（`--flush-failures' 已在 `--pending-p' 里，故不会早退）
+    (should (el-chronos-store-flush))
+    (should (= 3 (el-chronos-test--scalar
+                  "SELECT value FROM hourly_health WHERE key = 'dropped-commands'")))
+    (should (= 1 (el-chronos-test--scalar
+                  "SELECT value FROM hourly_health WHERE key = 'flush-failures'")))
+    (should (= 0 el-chronos-store--flush-failures))))
+
+(ert-deftest el-chronos-store-test-close-clears-counters ()
+  "`store-close' 清空 5 个自监控计数器，且**不依赖** `--clear-aggregates'（两者分离）。
+做两件事让「close 清零」不与「flush 上报后归零」混淆：① 关句柄使 close 首行的 flush
+早退（否则计数会被正常上报）；② 把 `--clear-aggregates' 整个 cl-letf 成空操作。"
+  (el-chronos-test-with-db
+    (setq el-chronos-store--dropped-commands 3
+          el-chronos-store--dropped-events 2
+          el-chronos-store--flush-failures 1
+          el-chronos-store--flush-count 4
+          el-chronos-store--flush-ms-total 12.5)
+    (cl-letf (((symbol-function 'el-chronos-store--clear-aggregates)
+               (lambda (&rest _args) nil))
+              ;; 句柄置 nil → close 首行 `(ignore-errors (flush))' 因 `--pending-p' 门
+              ;; 的 db 判定直接早退，计数器不被上报
+              ((symbol-value 'el-chronos-store--db) nil))
+      (el-chronos-store-close))
+    (should (= 0 el-chronos-store--dropped-commands))
+    (should (= 0 el-chronos-store--dropped-events))
+    (should (= 0 el-chronos-store--flush-failures))
+    (should (= 0 el-chronos-store--flush-count))
+    (should (= 0.0 el-chronos-store--flush-ms-total))))
+
+(ert-deftest el-chronos-store-test-pending-p-ignores-flush-count ()
+  "只有 `--flush-count' / `--flush-ms-total' 非零时 `--pending-p' 必须为 nil。
+反向验证（L3 第②项）：把这两个纳入 `--pending-p' → 本用例必红。
+为什么必须排除：它们每次成功 flush 之后都非零且单调增长，纳入后 `--pending-p' 恒真 →
+flush timer 每 5 秒空转一次事务，且 `flush-count' 被自己的上报行为无限推高（永不归零）。
+本用例用**真实**的连续两次 flush 构造场景，而不是手工 setq（那样测不出真实路径）。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-store-record-health hour "sample-misses" 1)
+      (should (el-chronos-store-flush))
+      (el-chronos-store-record-health hour "sample-misses" 1)
+      (should (el-chronos-store-flush))
+      ;; 此刻：所有数据容器空，只有 flush-count / flush-ms-total 非零
+      (should (> el-chronos-store--flush-count 0))
+      (should (> el-chronos-store--flush-ms-total 0.0))
+      (should (equal 0 (hash-table-count el-chronos-store--health)))
+      (should-not el-chronos-store--buffer)
+      (should-not el-chronos-store--slow-events)
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 0 el-chronos-store--dropped-events))
+      (should (= 0 el-chronos-store--flush-failures))
       (should-not (el-chronos-store--pending-p)))))
 
 ;;; startup_ms 补写与孤儿会话守卫（T2b）
