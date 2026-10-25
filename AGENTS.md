@@ -17,7 +17,7 @@
 
 **非目标**：自动调优/自动禁用功能、跨机器数据汇聚、源码行级采样、记录按键序列与文件内容。
 
-当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **199** 用例全绿、0 skipped，`make lint` 零告警）。
+当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **200** 用例全绿、0 skipped，`make lint` 零告警）。
 观测面已从「时间」扩展到「时间 + 内存/GC + 启动 + 配置变更」（ADR-0004）：schema v2 增 4 表（共 10 表）、
 GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-sig` 变更标记、采集器自监控（`hourly_health`）。
 7 个源码模块 + 7 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
@@ -29,21 +29,21 @@ GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-s
 
 | 路径 | 用途 | 行数 / 状态 |
 |---|---|---|
-| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 339 行（T2、T3/T4/T6 新增 defcustom） |
+| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 340 行（T2、T3/T4/T6 新增 defcustom） |
 | `el-chronos-collect.el` | 命令计时、心跳阻塞检测（含 D1 双跑去重）、profiler 窗口聚合、GC / 堆采样、启动打点、自监控计数 | 1246 行（T5a–c、T4、T5、T6） |
 | `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 342 行（T3） |
-| `el-chronos-store.el` | SQLite schema（v2，10 表 + 3 索引）、批量 flush、保留策略、top-N 淘汰、purge | 1334 行（T4、T1–T3） |
-| `el-chronos-analysis.el` | 17 个只读聚合查询（热点/慢命令/阻塞/包归因/趋势/热力/栈/会话/回归/GC/启动/健康/配置变更） | 758 行（T6、T7a–b） |
+| `el-chronos-store.el` | SQLite schema（v2，10 表 + 3 索引）、批量 flush、保留策略、top-N 淘汰、purge | 1335 行（T4、T1–T3） |
+| `el-chronos-analysis.el` | 17 个只读聚合查询（热点/慢命令/阻塞/包归因/趋势/热力/栈/会话/回归/GC/启动/健康/配置变更） | 761 行（T6、T7a–b） |
 | `el-chronos-report.el` | org 报告（14 节）、周报、CSV/JSON 导出、按需高精度剖析、报告期间自观测抑制 | 1072 行（T7、T8、T11） |
 | `el-chronos-web.el` | 最小 HTTP server（17 条路由 = 1 页 + 16 条只读 GET API）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1022 行（T9） |
-| `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 197 行 |
+| `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 198 行 |
 | `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史） | 640 行 / 27 用例 |
 | `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 371 行 / 28 用例 |
 | `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控 | 1204 行 / 49 用例 |
-| `test/el-chronos-report-test.el` | org 报告 14 节、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0 | 663 行 / 31 用例 |
+| `test/el-chronos-report-test.el` | org 报告 14 节、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 716 行 / 32 用例 |
 | `test/el-chronos-store-test.el` | schema/迁移（v1→v2 与回滚）/批量写入/保留策略/top-N 淘汰/purge 10 表/`note-startup-ms` 补写 | 1269 行 / 47 用例 |
 | `test/el-chronos-web-test.el` | 内嵌 Web server（启停/路由/边界/loopback/自观测抑制/四个 v2 端点） | 442 行 / 17 用例 |
-| `docs/architecture.org` | 分层、六条采集路径、可视化数据流、**实测结论**、已知偏差 | 481 行 |
+| `docs/architecture.org` | 分层、六条采集路径、可视化数据流、**实测结论**、已知偏差 | 568 行 |
 | `docs/schema.org` | 最终 DDL（**10 表 + 3 索引**）、迁移 v1→v2、top-N 淘汰 SQL、保留分类、purge 10 表删除顺序 | 515 行 |
 | `docs/ui.org` | 两形态总览（浏览器 Web dashboard + org 报告）、**17 条 Web 路由**、org 报告 **14 节**、性能注意与降级规则 | 196 行 |
 | `docs/api.org` | elisp 对外接口索引（7 个模块、签名单、defcustom 清单、内部函数约定） | 237 行 |
@@ -51,7 +51,7 @@ GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-s
 | `docs/adr/` | `0001-observer-architecture.md`、`0002-dual-visualization.md`（**已被 0003 取代**）、`0003-web-only-visualization.md`（可视化收敛为 Web dashboard + org 报告两形态）、`0004-observation-surface-expansion.md`（观测面扩展到内存/GC/启动/配置变更） | 已完成 |
 | `openspec/` | 计划与决策工件（`active/`、`completed/`、`decisions.md`、`tech-debt.md`） | 已建 |
 | `Makefile` | 验证入口：`check-parens` / `test` / `lint` / `full-check` | 已建 |
-| `Readme.org` / `CHANGELOG.md` | 项目说明与变更日志 | 148 行 / 135 行 |
+| `Readme.org` / `CHANGELOG.md` | 项目说明与变更日志 | 182 行 / 138 行 |
 
 ## 编码约定
 
@@ -141,10 +141,10 @@ make full-check     # check-parens + test
 
 全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。
 
-**当前基线**（实测 2026-10-25，T10b 文档同步时重测）：`make test` = **199 用例**（`Ran 199 tests, 199 results as expected, 0 unexpected`，约 9.3 秒，**0 skipped**）；
-分布：collect 49 / store 47 / report 31 / attrib 28 / analysis 27 / web 17 用例；
-行数：collect 1246 / store 1334 / report 1072 / web 1022 / analysis 758 / attrib 342 / 入口 339（源码 7 模块 **6113 行**）；
-测试：store 1269 / collect 1204 / report 663 / analysis 640 / web 442 / attrib 371 / helper 197（测试 7 文件 **4786 行**）；源码 + 测试合计 **10899 行**。
+**当前基线**（实测 2026-10-25，本次基线回填时重测）：`make test` = **200 用例**（`Ran 200 tests, 200 results as expected, 0 unexpected`，约 12.1 秒，**0 skipped**）；
+分布：collect 49 / store 47 / report 32 / attrib 28 / analysis 27 / web 17 用例；
+行数：collect 1246 / store 1335 / report 1072 / web 1022 / analysis 761 / attrib 342 / 入口 340（源码 7 模块 **6118 行**）；
+测试：store 1269 / collect 1204 / report 716 / analysis 640 / web 442 / attrib 371 / helper 198（测试 7 文件 **4840 行**）；源码 + 测试合计 **10958 行**。
 `make lint` **零告警**（14 个文件逐个字节编译）。新增或修改行为时基线只准上升，改测试要说明原因。
 
 **测试文件命名**：测试文件必须命名为 `test/*-test.el`；`make test` 通过 `$(sort $(wildcard test/*-test.el))` 自动发现该模式并按排序全部加载（无匹配时输出 `no test files` 并成功退出），禁止在 Makefile 里硬编码单个文件名（否则拆分测试后会静默漏跑）。
