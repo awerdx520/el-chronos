@@ -658,6 +658,59 @@ fixture 的两个栈帧符号与命令名——即真的走了 `--event-content'
           (el-chronos-web-stop))))
     (should-not (el-chronos-web-running-p))))
 
+;;; CSV 区块一致性：report 与 web 是两处内联重复实现（TD-19）
+
+(defconst el-chronos-report-test--web-only-csv-sections
+  '("overview" "sessions" "regressions")
+  "Web CSV 有而 report CSV 没有的区块（2026-10-25 实测的两侧真实差异）。
+web 侧 `/api/export.csv' 面向浏览器下载，比 report 侧的 `M-x el-chronos-export-csv'
+多三块：`overview' 是「先看总量」的窄表，`sessions' / `regressions' 是 Web dashboard
+的并列视图。这三块**之外**的区块名与顺序必须两侧完全一致（TD-19 的机械约束）；
+将来若要让 report 也产出它们（或删掉 web 的），改这个常量的同时必须同步
+`el-chronos-report--csv-sections' / `--csv-string'，否则本文件的用例会失败——
+这正是该用例存在的意义。")
+
+(ert-deftest el-chronos-report-test-csv-sections-match-web ()
+  "report 与 web 的 CSV 区块名集合与顺序必须一致（TD-19）。
+两处 CSV 是**内联重复实现**（web 刻意不 require report，见 TD-12 同因），区块名靠人工
+同步，改一侧会静默漂移：浏览器下载的 CSV 与 `M-x el-chronos-export-csv' 的产出变得不同，
+而两侧各自的断言都只认自己那一份，发现不了。
+
+断言分三层：
+  1. 两侧都能解析出区块（正则写错时不能静默通过）；
+  2. web 相对 report 的**差集**恰好是 `--web-only-csv-sections' 那三块（顺序也一致），
+     且 report 无独有块；
+  3. 去掉已知的 web 独有块后，两侧列表 `equal`（顺序一致本身就是有价值的不变量）。
+
+不做的事：只校验区块名与顺序，**不校验表头与列顺序**（那是更细的漂移，留给未来的用例）；
+也不为了通过断言去改产品代码（区块数差异是既成事实，已记录在 TD-19）。"
+  (el-chronos-test-with-db
+    (el-chronos-report-test--seed)
+    (let* ((section-re "^# section: \\(.+\\)$")
+           (names (lambda (csv)
+                    (let (acc pos)
+                      (while (string-match section-re csv pos)
+                        (push (match-string 1 csv) acc)
+                        (setq pos (match-end 0)))
+                      (nreverse acc))))
+           (report-names (funcall names (el-chronos-report--csv-string '7d)))
+           (web-names (funcall names (el-chronos-web--csv-string '7d)))
+           (web-only (cl-remove-if (lambda (name) (member name report-names)) web-names))
+           (report-only (cl-remove-if (lambda (name) (member name web-names)) report-names)))
+      ;; 1. 解析必须有产出
+      (should (> (length report-names) 0))
+      (should (> (length web-names) 0))
+      ;; 2. 差集两侧都可枚举：web 独有块 = 已知三块（顺序一致）；report 无独有块
+      (should (equal el-chronos-report-test--web-only-csv-sections web-only))
+      (should-not report-only)
+      ;; 3. 去掉已知的 web 独有块后逐项相等。失败时 `:form' 会带上两侧的实际列表，
+      ;;    可直接看出是「多了块 / 少了块 / 换了顺序 / 改了名」中的哪一种
+      (should (equal report-names
+                     (cl-remove-if
+                      (lambda (name)
+                        (member name el-chronos-report-test--web-only-csv-sections))
+                      web-names))))))
+
 (provide 'el-chronos-report-test)
 
 ;;; el-chronos-report-test.el ends here
