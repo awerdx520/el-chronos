@@ -55,6 +55,7 @@
 
 ### 变更
 
+- **文档与计划归档**：`docs/schema.org` / `api.org` / `architecture.org` / `ui.org` / `operations.org` 全部同步到 schema v2 与新增观测面（10 表 / 17 路由 / 14 报告节 / 20 defcustom）；`AGENTS.md` 基线与已知边界回填（199 用例）；新增技术债 TD-15～TD-19；计划 `expand-observation-surface.md` 由 `openspec/active/` 归档至 `openspec/completed/`（含「实现期勘误」）。
 - `/api/config-history` 返回最近 50 个会话并附 `total-sessions` / `truncated` 标示；CSV 导出不截断（镜像 org 报告的完整序列）。
 - `/api/health` 的 `ok-p` 显式归一为 JSON 布尔值，避免 `nil` 被序列化成 `null` 而与「未知」混淆。
 - **org 报告节数 11 → 14**：新增「启动分解」「采集健康」「配置变更」三节，位置在「GC 与内存」之后、

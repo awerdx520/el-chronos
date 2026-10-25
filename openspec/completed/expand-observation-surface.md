@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Execute）· 进行中
+- 阶段：Phase 4（Review & Document）· 已完成
 - 修订：2026-10-25 按用户裁决 R1–R10 与「flush 补写」拍板定稿 —— 启动耗时改为
   「`after-init-hook` 只捕获值 + 并入下一次 flush 事务补写」（设计 7
   处置 ③ / T6）、迁移显式事务边界（设计 3 陷阱 2–3 / T1）、自监控计数器独立 defvar 与差值口径
@@ -17,17 +17,22 @@
   已回填 `AGENTS.md`。它必须是前置的原因仍然成立：该计划修复前 nil 帧占 `unknown` 样本的 38.8%、
   其 `total_ms` 占全部样本 98.7%，任何基于 `hourly_functions` 的新增查询（本期 T7 的 GC 趋势、
   T8 的 GC 与内存节）都会被那个污染带偏。
-- **T1–T8 完成 / 剩余 T9（Web）+ T10（文档归档）**；当前基线 `make test` **192 用例**、`make lint` 零告警
+- **T1–T10 全部完成（已归档）**；最终基线 `make test` **199 用例**、`make lint` 零告警
 - 已完成：T1（schema v2 + `purge` 扩表 + 外键修复）✅ / T2（store 写入层 + `startup_ms` 补写 +
   孤儿会话守卫）✅ / T3（变更标记）✅ / T4（GC 与内存采集）✅ / T5（采集器自监控）✅ /
   T6（启动打点：`after-load-functions` 近似归因 + 3 个确定性锚点 + top-N 明细 +
   `startup_ms` 补写钩子 + `collect-stop` 顺序重排；基线 167 → 179 用例）✅ /
   T7a（`gc-trend` 查询 + 报告「GC 与内存」节，基线 153 → 159 用例）✅ /
   T7b（`startup-breakdown` / `health` / `config-history` 三个查询）✅ /
-  T8（报告三节 + 配置变更节，节数 10 → 14；CSV/JSON 导出同步覆盖；基线 179 → 192 用例）✅
-- 剩余：**T9（Web 路由 `/api/gc` / `/api/health` / `/api/startup` + 面板）+ T10（文档同步与归档）**
-- 下一步：T9 → T10（T10 收尾时把本计划归档到 `openspec/completed/`，并按计划文档清单同步
-  `AGENTS.md` / `docs/*.org` / `Readme.org`）
+  T8（报告三节 + 配置变更节，节数 10 → 14；CSV/JSON 导出同步覆盖；基线 179 → 192 用例）✅ /
+  T9（Web 4 条新路由 `/api/gc` / `/api/health` / `/api/startup` / `/api/config-history` +
+  四面板，路由 13 → 17；基线 192 → 199 用例）✅ /
+  T10a（`docs/schema.org` / `api.org` / `architecture.org` / `ui.org` / `operations.org` 五份
+  技术文档同步到 v2 观测面）✅ / T10b（`AGENTS.md` 基线与已知边界回填、隐私边界、错误矩阵；
+  `openspec/tech-debt.md` 新增 TD-15～TD-19）✅ / T10c（剩余过时表述修正、计划归档、
+  引用路径全量更新、最终全量验证与提交）✅
+- 下一步：已归档到 `openspec/completed/expand-observation-surface.md`（本计划无后续任务；
+  遗留的实测数字与 D1 GUI 验证见 `openspec/tech-debt.md`）
 
 ## 目标
 
@@ -813,6 +818,35 @@ packed-refs 回退是必需路径。
 - **Y4（minor）** 影响与代价与 T10 的 `docs/operations.org` 各加一条**直白的物理边界声明**：
   「用 `emacs-startup-hook` 或任何启动结束后开启 mode ⇒ 启动分解只有 `mode-start` 一个锚点、
   无包加载明细；要完整剖析请把加载提前到 `early-init.el`」。
+
+## 实现期勘误（与设计不符之处，以代码为准）
+
+实施过程中以下设计与最终代码不一致，**阅读本计划时以代码与 `docs/*.org` 为准**：
+
+1. **`session_meta` 的 `mode-start` 键未实现**
+   - 设计 4 与注意事项 13 提到 `session_meta` 的 `mode-start`「只作辅助信息」。
+   - **实际**：`mode-start` 是 `startup_phases.phase` 的取值（3 个确定性锚点
+     `mode-start` / `after-init` / `startup` 之一），**不是** `session_meta` 的键；
+     `session_meta` 只写 `git-head` / `config-sig` 两个键（取不到则不写行，Y1 语义）。
+   - 判据：`el-chronos-store-record-session-meta` 的调用点只有这两处；
+     `test/el-chronos-test-helper.el` 的 `el-chronos-test--insert-session-meta` docstring 已同步改正。
+2. **Web 路由数 17（设计写 16）、org 报告节数 14（设计写 13）**
+   - **实际**：`el-chronos-web--routes` 共 **17 条** = 1 条页面路由 + **16 条只读 GET API**
+     （`/api/summary` … `/api/export.csv`）。设计按 16 条计是漏算了随后由 T7b / T9
+     实做的 `/api/config-history`（配置变更）。
+   - **实际**：org 报告共 **14 节**（`^\* ` 标题计数，`test/el-chronos-report-test.el`
+     断言 `= 14`）。设计按 13 节计同样是漏算了「配置变更」节。
+3. **`defcustom` 最终 20 个（占位符已定稿）**
+   - 设计里「全仓 20 个」只是占位符。最终实测 **20 个**（`grep -c "^(defcustom"`）：
+     `el-chronos.el` **18 个** + 历史分散 **2 个**
+     （`el-chronos-collect-notify-blocks` 在 `el-chronos-collect.el`、
+     `el-chronos-profile-save` 在 `el-chronos-report.el`）。
+4. **启动分解的「差值归前一个文件」改为「归当次 `after-load-functions` 的 file」**
+   - 设计 7 表述为「相邻两次回调的差值归**前一个**文件」。
+   - **实际**：`after-load-functions` 在**载入完成之后**触发（钩子收的 FILE 实参就是刚载入完
+     的文件），因此差值语义是「本次触发 − 上次触发 = **这次** load 的耗时」，归属**当次回调的
+     file**。「归前一个文件」只在把回调当作「载入开始」信号时才成立。
+   - 语义不变（仍是近似归因：差值含前一个文件的收尾逻辑与它触发的钩子），仅归属表述修正。
 
 ## 文档清单
 

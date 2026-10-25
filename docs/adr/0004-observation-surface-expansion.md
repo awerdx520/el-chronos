@@ -1,9 +1,9 @@
 # ADR-0004 观测面从「时间」扩展到「时间 + 内存 + 启动 + 配置变更」
 
-- **状态**：Accepted（已接受，待实施 —— 落地任务见 `openspec/active/expand-observation-surface.md`）
+- **状态**：Accepted（已接受，**已实施并归档** —— 落地计划 `openspec/completed/expand-observation-surface.md`，2026-10-25）
 - **日期**：2026-10-25
 - **决策者**：用户（明确要求「内存 / GC / 启动 / 配置变更 / 自监控」五个维度一并补齐）
-- **关联**：`openspec/active/expand-observation-surface.md`（落地计划）、
+- **关联**：`openspec/completed/expand-observation-surface.md`（落地计划）、
   `AGENTS.md` I1 / I3 / I5 / I6 / I10、`docs/schema.org`、
   `openspec/completed/fix-sampling-attribution.md`（前置：采样口径地基，已归档）、`openspec/decisions.md`
 
@@ -272,7 +272,7 @@ I10（资源与依赖内嵌/内置，不引第三方）。
 
 ## 关联
 
-- 落地计划：`openspec/active/expand-observation-surface.md`（T1–T10，含迁移回滚测试要求）
+- 落地计划：`openspec/completed/expand-observation-surface.md`（T1–T10，含迁移回滚测试要求）
 - 前置计划：`openspec/completed/fix-sampling-attribution.md`（nil 帧占 38.8% 样本，**已归档**；
   它必须先完成，否则本 ADR 的 GC/趋势类查询会被污染口径带偏）
 - 决策表：`openspec/decisions.md`（2026-10-25 观测面扩展一行）

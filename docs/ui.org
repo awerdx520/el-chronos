@@ -26,7 +26,7 @@
 
 * 浏览器 Web dashboard（=M-x el-chronos-web-start=）
 
-** 路由表（13 条，全部 GET、只读）
+** 路由表（17 条，全部 GET、只读）
 
 | # | 方法 | 路径 | 参数 | 返回键 |
 |---|---|---|---|---|
@@ -41,8 +41,12 @@
 | 9 | GET | =/api/sessions= | =range= | =range= =limit=（nil）= =items=[{:id :started-at :startup-ms :emacs-version :host}]= |
 | 10 | GET | =/api/blocking= | =range= =limit=（默认 20） | =range= =limit= =items=[{:id :ts :duration-ms :kind :command :mode :project}]= |
 | 11 | GET | =/api/regressions= | =range=（被忽略） =limit=（默认 20） | =range= =limit= =items=[{:function :current-ms :previous-ms :growth :current-samples :previous-samples}]= |
-| 12 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
-| 13 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
+| 12 | GET | =/api/gc= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720） | =range= =bucket-count=（省略为 null）= =bucket-span= =gc-total= =heap-latest= =items=[{:bucket :gc-count :gc-ms :heap-bytes}]= |
+| 13 | GET | =/api/startup= | =session=（正整数；省略/非法 → 取最近一次有启动数据的会话） | =session-id= =started-at= =startup-ms= =phases=[[阶段 耗时]=…]= =loads=[[库 耗时]=…]= |
+| 14 | GET | =/api/health= | =range= | =range= =dropped-commands= =dropped-events= =flush-failures= =flush-count= =flush-ms= =flush-avg-ms= =sample-misses= =ok-p= =rows= |
+| 15 | GET | =/api/config-history= | =range= | =range= =total-sessions= =truncated= =changes= =sessions=[{:id :started-at :git-head :config-sig :changed}]= |
+| 16 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
+| 17 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
 
 约定：
 
@@ -52,21 +56,39 @@
   只有未知路径才 404。非 GET → 405（带 =Allow: GET=），路径不以 =/= 开头 → 400，
   请求头超过 =16384= 字节 → 413。
 
+** 四个新端点（v2）的参数与降级行为
+
+| 端点 | 参数 | 降级行为（I11：可见，不静默） |
+|---|---|---|
+| =/api/gc= | =range=、=buckets= | analysis 返回 nil（库打不开 / 查询失败）→ =:items= 为 =null=，**仍返回 200**，页面显示「（无数据）」。=:heap-bytes= 为 null 表示该桶内**没有任何堆样本**，前端渲染 =−= 而**不是 0**；Emacs < 31.1 时 =:heap-latest= 恒为 null，页面给出「本机 Emacs 不支持堆采样」的说明。本期全为基线桶（=gc-count= / =gc-ms= 全 0）时也给降级说明——基线桶不等于「没有发生 GC」 |
+| =/api/startup= | =session=（正整数） | 省略 / 非数字 / 非正数 → 取**最近一次有启动数据**的会话；提供了但库里没有该会话 → =:session-id= 回填请求的 id、其余键为 null 的**同构空结构**，**不返回 404**（会话可能已被保留策略清理，属正常空结果）；analysis 返回 nil → JSON =null=，页面显示「（无数据）」。页面标题显式标注覆盖范围（自 mode 启动起 X ms / 总 Y ms），无 =mode-start= 时显示 =−= |
+| =/api/health= | =range= | analysis 返回 nil → JSON =null=，页面显示「（无数据）」。**=:rows= 必须先行分支**：=:rows= 为 0 → 「本期无采集数据」；=:rows= > 0 且 =:ok-p= 为 true → 「本期无采集异常（flush N 次，平均 X）」。=:ok-p= 显式归一为 JSON 布尔（analysis 的 nil 会被序列化成 null，而「没有坏消息」是确定的判断，不该与「未知」共用一个值） |
+| =/api/config-history= | =range= | analysis 返回 nil → =:sessions= 为 null、计数为 0 的空结构。**只返回最近 =el-chronos-web--config-history-sessions=（50）个会话**（取尾部）：会话行随每次重启单调增长，全量返回会让单线程 Web 的主线程查询与浏览器渲染一起变长；截断后 =:changes= 按**返回的**会话重算，=:truncated= 显式归一为 JSON 布尔标出截断；保留下来的第一条若 =changed= 为 true，它参照的前一会话已不在列表里（截断的固有代价）。=git-head= / =config-sig= 为 null 表示**未取到**（store 层取不到就不写行），不是「取了但为空」 |
+
+**四个新端点的响应体很小**：以 fixture（3 个 GC 桶 / 6 个健康键 / 3 个阶段锚点 + 3 条包加载 /
+1 个会话）实测，=200= 响应体分别为 **252 / 203 / 184 / 237 字节**，均在 300 字节内；
+=range= 与 =buckets= 变大、会话变多（=config-history= 受 50 封顶）时线性增长，仍属同一量级。
+
 ** 内嵌前端结构
 
-页面结构（=el-chronos-web--markup=，无 CDN、无第三方库）：
+页面结构（=el-chronos-web--markup=，无 CDN、无第三方库）：**14 个 =<section>= 面板 + 顶栏 + 下钻侧栏**
+（v2 新增 4 个面板：GC 与内存 / 启动分解 / 采集健康 / 配置变更，加粗标出）。
 
 | 区块 | DOM | 图表实现 |
 |---|---|---|
 | 顶栏 | =#ranges= 范围按钮、=#refresh=、=#auto=（自动刷新 30s 勾选）、=#csv= 导出链接、=#status= | — |
 | 概览 | =.cards#ov=（6 张卡片） | 纯 HTML |
 | 趋势 | =svg#trend= + =#trend-legend= | 手写 SVG：面积 + 折线（=samples=）+ 柱（=slow-commands=） |
+| **GC 与内存** | =table#t-gc= + =#gc-legend= | 表格 + 图例：每桶 =gc-count= / =gc-ms= / =heap-bytes=；=heap-bytes= 为 null 渲染 =−=（无堆样本），不画成 0 |
+| **启动分解** | =div#startup= | 两张小表：阶段锚点（=mode-start= → =after-init= → =startup= → =first-idle=，缺的跳过）与包加载 TOP；标题标注「自 mode 启动起 X ms / 总 Y ms」 |
 | 包 / 模块占比 | =svg#donut= + =#donut-legend= | 手写 SVG 环形图（=stroke-dasharray=，R=45，前 8 项） |
 | 用法热力 | =.hm#heat=（DOM 网格） | CSS 背景色深浅 + =title= 悬浮提示，命令 ≤20、桶为时间轴 |
 | 慢命令 | =#q-slow= 搜索 + =table#t-slow= | 表格：列排序、分页 10 行 |
 | 热点函数 | =#q-func= 搜索 + =table#t-func= | 同上 |
 | 阻塞事件 | =table#t-block= | 表格 + 行点击下钻 |
 | 回归 | =table#t-reg= | 表格 |
+| **采集健康** | =div#health= | 六个指标 + flush 平均耗时；=rows= 为 0 时显示「本期无采集数据」（不是「无异常」） |
+| **配置变更** | =div#conf= | 表格：会话启动时间 / 提交（前 8 字符）/ 配置指纹（前 8 字符）/ 变化 ✓；截断时标注「仅显示最近 50 个会话」 |
 | 会话 | =table#t-sess= | 表格（多会话对比） |
 | 火焰图 | =svg#flame= + =#flame-legend= | **按层聚合近似**：栈按层级折叠，深度 ≤6 层，宽度按样本数占比 |
 | 下钻侧栏 | =aside#panel=（=#panel-close= / =#panel-body=） | 行点击 → =/api/event= 或本地已取数据渲染 |
@@ -103,7 +125,7 @@
 
 * org 报告（=M-x el-chronos-report=）
 
-10 节，按 =el-chronos-report--content= 的输出顺序：
+14 节，按 =el-chronos-report--content= 的输出顺序：
 
 | # | 节 | 数据来源 | 展示上限 |
 |---|---|---|---|
@@ -112,11 +134,33 @@
 | 3 | 热点函数 TOP | =el-chronos-analysis-top-functions= | 20 行；列：函数/包/self/样本/占比 |
 | 4 | 包归因 | =el-chronos-analysis-package-breakdown= | 不限（unknown 与 GC 恒排末尾） |
 | 5 | 趋势 | =el-chronos-analysis-trend= | 最近 48 桶；列：小时/样本/慢命令/阻塞 |
-| 6 | 阻塞事件 | =el-chronos-analysis-blocking-events= | 20 行；列：时间/时长/命令/mode/project |
-| 7 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
-| 8 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
-| 9 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
-| 10 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+| 6 | GC 与内存 | =el-chronos-analysis-gc-trend= → =--section-gc= | 最近 48 桶；列：小时/GC 次数/GC 耗时/堆大小 |
+| 7 | 启动分解 | =el-chronos-analysis-startup-breakdown= → =--section-startup= | 阶段锚点全列 + 包加载 TOP 10 行 |
+| 8 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 六个指标 + flush 平均耗时 |
+| 9 | 配置变更 | =el-chronos-analysis-config-history= → =--section-config= | 会话全列（哈希各显示前 8 字符） |
+| 10 | 阻塞事件 | =el-chronos-analysis-blocking-events= | 20 行；列：时间/时长/命令/mode/project |
+| 11 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
+| 12 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
+| 13 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
+| 14 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+
+** 四节新节的降级文案（I11：任何情况都不省略整节）
+
+| 节 | 触发条件 | 降级文案（与 =el-chronos-report.el= 的常量逐字一致） |
+|---|---|---|
+| GC 与内存 | 无桶数据，或全部桶的 =gc-count= / =gc-ms= 都是 0（会话首窗口只建基线） | =--gc-degrade=：「本期无 GC 采样数据（Emacs 31.1 以下不采集堆大小）。」整节不省略 |
+| 启动分解 | 无任何启动数据（=:session-id= 为 nil） | 节标题退化为「启动分解」，正文 =--startup-degrade=：「本期无启动分解数据（需在启动结束前启用 =el-chronos-mode=，最早可在 early-init.el 里启用）。」**整节不省略** |
+| 启动分解 | 有 =startup_phases= 但缺 =startup_ms= | 标题里「总 Y ms」显示 =−=，正文补 =--startup-total-degrade=：「（无总启动耗时：该会话的 startup_ms 尚未写入）」 |
+| 启动分解 | 无阶段锚点 | =--startup-phases-degrade=：「（无阶段锚点：mode 启动时启动已结束，只能记录 mode-start 之后的阶段）」 |
+| 启动分解 | 无包加载明细 | =--startup-loads-degrade=：「（无包加载明细：mode 启动时启动已结束，不记录 after-load-functions）」 |
+| 采集健康 | =:rows= 为 0（本期没有 health 行） | 「本期无采集数据（采集器尚未写入健康指标）」——**不许**落到 =:ok-p= 分支（analysis 无数据时同样给 =:ok-p= 为 t，照抄会把「没采集」读成「一切正常」） |
+| 采集健康 | =:rows= > 0 且 =:ok-p= 为 t | 只给一行「本期无采集异常（flush N 次，平均 X）」——「无异常」不等于「无信息」，flush 次数与均值是正常运转的度量 |
+| 采集健康 | 查询失败（analysis 返回 nil） | 空表 + =（无数据）= |
+| 配置变更 | =:sessions= 为空或查询失败 | =--config-degrade=：「本期无会话变更记录（会话启动时未取到 git-head / config-sig，或窗口内没有会话）。」整节不省略 |
+
+口径提醒：启动分解节的**包加载耗时是近似归因**（相邻 =after-load-functions= 回调的时间差），
+且**只覆盖 mode 启动之后**的 load —— 节标题必须如实标注覆盖范围，不许把近似数据冒充全程
+（物理边界与「怎么才能覆盖完整启动」见 [[file:operations.org][docs/operations.org]]「启动分解的物理边界」）。
 
 相关入口：
 
@@ -134,6 +178,7 @@
 | Web 查询 | 列表 =limit= 默认 20、上限 1000；堆栈默认 50 | 单线程串行，长查询会占主线程 |
 | Web 请求上限 | 单请求累积 16384 字节（=el-chronos-web--max-request-bytes=） | 超出返回 413，防畸形请求无限占内存 |
 | Web 前端 | 一次取数 + 本地渲染；自动刷新默认 30s | 关掉自动刷新即零轮询；搜索 / 排序 / 分页均在本地数据上做 |
+| Web 新端点（v2） | =/api/gc= / =/api/startup= / =/api/health= / =/api/config-history= 的响应体实测 252 / 203 / 184 / 237 字节（fixture 见上） | 均 < 300 字节，单线程串行下开销可忽略；=config-history= 由 =el-chronos-web--config-history-sessions= 封顶 50 个会话，防会话数增长拖长查询与渲染 |
 | org 报告 | 慢命令 / 热点函数 / 阻塞 / 回归 / 会话各 20 行；趋势最近 48 桶；栈 10 行 | 报告一次成型、无增量渲染；重查询期间抑制阻塞判定，避免把报告耗时记成假阻塞 |
 
 ** 待实测

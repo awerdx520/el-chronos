@@ -4,9 +4,13 @@
 #+OPTIONS: toc:3 num:nil
 
 #+BEGIN_QUOTE
-状态：**Phase 4（Review & Document），T1–T11 已实现并实测**（2026-10-24，GNU Emacs 31.1）。
-本文件描述分层、四条采集路径、可视化数据流、**实测结论**与**已知偏差**；不变量与字段定义以
-[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]] 为准，
+状态：**Phase 4（Review & Document）已完成；观测面扩展（schema v2）已实现并实测**（2026-10-25，
+GNU Emacs 31.1）。本文件描述分层、**六条采集路径**、可视化数据流、**实测结论**与**已知偏差**；
+不变量与字段定义以
+[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]] 为准
+（v2 扩展的设计与决策见
+[[file:../openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]
+与 [[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]），
 对外接口见 [[file:api.org][docs/api.org]]，界面与路由见 [[file:ui.org][docs/ui.org]]。
 尚未实测的项集中在文末「待补」清单，与 [[file:../openspec/tech-debt.md][openspec/tech-debt.md]] 的 TD 编号对应。
 #+END_QUOTE
@@ -17,24 +21,26 @@
 
 | 层              | 模块                     | 输入                         | 输出                                   | 副作用                            |
 |-----------------+-------------------------+-----------------------------+---------------------------------------+----------------------------------|
-| 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调 | 内存中的事件与小时聚合桶                  | 只读环境、写内存                    |
+| 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调、=after-load-functions=、=gcs-done= / =gc-elapsed= / =garbage-collect-heapsize= | 内存中的事件与小时聚合桶（含 GC / 健康计数 / 启动阶段与 load 明细） | 只读环境、写内存                    |
 | 归因 attrib      | =el-chronos-attrib.el=    | 符号名、buffer               | file / package / mode / project 字符串 | 无（缓存 hash table）              |
-| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行                             | 唯一允许写盘的一层（I3）             |
-| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集                           | 只读数据库                         |
-| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer / 导出文件                  | 创建 buffer、按需写导出文件         |
-| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON → 内嵌 HTML / JS           | 仅监听 =127.0.0.1= （默认关闭、只读） |
+| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v2 共 10 表：新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=） | 唯一允许写盘的一层（I3）             |
+| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（17 个查询）               | 只读数据库                         |
+| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（14 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
+| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（17 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
 
 数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / web（两种呈现形态，共享同一 analysis 查询层）= 。
 =attrib= 是被动依赖（collect 调它补上下文），不被 store 反向调用。
 
-* 采集时序：四条路径
+* 采集时序：六条路径
 
 ** 路径 1：启动（每会话一次）
 
-1. =after-init-hook= / =emacs-startup-hook= 打点 → 记 =t0= ；
-2. 计算 =startup_ms= 、采集 =emacs-version= / =host= / =gc-threshold= ；
-3. =store= 插入一行 =sessions= ；
-4. 若 =el-chronos-enabled= 为真 → 启动采样器与心跳 timer。
+1. 建会话行（=--ensure-session=）：算 =startup_ms=（=before-init-time= → =after-init-time=）、
+   采集 =emacs-version= / =host= / =gc-threshold= ；
+2. =store= 插入一行 =sessions= ；
+3. 同一冷路径上直接写 =session_meta= 的变更标记（=git-head= / =config-sig=，取不到的键不写行）；
+4. 若 =el-chronos-enabled= 为真 → 启动采样器与心跳 timer；
+5. 启动打点（路径 5）在这里接入。
 
 ** 路径 2：命令边界（每命令一次）
 
@@ -65,6 +71,49 @@
 4. 累加进内存中的小时桶（按整点 key 分桶），**不立即写库**；
 5. 调 =profiler-cpu-stop= + =profiler-cpu-start=（取用即重置，避免长期累积内存）；
 6. =store= 的 flush timer 在小时切换/缓冲达阈值时批量落库。
+
+** 路径 5：启动打点（每次启动一次，与路径 1 同源）
+
+1. **前置判定（最关键的一条）**：=collect-start= 执行时若 =after-init-time= 已非 nil，说明启动基本
+   结束（=startup.el= 先 =setq after-init-time=、紧接着跑 =after-init-hook=，两行都在 init 文件加载
+   之后）→ **一个启动钩子都不挂**，只记 =mode-start= 锚点。否则那 30 秒兜底窗口里用户
+   =require= / 打开文件触发的每一次 load 都会被记成「启动期 load」，污染 =startup_phases=；
+2. 启动未结束则挂 =after-load-functions=：钩子收 =FILE= 参数，记录**相邻两次回调的时间差**作为
+   「前一个文件的 load 耗时」（**近似归因**，差值含前一个文件的收尾逻辑与它触发的钩子执行）；
+   **内存中保存全部 load 记录**，写库前按 ms 降序截断到 =el-chronos-startup-top-n=（默认 50）；
+3. 阶段锚点：=mode-start= 在 =collect-start= 里直接记（这是「观测起点」）；=after-init-hook= /
+   =emacs-startup-hook= 若尚未过就各挂一次记 =after-init= / =startup=（**已过则跳过，不倒填**）；
+   =first-idle= 为可选锚点，仅在能注册 idle timer 时记一次，**不作摘钩依据**；
+4. =after-init-hook= 回调只做两件事：自摘钩子 + 算 =before-init-time= → =after-init-time= 的毫秒差值
+   交给 =el-chronos-store-note-startup-ms=（**纯内存、启动期零 IO**），落库并入下一次 flush 事务；
+5. **摘钩用确定性三元**（任一满足即摘，不依赖 idle 时机）：① =emacs-startup-hook= 已触发；
+   ② 累计 load 次数 ≥ =4 × top-n=；③ 自 mode 启动起超过 30 秒（一次性普通 timer，经
+   =--register-timer= 登记以便 I5 统一清理）；
+6. =collect-stop= **先摘启动打点的全部钩子**（=after-load-functions= / 条件注册的
+   =after-init-hook= / =emacs-startup-hook= / 那个一次性 timer）→ 再做 =--sample-tick= 收尾 →
+   最后摘其余钩子。顺序反过来会让关闭途中的回调再置一次 pending。
+
+** 路径 6：GC 与自监控（每个采样 tick，与路径 4 同一回调但**解耦**）
+
+1. 取 =gcs-done= / =gc-elapsed= 与上次基线的差值（负值按 0 处理）→ =el-chronos-store-record-gc=；
+2. 每 =el-chronos-heap-sample-windows=（默认 6）个采样窗口调一次堆大小采集，其余窗口传 nil
+   （NULL 由 =COALESCE= 保旧值）；
+3. 堆大小 = =(fboundp 'garbage-collect-heapsize)= 守卫 → 对返回的 9 项 =(NAME SIZE USED FREE)=
+   求 =Σ (* SIZE USED)=；函数不存在（Emacs < 31.1）返回 nil、不报错；
+4. 相邻两次 tick 的时间差 > 2 × =el-chronos-sample-window-seconds= → =sample-misses= +1
+   （说明主线程被占住、窗口丢了）。
+
+**为什么这一段必须写在 =(when el-chronos-collect--sampling-p …)= 之外**：=gcs-done= /
+=gc-elapsed= / =garbage-collect-heapsize= 都**不依赖 profiler**。项目的降级契约是「profiler 启动
+失败 → 禁用采样，命令 / 心跳继续」，若把 GC 采集绑进 =sampling-p= 内，内存 / GC 趋势会跟着陪葬，
+而它恰恰是判断「是不是越用越胖」的唯一依据，最不该在故障时消失。
+
+**零副作用约束**：=gcs-done= / =gc-elapsed= 是 Emacs 自维护的全局单调计数器，读它们不触发任何
+GC；=garbage-collect-heapsize= 按官方 docstring「may not be fully up to date unless called right
+after a full GC cycle」——即它**只读、不做**。**禁止调 =garbage-collect=**（它会真的做一次 GC，
+等于观测器替用户改变运行时行为，还污染自己刚记录的数据），**禁止用 =memory-info=**（那是**系统
+内存** =TOTAL-RAM FREE-RAM TOTAL-SWAP FREE-SWAP=，不是 Emacs 堆；remote =default-directory= 下
+还有触发 TRAMP 远端查询的风险）。
 
 ** 采样归因口径（nil 帧 / C 原语 / 闭包叶子）
 
@@ -225,7 +274,7 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 ** 9. 自观测抑制（report / Web）：三层防护 + 心跳侧感知
 （本节原名「报告自观测抑制」，更名以纳入 Web 请求处理侧；旧引用按原名检索本文件仍可命中。）
 
-需求：报告生成（首次加载 org + 13 个 analysis 查询）与 Web 请求处理（查询 + 序列化 + 发送，
+需求：报告生成（首次加载 org + 14 个 analysis 查询）与 Web 请求处理（查询 + 序列化 + 发送，
 主线程同步）都不能被自己的 1s 心跳判为阻塞——那是观测者在观测自己，属假阳性。两个入口各有
 一个同款宏：=el-chronos-report--without-block-events=（报告）与
 =el-chronos-web--without-block-events=（Web 请求），都用三层：
@@ -407,6 +456,10 @@ DELETE FROM hourly_usage WHERE dimension = 'command' AND key IN ('unknown', 'ano
 | 火焰图是「按层聚合近似」 | Web 侧把栈按层级折叠，深度上限 6，宽度按样本数占比 | 不是精确 flame graph：=hourly_stacks= 只保留 top-N 栈，短栈合并；精度足以定位热点路径 |
 | 忽略 =RANGE= 的其它调用点 | =el-chronos-analysis-heatmap= 只取 =dimension='command'= | mode / project 维度不参与热力图（数据仍在 =hourly_usage= 里，可用 SQL 查） |
 | =redisplay_internal (C function)= 进入回归判定 | 该符号归 =built-in= 后不再被 =regressions= 的 SQL 排除（SQL 仅排除 =Automatic GC=）；其 self 波动超阈值会出现「回归」 | 这是正确行为——redisplay 确实是耗时大户；看回归列表时需知道 built-in 项可能命中的是 Emacs 自身而非用户配置。口径见本节「采样归因口径」 |
+| **启动分解的包加载耗时是近似归因** | =startup_phases= 里 =load:<library>= 行的耗时，是相邻两次 =after-load-functions= 回调的**时间差** | 差值里含**前一个文件**的收尾逻辑与它触发的钩子执行，不是精确的单文件 load 耗时。用途是定位「哪个包的加载量级最大」，不适合做逐文件预算对齐 |
+| =heap_bytes= 仅 Emacs 31.1+ 有值 | 更低版本该列**恒 NULL**，=gc-trend= 的 =:heap-bytes= 也就恒为 nil | 采集层用 =(fboundp 'garbage-collect-heapsize)= 守卫，函数不存在就不采、不报错（I6）。**不是数据丢失**；跨版本混图时曲线出现的是**空洞**（部分会话有堆值），应按 =sessions.emacs_version= 分组阅读，不要读成「内存没长」 |
+| 启动分解覆盖范围受加载时机限制 | 只有 mode 在 =after-init-hook= **之前**启用才记包加载明细；在启动结束之后启用（例如 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=）时，=startup_phases= **只有 =mode-start= 一个锚点** | 事实依据：=startup.el= 第 1707 行先 =(setq after-init-time (current-time))=、第 1708 行才 =(run-hooks 'after-init-hook)=，两行都在 init 文件加载**之后** → =collect-start= 时启动已结束，于是**一个启动钩子都不挂**（否则后续交互触发的 load 会被记成「启动期 load」）。观测器无法观测自己被加载之前的事，见 [[file:operations.org][docs/operations.org]]「启动分解的物理边界」 |
+| 首个采样窗口只建基线 | 会话第一个采样 tick 只记录 =gcs-done= / =gc-elapsed= 基线、按 0 差值入库，因此最多丢 ≤1 个窗口的 GC 增量 | 计数器是单调全局量，没有上一次基线就没有差值可比。表现为可能出现 =gc-count= / =gc-ms= 全 0 的桶（**基线桶**，不等于「没有发生 GC」）；同源说明见 =el-chronos-analysis-gc-trend= 的 docstring |
 
 * 待补（Phase 4 之后）
 

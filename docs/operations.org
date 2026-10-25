@@ -72,6 +72,33 @@ sqlite3 -readonly "file:$HOME/.emacs.d/.local/state/chronos/chronos.sqlite?mode=
 （=ts= 是毫秒时间戳，用 =date -d @$((ts/1000))= 换算；=context_json= 里的 =mode= 是
 判定时刻的 major-mode，可据此定位当时在哪个 buffer。）
 
+* 启动分解的物理边界（重要：不是 bug）
+
+**观测器无法观测自己被加载之前发生的事。**
+
+- 若用 =emacs-startup-hook=（或任何**启动结束之后**的时机）开启 mode —— 本机 =thomas-emacs= 就是
+  =(add-hook 'emacs-startup-hook #'el-chronos-mode)= —— 启动分解**只含 =mode-start= 一个锚点、
+  没有任何包加载明细**。这是物理边界，不是 bug，也不是采集失败。
+- 事实依据：=startup.el= 第 1707 行先 =(setq after-init-time (current-time))=、第 1708 行才
+  =(run-hooks 'after-init-hook)=，两行都在 init 文件加载**之后**执行。所以 =collect-start= 执行时
+  启动已经收尾，采集器**故意一个启动钩子都不挂**（否则此后你每次 =require= / 打开文件触发的 load
+  都会被记成「启动期 load」，把交互期的加载混进启动耗时里，比缺数据更糟）。
+- **要完整剖析请把 =(el-chronos-mode 1)= 提前到 =early-init.el=**（例如 =early-init.el= 末尾）：
+
+#+BEGIN_SRC elisp
+;; ~/.emacs.d/early-init.el 末尾
+(require 'el-chronos)
+(el-chronos-mode 1)
+#+END_SRC
+
+  此时 =mode-start= 就是「记录起点」，之后的 load 才会进 =startup_phases=。副作用要知道：
+  early-init 期间很多设施尚未就绪（=package.el= 未初始化、主题未加载、部分 face 不存在），
+  采集器自身必须能降级——项目已按此设计（采集路径全部 =condition-case= 包裹，I6），
+  但你的**其他**初始化代码若也搬进 early-init 需自行确认顺序。
+- 无论哪种写法，节标题都会如实标注覆盖范围（「自 mode 启动起 X ms / 总 Y ms」），
+  **不会**把近似数据冒充全程；包加载耗时本身也是**近似归因**（相邻 =after-load-functions=
+  回调的时间差，含前一个文件的收尾）。
+
 * 卸载
 
 三步，顺序不能反（先停观测再删数据，否则会有未 flush 缓冲写回）。
@@ -95,11 +122,11 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 
 | 操作 | 入口 | 作用范围 | 备注 |
 |---|---|---|---|
-| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 三张 =hourly_*= 聚合表**永久保留**，不参与自动清理 |
-| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含 =hourly_*=） | 输入留空 = 清空全部 6 张表 |
-| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 6 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键 |
+| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 五张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理 |
+| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含五张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **10 张表** |
+| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 10 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
 | 回收空间 | =M-x el-chronos-store-vacuum= | =VACUUM=（重写库文件） | 不能在事务内执行；purge 后跑一次可显著缩小文件 |
-| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库 |
+| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库（=user_version= 2、10 表 + 3 索引） |
 
 #+BEGIN_SRC elisp
 (el-chronos-purge (truncate (* 1000 (float-time (date-to-time "2026-09-01 00:00:00")))))
@@ -128,6 +155,9 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | echo area 不再弹出「主线程阻塞约 N ms」 | =el-chronos-collect-notify-blocks= 默认为 =nil=（静默），**不是漏记**——事件照旧落 =slow_events(kind="block")= 并进报告 / Web 页面 | 查库确认（见「阻塞提示」节的 SQL）；需要即时可见就把该变量设为 =messages=（只进 =*Messages*=）或 =t=（真 echo） |
 | 回归列表里出现看起来「没变慢」的函数 | 回归按 =el-chronos-regression-window-days=（默认 7 天）与自身上下窗口比较，**与页面显示范围无关**；小样本噪声由 =el-chronos-regression-min-samples= 抑制 | 看返回里的 =:current-samples= / =:previous-samples=；嫌噪就提高阈值或最小样本数 |
 | 包占比里 =built-in= 占大头（甚至过半） | **正常口径**：Emacs C 原语（=kill-buffer= / =plist-get= / =redisplay_internal= 等）与 GC 采样本就来自内核，2026-10-25 起归 =built-in= 而非 =unknown= | 无需处理；若想看用户配置的开销，按包名过滤掉 =built-in= / =GC= / =unknown= 三行即可。历史数据需 =el-chronos-purge= 后重来才是新口径 |
+| 采集健康显示「本期无采集数据」 | **不是故障**：采集器还没写过 =hourly_health= 行（=:rows= = 0），例如刚开始用、或这段时间内没有一次 flush 成功过 | 与「本期无采集异常」是两个不同结论：先确认 =el-chronos-mode= 在跑、=M-x el-chronos-status= 能显示库路径，然后等一个 flush 周期（默认 5s）再看。只读 =:ok-p= 会把「没采集」读成「一切正常」，报告与页面都按 =:rows= 先行分支 |
+| =heap_bytes= 恒为 =−= / 为 NULL | **Emacs < 31.1 没有 =garbage-collect-heapsize=**，采集层守卫失败即不采，该列恒 NULL | 正常能力缺口，不是采集失败。=M-: (fboundp 'garbage-collect-heapsize)= 验证；升级 Emacs 后只有**新会话**才有堆值，历史会话永远是 NULL（跨版本混图会出现空洞，按 =sessions.emacs_version= 分组看） |
+| 启动分解只有 =mode-start= 一个锚点 | mode 在**启动结束之后**才启用（典型写法 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=） | **物理边界，不是 bug**：观测器无法观测自己被加载之前的事。要完整剖析就把 =(el-chronos-mode 1)= 提前到 =early-init.el=（含副作用说明，见「启动分解的物理边界」节） |
 
 * 验证步骤
 
@@ -137,7 +167,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 |---|---|---|---|
 | =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
 | =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
-| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 120 tests, 120 results as expected, 0 unexpected= |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 199 tests, 199 results as expected, 0 unexpected= |
 | =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
 
 ** 手动 smoke（端到端，5 分钟）
@@ -166,8 +196,8 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 
 | 类别 | 内容 |
 |---|---|
-| **记录** | 命令名、耗时、GC 耗时、major-mode、项目 **basename**、结果（=ok= / =aborted= / =error=）、函数符号名、函数定义源码路径（仅归因所需） |
-| **不记录** | 被操作文件路径、buffer 内容、按键序列、命令参数、剪贴板、环境变量 |
+| **记录** | 命令名、耗时、GC 耗时、major-mode、项目 **basename**、结果（=ok= / =aborted= / =error=）、函数符号名、函数定义源码路径（仅归因所需）、会话级 =git-head= / =config-sig= 两键（见下「隐私边界补充」） |
+| **不记录** | 被操作文件路径、buffer 内容、按键序列、命令参数、剪贴板、环境变量、**配置文件内容**（=config-sig= 只取相对路径 + mtime + size 的 sha1） |
 
 =commands.project= 只存 basename（=file-name-nondirectory= 处理后的目录名），取不到为 =NULL=；
 断言：该列不出现 =/=。唯一例外是用户**主动**把 =el-chronos-usage-granularity= 改为 =file=——
@@ -183,6 +213,25 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | =hourly_functions= | **永久** | 仅 purge | ≤ 24 × 函数数 / 天 |
 | =hourly_usage= | **永久** | 仅 purge | ≤ 24 × 维度取值数 / 天 |
 | =hourly_stacks= | **永久** | 仅 purge | ≤ 24 × =el-chronos-store-stack-top-n=（默认 200）× 会话数 / 天 |
+| =hourly_gc= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 1 行（与既有 =hourly_*= 同量级，可忽略） |
+| =hourly_health= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 6 行（6 个固定键；同量级，可忽略） |
+| =startup_phases= | 随 =sessions= 由 purge 清理 | 仅 purge | **每会话 ≤ top-N + 3 行**（默认 ≤ 53，=el-chronos-startup-top-n= 为 50；=first-idle= 记录时 ≤ 54）—— 比 =sessions= 高两个量级，**频繁重启的机器上会明显增长，是本项目最值得留意的一张表** |
+| =session_meta= | 随 =sessions= 由 purge 清理 | 仅 purge | 每会话 ≤ 2 行（=git-head= / =config-sig=，取不到则不写行） |
+
+** 隐私边界补充：=session_meta= 的两个键
+
+=session_meta= 记录两个会话级标记：
+
+- =git-head=：配置仓库的**提交 sha**（含分支解析：读 =.git/HEAD= → loose ref → =.git/packed-refs=
+  回退 → detached 裸 sha；任一步失败即不写行）。
+- =config-sig=：配置文件的**指纹**，由 =el-chronos-config-watch-globs=（默认
+  ='("early-init.el" "init.el" "lisp/init-*.el")=）展开的每个文件的**相对路径 + mtime + size**
+  排序后做 =secure-hash 'sha1= 得到。**不含任何文件内容**。
+
+**这两个键可以识别你的配置仓库状态**（用了哪次提交、配置何时改过），属用户可识别信息：
+=el-chronos-purge= **会删除它们**（含当前会话行的 meta），所以「泄露」窗口 = 库里还留着那段历史的时间。
+不想留就可以随时 =M-x el-chronos-purge=。若连采集都不想有，把 =el-chronos-config-watch-globs=
+设为 =nil=（不匹配任何文件 → 不写 =config-sig= 行）；=git-head= 没有开关，由 purge 负责清理。
 
 ** Web 的特殊说明
 
@@ -196,5 +245,5 @@ Windows 侧进程可直连该端口）。定位是「本机自用的只读视图
 - 界面 / 路由：[[file:ui.org][docs/ui.org]]
 - 数据模型与保留策略：[[file:schema.org][docs/schema.org]]
 - 架构与实测结论：[[file:architecture.org][docs/architecture.org]]
-- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（未关闭：TD-4 / TD-6 / TD-7 / TD-8 / TD-10 / TD-11；TD-1 / TD-2 / TD-3 / TD-5 / TD-9 / TD-12 已关闭）
+- 技术债：[[file:../openspec/tech-debt.md][openspec/tech-debt.md]]（未关闭：TD-4 / TD-6 / TD-7 / TD-8 / TD-11 / TD-14 / TD-15 / TD-16 / TD-17 / TD-18 / TD-19；已关闭：TD-1 / TD-2 / TD-3 / TD-5 / TD-9 / TD-12；已处置但成因待定：TD-13；已定案不对齐：TD-10）
 - 计划：[[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]
