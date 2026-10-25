@@ -619,11 +619,14 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
 :git-head STR|nil :config-sig STR|nil :changed BOOL)' 的 plist 列表、
 `:changes' 是变化次数。
 
-`:changed' 表示**与前一个会话相比** `(git-head, config-sig)' 有变化：第一个会话恒为 nil
-（没有「前一个」，`nil' 读作「无从比较」，与「没变化」区分）；后续会话为 t / nil。
+`:changed' 表示**与前一个会话相比** `(git-head, config-sig)' 有变化，取值 t / nil。
+**`nil' 有两种含义，且本层不区分二者**：① 第一个会话（没有「前一个」，无从比较）；
+② 与前一会话相比标记无差异。调用方若需区分，请自行判断会话序号（`:sessions' 的首个
+元素即第一个会话）。引入三态（`:n/a' / nil / t）属行为变更、未实施，见技术债 TD-20。
 两个键都为 nil 的两个相邻会话视为**没变化** —— 两次都取不到标记时无法断言配置变了，
 谎报变化比漏报更糟（会让人以为「那天改了什么」）。
-`:changes' 只统计 `:changed' 为 t 的会话数，等于「标记发生变化的次数」。
+`:changes' 只统计 `:changed' 为 t 的会话数，等于「标记发生变化的次数」（首会话 `:changed'
+恒为 nil，故不计入）。
 
 `git-head' / `config-sig' 取自 `session_meta' 的 KV（store 层写入：取不到就**不写行**），
 因此 nil 表示「未取到」而非「取了但为空」。空库返回 `(:sessions nil :changes 0)`

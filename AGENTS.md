@@ -99,7 +99,8 @@ I9 / I11 已按 ADR-0003 改写；I10 仅删除了随 dashboard 下线的实现�
 ## 隐私边界
 
 - **记录**：命令名、耗时、GC 时长、major-mode、项目 **basename**、函数符号名、函数定义源码路径（归因必需）、
-  `git-head`（当前提交 sha）、`config-sig`（配置文件 mtime/size 指纹，**不含文件内容**）。
+  `git-head`（当前提交 sha）、`config-sig`（配置文件 mtime/size 指纹，**不含文件内容**）、
+  `host`（`sessions.host`，`(system-name)` 主机名，用于区分多机数据；**不含**用户名与网络地址）。
 - `git-head` / `config-sig` 二者存于 `session_meta`（主键 `(session_id, key)`，每会话每键一行），
   可据此识别配置仓库状态；读法：`git-head` 只读 `.git/HEAD` 与 refs/packed-refs（**不调 git 子进程**），
   `config-sig` 只对 `el-chronos-config-watch-globs` 命中文件取 mtime/size 做 sha1（**不读文件内容**）；
