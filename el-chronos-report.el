@@ -49,6 +49,32 @@
 I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位等价，但更具体 —— 用户需要
 知道「没数据」的可能原因是 Emacs 版本低于 31.1、堆大小无从采集）。")
 (defconst el-chronos-report--empty "（无数据）" "空数据占位文本。")
+(defconst el-chronos-report--startup-load-rows 10
+  "「启动分解」里包加载 TOP 最多展示的库数。
+采集层按 `el-chronos-startup-top-n'（默认 50）截断入库，报告再截一次只为可读性。")
+(defconst el-chronos-report--startup-degrade
+  "本期无启动分解数据（需在启动结束前启用 `el-chronos-mode'，最早可在 early-init.el 里启用）。"
+  "「启动分解」节的整体降级说明：库里没有任何会话带启动数据时使用。
+I11：无数据时**不省略整节**，且说明为什么可能没数据 —— 用户看不到启动分解的最常见原因
+就是 mode 在 init 末尾才启用（此时启动已结束，采不到任何 load）。")
+(defconst el-chronos-report--startup-phases-degrade
+  "（无阶段锚点：mode 启动时启动已结束，只能记录 mode-start 之后的阶段）"
+  "「启动分解」节里阶段锚点表为空时的降级说明。")
+(defconst el-chronos-report--startup-loads-degrade
+  "（无包加载明细：mode 启动时启动已结束，不记录 after-load-functions）"
+  "「启动分解」节里包加载表为空时的降级说明。")
+(defconst el-chronos-report--startup-total-degrade
+  "（无总启动耗时：该会话的 startup_ms 尚未写入）"
+  "「启动分解」节里总耗时缺失时的降级说明（`startup_ms' 为 NULL 的会话）。")
+(defconst el-chronos-report--config-degrade
+  "本期无会话变更记录（会话启动时未取到 git-head / config-sig，或窗口内没有会话）。"
+  "「配置变更」节无数据时的降级说明（I11：不省略整节）。")
+(defconst el-chronos-report--health-no-data
+  "本期无采集数据（采集器尚未写入健康指标）"
+  "「采集健康」节在窗口内 `hourly_health' **一行都没有**时的专属说明。
+必须与 `本期无采集异常' 严格区分（I11）：后者是「采集器在工作、只是没有坏消息」，
+前者是「采集器根本没上报」——两者的运维含义相反，混用会把「没采集」显示成「一切正常」。")
+
 
 (defvar-local el-chronos-report--current-range nil
   "报告 buffer 对应的当前时间范围，供 `revert-buffer' 复用。")
@@ -125,6 +151,14 @@ I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位
 (defun el-chronos-report--pct (value)
   "把百分比数值 VALUE 格式化为 \"12.3%\"；非数字返回 \"-\"。"
   (if (numberp value) (format "%.1f%%" (float value)) "-"))
+(defun el-chronos-report--digest (value)
+  "把 VALUE 截成前 8 个字符用于展示（提交号 / 配置指纹）；nil 或空串返回 \"-\"。
+短于 8 个字符时原样返回 —— 只截不补，补零会伪造出不存在的长度。"
+  (let ((text (and value (format "%s" value))))
+    (if (or (null text) (string-empty-p text))
+        "-"
+      (substring text 0 (min 8 (length text))))))
+
 (defun el-chronos-report--time (ms)
   "把 epoch 毫秒 MS 格式化为本地时间；非数字返回 \"-\"。"
   (if (numberp ms) (format-time-string "%Y-%m-%d %H:%M:%S" (/ (float ms) 1000.0)) "-"))
@@ -240,6 +274,104 @@ I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位
        "GC 与内存" '("时间" "GC 次数" "GC 耗时" "内存") rows)
     (concat "* GC 与内存\n" el-chronos-report--gc-degrade "\n\n")))
 
+(defun el-chronos-report--section-startup (breakdown)
+  "渲染「启动分解」节；BREAKDOWN 为 `el-chronos-analysis-startup-breakdown' 的结果或 nil。
+标题形如 `启动分解（自 mode 启动起 X ms / 总 Y ms）'，其中 X 取 `mode-start' 锚点、
+Y 取会话的 `startup_ms'；任一段缺失时对应位置显示 \"-\" 并在正文给出降级说明。
+
+正文两张表：① 阶段锚点（`阶段' / `耗时'，固定顺序 mode-start → after-init → startup →
+first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时降序取前
+`el-chronos-report--startup-load-rows' 条）。
+
+**覆盖范围必须显式标注**（计划设计 7 处置 ①）：包加载耗时是 `after-load-functions' 相邻
+回调的时间差，属**近似归因**；且只覆盖 mode 启动之后发生的 load。用户通常在 init 末尾才
+启用 mode，此时只有 `mode-start' 一个锚点 —— 这张表不能冒充「完整启动剖析」。
+无任何启动数据时整节走 `el-chronos-report--startup-degrade'（I11：不省略整节）。"
+  (let* ((session (and breakdown (plist-get breakdown :session-id)))
+         (phases (and breakdown (plist-get breakdown :phases)))
+         (loads (and breakdown (plist-get breakdown :loads)))
+         (startup (and breakdown (plist-get breakdown :startup-ms)))
+         (mode-start (cadr (assoc "mode-start" phases))))
+    (if (null session)
+        (concat "* 启动分解\n" el-chronos-report--startup-degrade "\n\n")
+      (concat
+       (format "* 启动分解（自 mode 启动起 %s / 总 %s）\n"
+               (el-chronos-report--ms->human mode-start)
+               (el-chronos-report--ms->human startup))
+       (if (numberp startup) "" (concat el-chronos-report--startup-total-degrade "\n"))
+       "阶段锚点：\n"
+       (if phases
+           (el-chronos-report--table
+            '("阶段" "耗时")
+            (cl-loop for (phase ms) in phases
+                     collect (list (el-chronos-report--str phase)
+                                   (el-chronos-report--ms->human ms))))
+         (concat el-chronos-report--startup-phases-degrade "\n"))
+       (format "包加载 TOP（前 %d）：\n" el-chronos-report--startup-load-rows)
+       (if loads
+           (el-chronos-report--table
+            '("包" "耗时")
+            (cl-loop for (library ms) in
+                     (last loads (min el-chronos-report--startup-load-rows (length loads)))
+                     collect (list (el-chronos-report--str library)
+                                   (el-chronos-report--ms->human ms))))
+         (concat el-chronos-report--startup-loads-degrade "\n"))
+       "\n"))))
+
+(defun el-chronos-report--section-health (health)
+  "渲染「采集健康」节；HEALTH 为 `el-chronos-analysis-health' 的结果或 nil。
+`指标' / `值' 两列：丢弃命令、丢弃事件、flush 失败、flush 次数、flush 平均耗时、
+采样窗口丢失。
+
+四个分支（I11：任何分支都不省略整节）：
+① HEALTH 为 nil（查询失败）→ 空表 → `（无数据）'；
+② `:rows' 为 0（窗口内 `hourly_health' 一行都没有）→「本期无采集数据」——
+   **不许**落到 `:ok-p' 分支：analysis 层在无数据时同样给 `:ok-p' 为 t，
+   照抄会显示「本期无采集异常」，把「没采集」读成「一切正常」；
+③ `:rows' 非 0 且 `:ok-p' 为 t → 只给一行「本期无采集异常」，括号里带 flush 次数与
+   平均耗时 —— 它们是正常运转的度量，「无异常」不等于「无信息」；
+④ 否则渲染完整指标表。"
+  (let ((rows (and health (plist-get health :rows)))
+        (ok (and health (plist-get health :ok-p)))
+        (value (lambda (key) (and health (plist-get health key)))))
+    (cond
+     ((null health) (el-chronos-report--table-section "采集健康" '("指标" "值") nil))
+     ((and (numberp rows) (zerop rows))
+      (concat "* 采集健康\n" el-chronos-report--health-no-data "\n\n"))
+     (ok (concat "* 采集健康\n"
+                 (if (> (or (funcall value :flush-count) 0) 0)
+                     (format "本期无采集异常（flush %s 次，平均 %s）\n\n"
+                             (el-chronos-report--num (funcall value :flush-count))
+                             (el-chronos-report--ms->human (funcall value :flush-avg-ms)))
+                   "本期无采集异常（本期无 flush 记录）\n\n")))
+     (t (el-chronos-report--table-section
+         "采集健康" '("指标" "值")
+         (list (list "丢弃命令" (el-chronos-report--num (funcall value :dropped-commands)))
+               (list "丢弃事件" (el-chronos-report--num (funcall value :dropped-events)))
+               (list "flush 失败" (el-chronos-report--num (funcall value :flush-failures)))
+               (list "flush 次数" (el-chronos-report--num (funcall value :flush-count)))
+               (list "flush 平均耗时"
+                     (el-chronos-report--ms->human (funcall value :flush-avg-ms)))
+               (list "采样窗口丢失" (el-chronos-report--num (funcall value :sample-misses)))))))))
+
+(defun el-chronos-report--section-config (history)
+  "渲染「配置变更」节；HISTORY 为 `el-chronos-analysis-config-history' 的结果或 nil。
+表头 `会话启动时间' / `提交' / `配置指纹' / `变化'：`git-head' 与 `config-sig' 各显示前
+8 个字符（完整哈希在表格里没有可读性），`:changed' 为 t 时「变化」列显示 `✓'，
+首个会话与无变化会话显示 \"-\"（首个会话无从比较，不能算「没变化」）。
+`:sessions' 为空或无 HISTORY 时走 `el-chronos-report--config-degrade'（I11：不省略整节）。"
+  (let ((sessions (and history (plist-get history :sessions))))
+    (if (null sessions)
+        (concat "* 配置变更\n" el-chronos-report--config-degrade "\n\n")
+      (el-chronos-report--table-section
+       "配置变更" '("会话启动时间" "提交" "配置指纹" "变化")
+       (cl-loop for item in sessions
+                collect (list (el-chronos-report--time (plist-get item :started-at))
+                              (el-chronos-report--digest (plist-get item :git-head))
+                              (el-chronos-report--digest (plist-get item :config-sig))
+                              (if (plist-get item :changed) "✓" "-")))))))
+
+
 (defun el-chronos-report--usage-rows (range)
   "构造「用法 TOP」行（plist `:name' `:count' `:total-ms'）。
 次数与总耗时都取自 `hourly_usage' 的 command 维度热力图（前 20 个命令跨桶求和），
@@ -266,7 +398,12 @@ I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位
          (blocking (cl-sort (copy-sequence (el-chronos-analysis-blocking-events
                                             range el-chronos-report--blocking-rows))
                             #'> :key (lambda (r) (or (plist-get r :ts) 0))))
-         (sessions (el-chronos-analysis-sessions range)))
+         (sessions (el-chronos-analysis-sessions range))
+         ;; 三个「本期健康/环境」视角的节：都在「GC 与内存」之后、「阻塞事件」之前。
+         ;; 与趋势族相邻的理由：它们回答的是「这台机器这个时期的状态如何」，而不是单点明细。
+         (startup (el-chronos-analysis-startup-breakdown nil))
+         (health (el-chronos-analysis-health range))
+         (config-history (el-chronos-analysis-config-history range)))
     (concat
      (format "#+TITLE: el-chronos 报告（近 %d 天）\n" (el-chronos-report--days range))
      (format "#+DATE: %s\n" (format-time-string "%Y-%m-%dT%H:%M:%S%z"))
@@ -290,6 +427,10 @@ I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位
        '(:bucket :samples :slow-commands :blocked) '(time num num num)))
      ;; 紧随「趋势」：同属时间桶视角，用户从「慢/阻塞」往下看自然想知道「是不是内存涨了」
      (el-chronos-report--section-gc gc-trend)
+     ;; 启动分解 → 采集健康 → 配置变更：三节都是「本期健康 / 环境」类视角，紧随趋势族
+     (el-chronos-report--section-startup startup)
+     (el-chronos-report--section-health health)
+     (el-chronos-report--section-config config-history)
      (el-chronos-report--table-section
       "阻塞事件" '("时间" "时长" "命令" "mode" "project")
       (el-chronos-report--rows
@@ -392,16 +533,72 @@ ROWS 输出原始值（不做人类可读格式化），便于下游解析。"
      el-chronos-analysis-blocking-events 100 (:id :ts :duration-ms :kind :command :mode :project)))
   "CSV 导出的 5 个区块：(区块名 表头 查询函数 LIMIT 字段)。")
 
+(defun el-chronos-report--csv-startup (breakdown)
+  "生成「启动分解」CSV 区块（`# section: startup'）：阶段锚点与包加载 TOP 合成一张表。
+两段用 `kind' 列区分（`phase' / `load'），其余列是 `name' 与 `ms'：合成一张表而不是两个
+同名区块，是为了让下游只靠 `# section:' 就能定位区块（同名区块会让人以为解析错了）。
+包加载按 `el-chronos-report--startup-load-rows' 截断，与 org 报告的可读性口径一致；
+BREAKDOWN 为 nil 时只输出表头（无数据不省略区块，与 org 报告的 I11 一致）。"
+  (let* ((phases (and breakdown (plist-get breakdown :phases)))
+         (loads (and breakdown (plist-get breakdown :loads))))
+    (el-chronos-report--csv-block
+     "startup" '("kind" "name" "ms")
+     (append
+      (cl-loop for (phase ms) in phases collect (list "phase" phase ms))
+      (cl-loop for (library ms) in
+               (last loads (min el-chronos-report--startup-load-rows (length loads)))
+               collect (list "load" library ms))))))
+
+(defun el-chronos-report--csv-health (health)
+  "生成「采集健康」CSV 区块（`# section: health'）：`metric' / `value' 两列的窄表。
+键名沿用 `hourly_health.key' 的写法（snake_case），另加一行 `rows'（窗口内行数）——
+导出件同样要能区分「没采集」与「没异常」，否则下游会重犯 org 报告曾犯的错（I11）。
+HEALTH 为 nil（查询失败）时只输出表头。"
+  (el-chronos-report--csv-block
+   "health" '("metric" "value")
+   (when health
+     (list (list "dropped_commands" (plist-get health :dropped-commands))
+           (list "dropped_events" (plist-get health :dropped-events))
+           (list "flush_failures" (plist-get health :flush-failures))
+           (list "flush_count" (plist-get health :flush-count))
+           (list "flush_ms" (plist-get health :flush-ms))
+           (list "flush_avg_ms" (plist-get health :flush-avg-ms))
+           (list "sample_misses" (plist-get health :sample-misses))
+           (list "rows" (plist-get health :rows))))))
+
+(defun el-chronos-report--csv-config-history (history)
+  "生成「配置变更」CSV 区块（`# section: config-history'）。
+列：`session_id' / `started_at_ms' / `git_head' / `config_sig' / `changed'；两个哈希写
+**完整值**（org 报告截 8 位只为排版，导出件要给下游做 join 与比对），`changed' 写
+`1' / `0' 而不是空串 —— 空串与「首会话无从比较」无法区分。
+HISTORY 为 nil 时只输出表头。"
+  (el-chronos-report--csv-block
+   "config-history" '("session_id" "started_at_ms" "git_head" "config_sig" "changed")
+   (cl-loop for item in (and history (plist-get history :sessions))
+            collect (list (plist-get item :id)
+                          (plist-get item :started-at)
+                          (plist-get item :git-head)
+                          (plist-get item :config-sig)
+                          (if (plist-get item :changed) "1" "0")))))
+
 (defun el-chronos-report--csv-string (range)
-  "生成 RANGE 的 CSV 全文：5 个区块用 `# section:' 注释行分隔；字段保持原始值。"
-  (mapconcat
-   (lambda (spec)
-     (let* ((keys (nth 4 spec))
-            (items (funcall (nth 2 spec) range (nth 3 spec))))
-       (el-chronos-report--csv-block (nth 0 spec) (nth 1 spec)
-                                     (el-chronos-report--rows items keys
-                                                              (make-list (length keys) 'raw)))))
-   el-chronos-report--csv-sections ""))
+  "生成 RANGE 的 CSV 全文：8 个区块用 `# section:' 注释行分隔；字段保持原始值。
+前 5 个区块由 `el-chronos-report--csv-sections' 的通用规格生成（查询 → 行 → 列）；
+后 3 个（startup / health / config-history）返回结构不齐整 —— 启动分解是两段嵌套列表、
+采集健康是扁平 plist、配置变更嵌在 `:sessions' 里，且启动分解不吃 RANGE —— 各自手写
+区块生成函数，而不是硬塞进通用规格。"
+  (concat
+   (mapconcat
+    (lambda (spec)
+      (let* ((keys (nth 4 spec))
+             (items (funcall (nth 2 spec) range (nth 3 spec))))
+        (el-chronos-report--csv-block (nth 0 spec) (nth 1 spec)
+                                      (el-chronos-report--rows items keys
+                                                               (make-list (length keys) 'raw)))))
+    el-chronos-report--csv-sections "")
+   (el-chronos-report--csv-startup (el-chronos-analysis-startup-breakdown nil))
+   (el-chronos-report--csv-health (el-chronos-analysis-health range))
+   (el-chronos-report--csv-config-history (el-chronos-analysis-config-history range))))
 
 (defun el-chronos-report--json-value (value)
   "把 VALUE 递归转成 `json-serialize' 友好形态。
@@ -418,7 +615,9 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
    (t value)))
 
 (defun el-chronos-report--json-string (range)
-  "生成 RANGE 的 JSON 全文（单个对象，含 overview 与各明细区块）。"
+  "生成 RANGE 的 JSON 全文（单个对象，含 overview 与各明细区块）。
+键名沿用既有 snake_case 风格（`slow_commands' / `blocking_events'）；
+三个新查询对应 `startup' / `health' / `config_history'。"
   (concat
    (json-serialize
     (el-chronos-report--json-value
@@ -433,7 +632,11 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
            :regressions (el-chronos-analysis-regressions range 100)
            :usage (el-chronos-analysis-heatmap range 20)
            :sessions (el-chronos-analysis-sessions range)
-           :stacks (el-chronos-analysis-stacks range 100))))
+           :stacks (el-chronos-analysis-stacks range 100)
+           ;; 三个「本期健康 / 环境」视角查询，与 org 报告新增的三节同源
+           :startup (el-chronos-analysis-startup-breakdown nil)
+           :health (el-chronos-analysis-health range)
+           :config_history (el-chronos-analysis-config-history range))))
    "\n"))
 
 (defun el-chronos-export (format file &optional range)

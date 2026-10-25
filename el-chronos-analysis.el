@@ -439,6 +439,222 @@ LIMIT 限制参与的命令条数（按窗口内总次数取前 N，默认 20）
                              :startup-ms (and (numberp startup) startup)
                              :emacs-version version :host host)))))
 
+;;; 启动分解
+(defconst el-chronos-analysis--startup-phase-order
+  '("mode-start" "after-init" "startup" "first-idle")
+  "启动分解里阶段锚点的固定展示顺序。
+四个锚点由采集层按「确定性 3 个 + 可选 1 个」写入（`mode-start' 确定性写入；
+`after-init' / `startup' 仅在 mode 启动时它们还没到时条件注册；`first-idle' 可选）。
+缺失的锚点**不输出 nil 行** —— 采不到就是采不到，填 nil 只会让读表的人以为「耗时未知」
+而不是「未记录」。")
+
+(defconst el-chronos-analysis--startup-load-prefix "load:"
+  "`startup_phases' 里包加载明细的阶段名前缀（完整阶段名为 \"load:<library>\"）。")
+
+(defun el-chronos-analysis--startup-empty (session-id)
+  "构造启动分解的空结果（与有数据时**同构**，避免调用方判空分支分叉）。
+SESSION-ID 原样回填：显式传了 id 就回该 id，未传（自动选会话）时为 nil。
+`:started-at' / `:startup-ms' / `:phases' / `:loads' 全为 nil。"
+  (list :session-id session-id :started-at nil :startup-ms nil :phases nil :loads nil))
+
+(defun el-chronos-analysis--startup-session (db session-id)
+  "在 DB 上定位启动分解的目标会话，返回 (ID STARTED-AT STARTUP-MS) 或 nil。
+SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的最近会话 ——
+判据是 `startup_ms' 非空 **或** `startup_phases' 有行（两者任一即可：总耗时可能因
+早期版本 / 补写未落库而缺失，而阶段锚点仍在；只按 `startup_ms' 筛会漏掉这种会话）。
+排序用 `started_at' 降序，同毫秒时用 id 降序兜底，保证结果确定可复现。"
+  (if (numberp session-id)
+      (car (el-chronos-analysis--select
+            db "SELECT id, started_at, startup_ms FROM sessions WHERE id = ?"
+            (list session-id)))
+    (car (el-chronos-analysis--select
+          db (concat "SELECT s.id, s.started_at, s.startup_ms FROM sessions s"
+                     " WHERE s.startup_ms IS NOT NULL"
+                     " OR EXISTS (SELECT 1 FROM startup_phases p"
+                     "            WHERE p.session_id = s.id)"
+                     " ORDER BY s.started_at DESC, s.id DESC LIMIT 1")
+          nil))))
+
+(defun el-chronos-analysis--startup-anchors (phases)
+  "把 PHASES（`(PHASE MS)' 列表）整理成固定顺序的锚点列表，并丢弃 `load:' 明细。
+顺序由 `el-chronos-analysis--startup-phase-order' 决定（缺的跳过）；顺序表之外的非
+`load:' 阶段（将来新增的锚点）按耗时降序追加在末尾 —— 宁可多显示一条，也不要静默丢弃
+采集层新写入的阶段。"
+  (let ((table (make-hash-table :test #'equal)) (others nil))
+    (dolist (row phases)
+      (let ((phase (car row)) (ms (float (or (nth 1 row) 0))))
+        (when (and (stringp phase)
+                   (not (string-prefix-p el-chronos-analysis--startup-load-prefix phase)))
+          (if (member phase el-chronos-analysis--startup-phase-order)
+              (puthash phase ms table)
+            (push (list phase ms) others)))))
+    (append (cl-loop for phase in el-chronos-analysis--startup-phase-order
+                     when (gethash phase table)
+                     collect (list phase (gethash phase table)))
+            (cl-sort others #'> :key #'cl-second))))
+
+(defun el-chronos-analysis--startup-loads (phases)
+  "从 PHASES（`(PHASE MS)' 列表）里取出 `load:<library>' 明细，按耗时降序。
+返回值元素是 `(LIBRARY MS)'，前缀 `load:' 已去掉。同耗时按库名升序，保证顺序确定。"
+  (let ((prefix el-chronos-analysis--startup-load-prefix)
+        (loads nil))
+    (dolist (row phases)
+      (let ((phase (car row)))
+        (when (and (stringp phase) (string-prefix-p prefix phase))
+          (push (list (substring phase (length prefix)) (float (or (nth 1 row) 0))) loads))))
+    (cl-sort loads (lambda (a b)
+                     (if (= (cl-second a) (cl-second b))
+                         (string< (car a) (car b))
+                       (> (cl-second a) (cl-second b)))))))
+
+(defun el-chronos-analysis-startup-breakdown (&optional session-id)
+  "取会话 SESSION-ID 的启动耗时分解；SESSION-ID 为 nil 时取最近一次有启动数据的会话。
+「最近一次有启动数据」= `started_at' 最大且 `startup_ms' 非空 **或** `startup_phases'
+有行的会话（见 `el-chronos-analysis--startup-session'）。
+
+返回 plist：`:session-id' 会话 id、`:started-at' 会话启动时刻（epoch 毫秒）、
+`:startup-ms' 该会话的总启动耗时（毫秒，未写入时 nil）、`:phases' 阶段锚点列表
+`((PHASE MS) ...)'（固定顺序 `mode-start' / `after-init' / `startup' / `first-idle'，
+缺的跳过）、`:loads' 包加载明细 `((LIBRARY MS) ...)'（`phase' 以 \"load:\" 开头的行，
+按 ms 降序，前缀已去掉）。
+
+三条口径必须知晓，否则会把有意为之当 bug 修：
+① **近似归因**：包加载耗时是采集层用 `after-load-functions' 相邻两次回调的**时间差**
+   记录的，差值里含前一个文件的收尾逻辑与它触发的钩子执行 —— 它不是精确耗时；
+② **覆盖范围受加载时机限制**：用户通常在 init 末尾才启用 mode，此时启动已基本结束，
+   于是只能记录 mode 启动之后发生的 load。**mode 在启动结束后启用时只有 `mode-start'**
+   一个锚点，报告节标题必须据此标注覆盖范围，不许把近似数据冒充全程；
+③ `:startup-ms' 与 `:phases' 是两套来源：前者来自 `before-init-time' → `after-init-time'
+   的差值（store 层写入），后者来自采集打点。任一方缺失都不影响另一方。
+
+无该会话、无数据或数据库不可用时返回**同构空结构**（不返回 nil，避免下游判空分叉）；
+查询出错由 `el-chronos-analysis--guard' 告警并返回 nil（同其他查询的降级约定）。"
+  (el-chronos-analysis--guard 'startup-breakdown
+    (when-let* ((db (el-chronos-analysis--db)))
+      (if-let* ((row (el-chronos-analysis--startup-session db session-id)))
+          (cl-destructuring-bind (id started startup) row
+            (let ((phases (el-chronos-analysis--select
+                           db "SELECT phase, ms FROM startup_phases WHERE session_id = ?"
+                           (list id))))
+              (list :session-id id
+                    :started-at started
+                    :startup-ms (and (numberp startup) startup)
+                    :phases (el-chronos-analysis--startup-anchors phases)
+                    :loads (el-chronos-analysis--startup-loads phases))))
+        (el-chronos-analysis--startup-empty session-id)))))
+
+;;; 采集健康（自监控计数）
+(defconst el-chronos-analysis--health-keys
+  '((:dropped-commands . "dropped-commands")
+    (:dropped-events . "dropped-events")
+    (:flush-failures . "flush-failures")
+    (:flush-count . "flush-count")
+    (:flush-ms . "flush-ms")
+    (:sample-misses . "sample-misses"))
+  "返回 plist 键 → `hourly_health.key' 字符串的映射。
+键名在 store 层是字符串枚举（`el-chronos-store-record-health' 的 docstring），
+此处集中映射一次，避免拼写漂移；库里的未知键（将来新增）不影响已有键的取值。")
+
+(defconst el-chronos-analysis--health-bad-keys
+  '("dropped-commands" "dropped-events" "flush-failures" "sample-misses")
+  "参与 `:ok-p' 判定的「坏消息」键。
+`:ok-p' 为 t 读作「本期没有丢失/失败」：丢弃命令、丢弃事件、flush 失败、采样窗口丢失
+全为 0。`flush-count' / `flush-ms' 是正常运转的度量，不算坏消息。")
+
+(defun el-chronos-analysis-health (range)
+  "窗口 RANGE 内采集器自监控计数的汇总。
+返回 plist：`:dropped-commands' `:dropped-events' `:flush-failures' `:flush-count'
+`:sample-misses' 均为整数（库内 REAL，取整）；`:flush-ms' 为求和后的毫秒数（浮点）；
+`:flush-avg-ms' 为 `flush-ms / flush-count'（count 为 0 时 nil，避免除零）；
+`:ok-p' 为「坏消息键」全 0（见 `el-chronos-analysis--health-bad-keys'）；
+`:rows' 为窗口内 `hourly_health' 的**行数**（区分「没有坏消息」与「采集器根本没写过数据」）。
+
+口径三条：
+① 每个键对窗口内的行**求和**（`hourly_health' 的 upsert 语义是累加，同键多行只可能来自
+   多会话/多小时）；
+② **无数据时各项为 0 且 `:ok-p' 为 t** —— 「没有坏消息」不等于「有数据」：库里一条
+   health 行都没有时本函数同样返回 `:ok-p' 为 t。要区分二者请读 `:rows'（0 = 没数据），
+   报告层据 `:rows' 为 0 显示「本期无采集数据」，不走 `:ok-p' 分支（CSV 导出件里对应
+   一行 `rows'）；
+③ 计数是 **eventual** 值：flush 失败时写库本身也失败，失败计数只能在下一次成功 flush
+   时补写（store 层设计 6 的已知悖论），因此失败可能滞后一个 flush 周期才出现在本函数
+   的结果里。
+数据库打不开或查询出错时返回 nil（`el-chronos-analysis--guard' 的降级约定）。"
+  (el-chronos-analysis--guard 'health
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let ((table (make-hash-table :test #'equal))
+            (rows (or (caar (el-chronos-analysis--select
+                             db "SELECT count(*) FROM hourly_health\
+ WHERE hour_ts >= ? AND hour_ts < ?"
+                             (list start end)))
+                      0)))
+        (dolist (row (el-chronos-analysis--select
+                      db (concat "SELECT key, sum(value) FROM hourly_health"
+                                 " WHERE hour_ts >= ? AND hour_ts < ? GROUP BY key")
+                      (list start end)))
+          (puthash (car row) (float (or (nth 1 row) 0)) table))
+        (let* ((value (lambda (key)
+                        (or (gethash (alist-get key el-chronos-analysis--health-keys) table)
+                            0.0)))
+               (flush-count (funcall value :flush-count))
+               (flush-ms (funcall value :flush-ms)))
+          (list :dropped-commands (truncate (funcall value :dropped-commands))
+                :dropped-events (truncate (funcall value :dropped-events))
+                :flush-failures (truncate (funcall value :flush-failures))
+                :flush-count (truncate flush-count)
+                :flush-ms flush-ms
+                :flush-avg-ms (if (> flush-count 0) (/ flush-ms flush-count) nil)
+                :sample-misses (truncate (funcall value :sample-misses))
+                :ok-p (cl-every (lambda (key)
+                                  (zerop (funcall value key)))
+                                '(:dropped-commands :dropped-events
+                                  :flush-failures :sample-misses))
+                :rows rows))))))
+
+;;; 配置变更（git-head / config-sig 的会话序列）
+(defun el-chronos-analysis-config-history (range)
+  "窗口 RANGE 内各会话的变更标记序列，按启动时间**升序**（时间线顺序）。
+返回 plist：`:sessions' 元素是 `(:id N :started-at MS
+:git-head STR|nil :config-sig STR|nil :changed BOOL)' 的 plist 列表、
+`:changes' 是变化次数。
+
+`:changed' 表示**与前一个会话相比** `(git-head, config-sig)' 有变化：第一个会话恒为 nil
+（没有「前一个」，`nil' 读作「无从比较」，与「没变化」区分）；后续会话为 t / nil。
+两个键都为 nil 的两个相邻会话视为**没变化** —— 两次都取不到标记时无法断言配置变了，
+谎报变化比漏报更糟（会让人以为「那天改了什么」）。
+`:changes' 只统计 `:changed' 为 t 的会话数，等于「标记发生变化的次数」。
+
+`git-head' / `config-sig' 取自 `session_meta' 的 KV（store 层写入：取不到就**不写行**），
+因此 nil 表示「未取到」而非「取了但为空」。空库返回 `(:sessions nil :changes 0)`
+（不返回 nil，与其他查询的降级约定一致）；查询出错返回 nil。"
+  (el-chronos-analysis--guard 'config-history
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let ((rows (el-chronos-analysis--select
+                   db (concat "SELECT s.id, s.started_at,"
+                              " (SELECT m.value FROM session_meta m"
+                              "   WHERE m.session_id = s.id AND m.key = ?),"
+                              " (SELECT m.value FROM session_meta m"
+                              "   WHERE m.session_id = s.id AND m.key = ?)"
+                              " FROM sessions s"
+                              " WHERE s.started_at >= ? AND s.started_at < ?"
+                              " ORDER BY s.started_at, s.id")
+                   (list "git-head" "config-sig" start end)))
+            (previous nil)
+            (changes 0)
+            (items nil))
+        (dolist (row rows)
+          (cl-destructuring-bind (id started head sig) row
+            (let* ((marks (list head sig))
+                   (changed (and previous (not (equal marks previous)))))
+              (when changed (setq changes (1+ changes)))
+              (push (list :id id :started-at started
+                          :git-head head :config-sig sig :changed changed)
+                    items)
+              (setq previous marks))))
+        (list :sessions (nreverse items) :changes changes)))))
+
 ;;; 阻塞事件与单条下钻
 (defun el-chronos-analysis-blocking-events (range &optional limit)
   "窗口 RANGE 内的命令外阻塞事件列表，按耗时降序。

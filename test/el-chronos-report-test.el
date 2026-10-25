@@ -18,7 +18,11 @@
 ;;      列表 → `apply'（断言实参确实是 3 个，而不是「一个列表」）；单值 → 单个实参。
 ;;   5. 错误与降级：命令抛错只进报告 `* 错误' 节，调用方不崩；`--save' 在零样本时
 ;;      不写库；`el-chronos-profile-save' 为 nil 时根本不调用 `--save'。
-;;   6. 报告结构：10 个 `* 标题' 节、空库 8 处 `（无数据）'、正文不出现 `nil' 字面量。
+;;   6. 报告结构：14 个 `* 标题' 节、空库 8 处 `（无数据）'、正文不出现 `nil' 字面量；
+;;      新增三节（启动分解 / 采集健康 / 配置变更）各自的有数据与降级渲染，
+;;      其中「采集健康」区分「没采集」（`:rows' 为 0）与「没异常」（`:ok-p' 为 t）。
+;;   9. 导出：CSV 的 8 个 `# section:' 区块（既有 5 + startup / health / config-history）
+;;      与 JSON 的三个新键；断言覆盖行内容而非只认标题。
 ;;   7. 报告期间抑制自观测阻塞：`--without-block-events' 的绑定/恢复 + 关键行为断言
 ;;      （重查询后心跳不新增 `block' 行；对照组直接跑重查询则确实会新增）。
 ;;   8. Web：500 分支不回显内部错误（含绝对路径）、改走 `display-warning'、之后仍可服务；
@@ -275,27 +279,30 @@
 ;;; 报告渲染
 
 (ert-deftest el-chronos-report-test--content-sections ()
-  "fixture 下报告含 11 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。"
+  "fixture 下报告含 14 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。"
   (el-chronos-test-with-db
     (el-chronos-report-test--seed)
     (let ((content (el-chronos-report--content '7d)))
       (should (stringp content))
       (should (string-match-p "\\`#\\+TITLE: el-chronos 报告" content))
-      (should (= 11 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (string-match-p "save-buffer" content))
       (should (string-match-p "leaf-fn" content))
       (should (string-match-p "900 ms" content))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
 
 (ert-deftest el-chronos-report-test--content-empty-db ()
-  "空库时报告仍然成型：11 节、8 处 `（无数据）'、无 `nil' 字面量。
+  "空库时报告仍然成型：14 节、8 处 `（无数据）'、无 `nil' 字面量。
 「GC 与内存」节空库走更具体的降级说明（见 `report-gc-section-degrades-visible'），
-因此不计入 `（无数据）' 的 8 处。"
+「启动分解」/「配置变更」两节同理走各自的降级文案（见各自的 renders-and-degrades 用例），
+「采集健康」空库走「本期无采集数据」（没采集 ≠ 没异常，见
+`health-distinguishes-no-data-from-no-problem'）—— 因此这四节都不计入 `（无数据）' 的 8 处。"
   (el-chronos-test-with-db
     (let ((content (el-chronos-report--content '7d)))
-      (should (= 11 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (= 8 (el-chronos-report-test--count-matches "（无数据）" content)))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
+
 
 (ert-deftest el-chronos-report-test-gc-section-renders ()
   "有 GC 数据时「GC 与内存」节渲染出表头与格式化后的单元格。"
@@ -331,10 +338,185 @@
             (should buffer-read-only)
             (should (eq '1d el-chronos-report--current-range))
             (should (functionp revert-buffer-function))
-            (should (= 11 (el-chronos-report-test--count-matches
+            (should (= 14 (el-chronos-report-test--count-matches
                            "^\\* " (buffer-substring-no-properties
                                     (point-min) (point-max))))))
         (kill-buffer buffer)))))
+
+
+;;; 启动分解 / 采集健康 / 配置变更三节
+
+(ert-deftest el-chronos-report-test-startup-section-renders-and-degrades ()
+  "「启动分解」有数据时渲染覆盖范围标题 + 两张表（锚点 / 包加载，前者固定顺序、
+后者按耗时降序）；无数据时给出可见的整体降级说明（I11：不省略整节）。
+降级分支用 `cl-letf' 把查询打成 nil 模拟 —— 新库总会有一条自动建的会话行，
+真实库很难造出「完全无启动数据」的状态。"
+  (el-chronos-test-with-db
+    (let* ((now (el-chronos-test--now-ms))
+           (id (el-chronos-test--insert-session now 2500.0)))
+      (el-chronos-test--insert-startup-phase id "mode-start" 8.0)
+      (el-chronos-test--insert-startup-phase id "after-init" 1800.0)
+      (el-chronos-test--insert-startup-phase id "load:magit" 1200.0)
+      (el-chronos-test--insert-startup-phase id "load:org" 300.0)
+      (let ((content (el-chronos-report--content '7d)))
+        ;; 标题标注覆盖范围与总时长（mode-start 8 ms / startup_ms 2500 ms）
+        (should (string-match-p "^\\* 启动分解（自 mode 启动起 8 ms / 总 2\\.50 s）$"
+                                content))
+        (should (string-match-p "阶段锚点：" content))
+        (should (string-match-p "| 阶段 | 耗时 |" content))
+        (should (string-match-p "| mode-start | 8 ms |" content))
+        (should (string-match-p "| after-init | 1.80 s |" content))
+        (should (string-match-p "包加载 TOP（前 10）：" content))
+        (should (string-match-p "| magit | 1.20 s |" content))
+        ;; 包加载按耗时降序：magit 在 org 之前
+        (should (< (string-match "| magit |" content) (string-match "| org |" content)))
+        (should-not (string-match-p "本期无启动分解数据" content))
+        (should-not (string-match-p "无包加载明细" content))))
+    ;; 只有 mode-start 一个锚点、没有总耗时与 load 明细：分段降级说明必须可见
+    (let ((id (el-chronos-test--insert-session (el-chronos-test--now-ms) nil)))
+      (el-chronos-test--insert-startup-phase id "mode-start" 3.0)
+      (let* ((content (el-chronos-report--content '7d))
+             (section (substring content (string-match "^\\* 启动分解" content))))
+        (should (string-match-p "^\\* 启动分解（自 mode 启动起 3 ms / 总 -）$" section))
+        (should (string-match-p "无总启动耗时" section))
+        (should (string-match-p "无包加载明细" section))))
+    ;; 查询整体失败（返回 nil）→ 整节降级，不省略标题
+    (cl-letf (((symbol-function 'el-chronos-analysis-startup-breakdown)
+               (lambda (&rest _) nil)))
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* 启动分解$" content))
+        (should (string-match-p "本期无启动分解数据" content))))))
+
+(ert-deftest el-chronos-report-test-health-section-renders-and-degrades ()
+  "「采集健康」有坏消息时渲染 `指标' / `值' 六行；有数据且全零（`:ok-p' 为 t）时只给一行
+说明并带上 flush 次数 / 平均耗时 —— 两种状态都不省略整节（I11）。
+「一行 health 行都没有」是第三种状态，由
+`health-distinguishes-no-data-from-no-problem' 专门覆盖，本用例不重复。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "dropped-commands" 5)
+      (el-chronos-test--insert-health hour "sample-misses" 2)
+      (el-chronos-test--insert-health hour "flush-count" 20)
+      (el-chronos-test--insert-health hour "flush-ms" 100.0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* 采集健康$" content))
+        (should (string-match-p "| 指标 | 值 |" content))
+        (should (string-match-p "| 丢弃命令 | 5 |" content))
+        (should (string-match-p "| 采样窗口丢失 | 2 |" content))
+        (should (string-match-p "| flush 次数 | 20 |" content))
+        (should (string-match-p "| flush 平均耗时 | 5 ms |" content))
+        (should-not (string-match-p "本期无采集异常" content))))
+    (el-chronos-test-with-db
+      (let ((hour (el-chronos-test--hour-ts)))
+        ;; 有行但全零：采集器在工作、没有坏消息
+        (el-chronos-test--insert-health hour "flush-count" 4)
+        (el-chronos-test--insert-health hour "flush-ms" 8.0)
+        (el-chronos-test--insert-health hour "dropped-commands" 0)
+        (let ((content (el-chronos-report--content '7d)))
+          (should (string-match-p "^\\* 采集健康$" content))
+          (should (string-match-p "本期无采集异常" content))
+          (should (string-match-p "flush 4 次" content))
+          (should-not (string-match-p "| 指标 | 值 |" content)))))))
+
+(ert-deftest el-chronos-report-test-health-distinguishes-no-data-from-no-problem ()
+  "「没采集」与「没异常」必须是两句不同的话（I11）。
+空库时 `hourly_health' 一行都没有，analysis 层的 `:ok-p' 也是 t —— 若报告层按 `:ok-p'
+分支渲染，用户会看到「本期无采集异常（本期无 flush 记录）」并读成「一切正常」，而真相是
+采集器根本没上报。有数据且全零才是真正的「无异常」，此时不许出现「无采集数据」。"
+  (el-chronos-test-with-db
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\* 采集健康$" content))
+      (should (string-match-p "本期无采集数据（采集器尚未写入健康指标）" content))
+      (should-not (string-match-p "本期无采集异常" content))))
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "dropped-commands" 0)
+      (el-chronos-test--insert-health hour "flush-count" 7)
+      (el-chronos-test--insert-health hour "flush-ms" 35.0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "本期无采集异常（flush 7 次，平均 5 ms）" content))
+        (should-not (string-match-p "本期无采集数据" content))))))
+
+(ert-deftest el-chronos-report-test-config-section-renders-and-degrades ()
+  "「配置变更」渲染 `会话启动时间' / `提交' / `配置指纹' / `变化' 四列：两个哈希各截前
+8 位，`:changed' 为 t 时显示 `✓'、首会话显示 \"-\"；窗口内无会话时给出降级说明。"
+  (el-chronos-test-with-db
+    (let* ((end (- (el-chronos-test--now-ms) 3600000))
+           (start (- end 3600000))
+           (window (cons start end))
+           (first (el-chronos-test--insert-session (+ start 1000) 100.0))
+           (second (el-chronos-test--insert-session (+ start 2000) 100.0)))
+      (el-chronos-test--insert-session-meta first "git-head" "aaaaaaaabbbbcccc")
+      (el-chronos-test--insert-session-meta first "config-sig" "111122223333")
+      (el-chronos-test--insert-session-meta second "git-head" "ddddddddeeeeffff")
+      (el-chronos-test--insert-session-meta second "config-sig" "111122223333")
+      (let ((content (el-chronos-report--content window)))
+        (should (string-match-p "^\\* 配置变更$" content))
+        (should (string-match-p "| 会话启动时间 | 提交 | 配置指纹 | 变化 |" content))
+        (should (string-match-p "| aaaaaaaa | 11112222 | - |" content))
+        (should (string-match-p "| dddddddd | 11112222 | ✓ |" content))
+        (should-not (string-match-p "本期无会话变更记录" content))))
+    ;; 窗口内没有任何会话 → 整节降级（不省略标题）
+    (el-chronos-test-with-db
+      (let ((content (el-chronos-report--content (cons 1000000 2000000))))
+        (should (string-match-p "^\\* 配置变更$" content))
+        (should (string-match-p "本期无会话变更记录" content))))))
+
+;;; 导出：既有的 5 个区块 + 三个新查询
+
+(ert-deftest el-chronos-report-test-report-export-includes-new-sections ()
+  "CSV 含 startup / health / config-history 三个新区块且既有区块不丢；
+JSON 含 `:startup' / `:health' / `:config_history' 三个新键。
+新增区块不是「有标题就算完」：断言还覆盖各区块的实际行内容（启动分解的两段 `kind'、
+采集健康的 `rows' 行、配置变更的完整哈希与 `1'/'0' 变化标记），否则生成函数写错了
+标题照样匹配。"
+  (el-chronos-test-with-db
+    (let* ((now (el-chronos-test--now-ms))
+           (id (el-chronos-test--insert-session now 2500.0))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-startup-phase id "mode-start" 8.0)
+      (el-chronos-test--insert-startup-phase id "load:magit" 1200.0)
+      (el-chronos-test--insert-health hour "flush-count" 3)
+      (el-chronos-test--insert-health hour "flush-ms" 12.0)
+      (el-chronos-test--insert-session-meta id "git-head" "aaaaaaaabbbbcccc")
+      (el-chronos-test--insert-session-meta id "config-sig" "111122223333")
+      (let ((csv (el-chronos-report--csv-string '7d)))
+        ;; 三个新区块的标题
+        (should (string-match-p "^# section: startup$" csv))
+        (should (string-match-p "^# section: health$" csv))
+        (should (string-match-p "^# section: config-history$" csv))
+        ;; 既有 5 个区块仍在（导出是全量快照，不许因新增而丢旧块）
+        (should (string-match-p "^# section: slow-commands$" csv))
+        (should (string-match-p "^# section: top-functions$" csv))
+        (should (string-match-p "^# section: packages$" csv))
+        (should (string-match-p "^# section: trend$" csv))
+        (should (string-match-p "^# section: blocking-events$" csv))
+        ;; startup：阶段锚点与包加载合成一张 kind/name/ms 表
+        (should (string-match-p "^kind,name,ms$" csv))
+        (should (string-match-p "^phase,mode-start,8\\(\\.0\\)?$" csv))
+        (should (string-match-p "^load,magit,1200\\(\\.0\\)?$" csv))
+        ;; health：key/value 窄表，含区分「没采集」用的 rows 行
+        (should (string-match-p "^metric,value$" csv))
+        (should (string-match-p "^flush_count,3$" csv))
+        (should (string-match-p "^rows,2$" csv))
+        ;; config-history：完整哈希（不截 8 位）；`changed' 取决于库里是否已有更早的会话
+        ;; （测试夹具的库在打开时会自动写一条会话行并带真实 git-head），故这里只断言取值域
+        (should (string-match-p "^session_id,started_at_ms,git_head,config_sig,changed$" csv))
+        (should (string-match-p (format "\n%d,%d,aaaaaaaabbbbcccc,111122223333,[01]\n"
+                                        id now)
+                                csv)))
+      (let ((json (json-parse-string (el-chronos-report--json-string '7d)
+                                     :object-type 'plist)))
+        (should (plist-member json :startup))
+        (should (plist-member json :health))
+        (should (plist-member json :config_history))
+        ;; 新键里确实带数据（不是空壳）。注意嵌套 plist 的键由 `json-serialize' 直接取符号名，
+        ;; 连字符不会转下划线（既有 `slow_commands' 里的 `total-ms' 就是同一形态）
+        (should (equal 2500.0 (plist-get (plist-get json :startup) :startup-ms)))
+        (should (= 2 (plist-get (plist-get json :health) :rows)))
+        ;; 会话序列里必有本次插入的会话（夹具库在打开时会自动写一条会话行，故不判总数）
+        (should (cl-some (lambda (session) (equal id (plist-get session :id)))
+                         (append (plist-get (plist-get json :config_history) :sessions) nil)))))))
 
 ;;; 单条事件下钻：`el-chronos-show-event'
 

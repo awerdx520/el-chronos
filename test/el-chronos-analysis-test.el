@@ -32,6 +32,16 @@
     (el-chronos-test--insert-function hour "fn-bbb" "/tmp/b.el" "org" 30.0 30.0 3)
     (el-chronos-test--insert-function hour "Automatic GC" nil nil 10.0 10.0 1)))
 
+(defun el-chronos-analysis-test--drop-auto-session ()
+  "删除 `el-chronos-store-open' 自动建的会话行。
+`el-chronos-test-with-db' 打开库时会经 `--ensure-session' 建一行「本进程会话」
+（batch 下 `startup_ms' 也有值，约 0.4 ms），它会让「空库」与「窗口内会话数」类断言
+凭空多出一行 —— 这类用例先清空 `sessions' 再从零造 fixture。
+先删 `commands' 再删 `sessions'：`commands.session_id' 有外键约束（open 时
+`foreign_keys=ON'），顺序反过来会在有命令行时撞约束。"
+  (el-chronos-test--exec "DELETE FROM commands")
+  (el-chronos-test--exec "DELETE FROM sessions"))
+
 ;;; 时间范围
 
 (ert-deftest el-chronos-analysis-test-range-upper-bound ()
@@ -427,7 +437,179 @@
         (should (equal "31.1" (plist-get found :emacs-version)))
         (should (equal "test-host" (plist-get found :host)))))))
 
+;;; 启动分解
+
+(ert-deftest el-chronos-analysis-test-startup-breakdown ()
+  "有数据：阶段锚点按固定顺序输出（缺的跳过），包加载按 ms 降序且去掉 `load:' 前缀。
+插入顺序故意打乱 —— 输出顺序只由代码决定，与库内行序无关。"
+  (el-chronos-test-with-db
+    (let* ((now (el-chronos-test--now-ms))
+           (id (el-chronos-test--insert-session now 4321.0)))
+      (el-chronos-test--insert-startup-phase id "startup" 1500.0)
+      (el-chronos-test--insert-startup-phase id "load:org" 300.0)
+      (el-chronos-test--insert-startup-phase id "mode-start" 12.0)
+      (el-chronos-test--insert-startup-phase id "load:magit" 900.0)
+      (el-chronos-test--insert-startup-phase id "after-init" 800.0)
+      (let ((breakdown (el-chronos-analysis-startup-breakdown id)))
+        (should (= id (plist-get breakdown :session-id)))
+        (should (= now (plist-get breakdown :started-at)))
+        (should (= 4321.0 (plist-get breakdown :startup-ms)))
+        ;; first-idle 无行 → 跳过，不补 nil 行
+        (should (equal '(("mode-start" 12.0) ("after-init" 800.0) ("startup" 1500.0))
+                       (plist-get breakdown :phases)))
+        (should (equal '(("magit" 900.0) ("org" 300.0))
+                       (plist-get breakdown :loads)))))))
+
+(ert-deftest el-chronos-analysis-test-startup-breakdown-default-session ()
+  "SESSION-ID 为 nil 时取最近一个「有启动数据」的会话：`startup_ms' 非空**或**
+`startup_phases' 有行即可（总耗时可能缺失而锚点仍在）。"
+  (el-chronos-test-with-db
+    (let* ((now (el-chronos-test--now-ms))
+           (old (el-chronos-test--insert-session (- now 5000) 1000.0))
+           (latest (el-chronos-test--insert-session now nil)))
+      (el-chronos-test--insert-startup-phase old "mode-start" 5.0)
+      (el-chronos-test--insert-startup-phase latest "mode-start" 7.0)
+      (let ((breakdown (el-chronos-analysis-startup-breakdown nil)))
+        (should (= latest (plist-get breakdown :session-id)))
+        (should-not (plist-get breakdown :startup-ms))
+        (should (equal '(("mode-start" 7.0)) (plist-get breakdown :phases)))))))
+
+(ert-deftest el-chronos-analysis-test-startup-breakdown-empty ()
+  "空库与不存在的会话都返回**同构空结构**（不是 nil），避免下游判空分支分叉。"
+  (el-chronos-test-with-db
+    (el-chronos-analysis-test--drop-auto-session)
+    (let ((empty (el-chronos-analysis-startup-breakdown nil)))
+      (should (listp empty))
+      (should-not (plist-get empty :session-id))
+      (should-not (plist-get empty :started-at))
+      (should-not (plist-get empty :phases))
+      (should-not (plist-get empty :loads)))
+    (let ((missing (el-chronos-analysis-startup-breakdown 999999)))
+      (should (listp missing))
+      ;; 显式传的 id 原样回填，便于调用方确认「查的是哪个会话」
+      (should (= 999999 (plist-get missing :session-id)))
+      (should-not (plist-get missing :started-at))
+      (should-not (plist-get missing :phases)))))
+
+;;; 采集健康
+
+(ert-deftest el-chronos-analysis-test-health-sums ()
+  "按 key 求和（跨小时累加），坏消息非 0 时 `:ok-p' 为 nil，平均耗时 = flush-ms/次数。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (earlier (- hour 3600000)))
+      (el-chronos-test--insert-health hour "dropped-commands" 3)
+      (el-chronos-test--insert-health earlier "dropped-commands" 4)
+      (el-chronos-test--insert-health hour "dropped-events" 2)
+      (el-chronos-test--insert-health hour "flush-failures" 1)
+      (el-chronos-test--insert-health hour "flush-count" 10)
+      (el-chronos-test--insert-health hour "flush-ms" 500.0)
+      (el-chronos-test--insert-health earlier "flush-count" 4)
+      (el-chronos-test--insert-health earlier "flush-ms" 100.0)
+      (let ((health (el-chronos-analysis-health window)))
+        (should (= 7 (plist-get health :dropped-commands)))
+        (should (= 2 (plist-get health :dropped-events)))
+        (should (= 1 (plist-get health :flush-failures)))
+        (should (= 14 (plist-get health :flush-count)))
+        (should (= 600.0 (plist-get health :flush-ms)))
+        (should (= (/ 600.0 14) (plist-get health :flush-avg-ms)))
+        (should (= 0 (plist-get health :sample-misses)))
+        (should-not (plist-get health :ok-p))
+        (should (= 8 (plist-get health :rows)))))))
+
+(ert-deftest el-chronos-analysis-test-health-ok ()
+  "只有正常运转计数（flush 次数 / 耗时）时 `:ok-p' 为 t；`:rows' 区分「无坏消息」与「没数据」。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "flush-count" 8)
+      (el-chronos-test--insert-health hour "flush-ms" 400.0)
+      (let ((health (el-chronos-analysis-health window)))
+        (should (eq t (plist-get health :ok-p)))
+        (should (= 8 (plist-get health :flush-count)))
+        (should (= 50.0 (plist-get health :flush-avg-ms)))
+        (should (= 0 (plist-get health :dropped-commands)))
+        (should (= 0 (plist-get health :sample-misses)))
+        (should (= 2 (plist-get health :rows)))))))
+
+(ert-deftest el-chronos-analysis-test-health-empty ()
+  "空库：各项为 0、`:ok-p' 为 t、`:rows' 为 0、无平均耗时（`flush-count' 为 0 时不除零）。
+注意「没有坏消息」不等于「有数据」——要区分只能读 `:rows'。"
+  (el-chronos-test-with-db
+    (let ((health (el-chronos-analysis-health (el-chronos-analysis-test--window))))
+      (should (listp health))
+      (should (= 0 (plist-get health :dropped-commands)))
+      (should (= 0 (plist-get health :dropped-events)))
+      (should (= 0 (plist-get health :flush-failures)))
+      (should (= 0 (plist-get health :flush-count)))
+      (should (= 0.0 (plist-get health :flush-ms)))
+      (should-not (plist-get health :flush-avg-ms))
+      (should (= 0 (plist-get health :sample-misses)))
+      (should (eq t (plist-get health :ok-p)))
+      (should (= 0 (plist-get health :rows))))))
+
+;;; 配置变更
+
+(ert-deftest el-chronos-analysis-test-config-history-changes ()
+  "变化点识别：与**前一个**会话比较 (git-head, config-sig)，两种键任一变化都算；
+首会话 `:changed' 为 nil（无从比较），`:changes' 等于变化次数。"
+  (el-chronos-test-with-db
+    (el-chronos-analysis-test--drop-auto-session)
+    (let* ((window (el-chronos-analysis-test--window))
+           (base (car window))
+           (first (el-chronos-test--insert-session (+ base 1000) 100.0))
+           (same (el-chronos-test--insert-session (+ base 2000) 100.0))
+           (head-changed (el-chronos-test--insert-session (+ base 3000) 100.0))
+           (sig-changed (el-chronos-test--insert-session (+ base 4000) 100.0)))
+      (dolist (spec (list (list first "aaaa1111" "sig-old")
+                          (list same "aaaa1111" "sig-old")
+                          (list head-changed "bbbb2222" "sig-old")
+                          (list sig-changed "bbbb2222" "sig-new")))
+        (el-chronos-test--insert-session-meta (nth 0 spec) "git-head" (nth 1 spec))
+        (el-chronos-test--insert-session-meta (nth 0 spec) "config-sig" (nth 2 spec)))
+      (let* ((history (el-chronos-analysis-config-history window))
+             (sessions (plist-get history :sessions)))
+        (should (= 2 (plist-get history :changes)))
+        (should (= 4 (length sessions)))
+        ;; 升序（时间线顺序），不是 sessions 查询惯用的降序
+        (should (equal (list first same head-changed sig-changed)
+                       (mapcar (lambda (item) (plist-get item :id)) sessions)))
+        (should-not (plist-get (nth 0 sessions) :changed))
+        (should-not (plist-get (nth 1 sessions) :changed))
+        (should (eq t (plist-get (nth 2 sessions) :changed)))
+        (should (eq t (plist-get (nth 3 sessions) :changed)))
+        (should (equal "aaaa1111" (plist-get (nth 0 sessions) :git-head)))
+        (should (equal "sig-old" (plist-get (nth 0 sessions) :config-sig)))
+        (should (equal "sig-new" (plist-get (nth 3 sessions) :config-sig)))))))
+
+(ert-deftest el-chronos-analysis-test-config-history-empty ()
+  "空窗口返回 `(:sessions nil :changes 0)'（不是 nil）；窗口内有会话但无标记时
+`:git-head' / `:config-sig' 为 nil，且两个会话都取不到标记时**不谎报**变化。"
+  (el-chronos-test-with-db
+    (el-chronos-analysis-test--drop-auto-session)
+    (let ((history (el-chronos-analysis-config-history (cons 1000000 2000000))))
+      (should (listp history))
+      (should-not (plist-get history :sessions))
+      (should (= 0 (plist-get history :changes))))
+    (let* ((window (el-chronos-analysis-test--window))
+           (base (car window))
+           (one (el-chronos-test--insert-session (+ base 1000) 100.0))
+           (two (el-chronos-test--insert-session (+ base 2000) 100.0)))
+      (let* ((history (el-chronos-analysis-config-history window))
+             (sessions (plist-get history :sessions))
+             (first (car sessions)))
+        (should (= 2 (length sessions)))
+        (should (= one (plist-get first :id)))
+        (should-not (plist-get first :git-head))
+        (should-not (plist-get first :config-sig))
+        (should-not (plist-get first :changed))
+        (should-not (plist-get (nth 1 sessions) :changed))
+        (should (= 0 (plist-get history :changes)))
+        (should (= two (plist-get (nth 1 sessions) :id)))))))
+
 ;;; 空库降级
+
 
 (ert-deftest el-chronos-analysis-test-empty-database ()
   "空库上所有查询返回 nil 或 0，不抛错（I6 降级）。"

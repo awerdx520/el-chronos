@@ -9,6 +9,13 @@
 
 ### 修复
 
+- **「采集健康」不再把「没采集」显示成「一切正常」（I11）**：`hourly_health` 一行都没有时
+  `el-chronos-analysis-health` 各项为 0 且 `:ok-p` 为 t，报告层原先直接走 `:ok-p` 分支，用户看到
+  「本期无采集异常（本期无 flush 记录）」——真实含义是采集器根本没上报。修法：报告层先判 `:rows`，
+  为 0 时改显示「本期无采集数据（采集器尚未写入健康指标）」；`:rows` 非 0 时才按 `:ok-p` 决定
+  「无异常一行」还是六行指标表。CSV 导出的 `health` 区块补一行 `rows`，让下游同样能区分二者。
+  新增用例 `el-chronos-report-test-health-distinguishes-no-data-from-no-problem` 锁住两种状态的
+  互斥文案。
 - **`el-chronos-purge` 从 6 表扩展到 10 表**：补齐 schema v2 新增的 `hourly_gc` / `startup_phases` / `hourly_health` / `session_meta`，否则这四张表的数据永远无法通过 purge 清理。
 - **修复 `el-chronos-purge` 遇「跨界会话」整体回滚**：很早启动、当天仍在运行的会话，其 `started_at` 落在保留窗口之外而子表行落在窗口之内，删除时触发**外键冲突**，导致整个 purge 事务 ROLLBACK、一条数据都没删。
 - **`purge` 重建会话行时把 `startup_ms` 置 NULL**：避免出现「新 `started_at` 配旧启动耗时」的自相矛盾数据。
@@ -48,6 +55,9 @@
 
 ### 变更
 
+- **org 报告节数 11 → 14**：新增「启动分解」「采集健康」「配置变更」三节，位置在「GC 与内存」之后、
+  「阻塞事件」之前（三者都回答「这台机器这个时期的状态如何」，与趋势族相邻）。三节都遵守 I11：
+  无数据时给**具体**的降级文案而不是静默省略。
 - **`startup_ms` 在 mode 早于 `after-init-hook` 启用时改为「钩子捕获 + 下一次 flush 补写」**：这类会话里 `--ensure-session` 建会话行时 `after-init-time` 仍是 nil（`startup.el` 先 `setq after-init-time` 再跑 `after-init-hook`，两行都在 init 文件加载之后），`startup_ms` 落 NULL 且事后无人能补。现在由 `after-init-hook` 一次性回调算出 `before-init-time` → `after-init-time` 的毫秒差，调 `el-chronos-store-note-startup-ms` **纯内存登记**；真正的 `UPDATE sessions SET startup_ms = ? WHERE id = ? AND startup_ms IS NULL`（`IS NULL` 守卫防覆盖已正确写入的值）由 store 的下一次 flush 在**既有事务内**完成，COMMIT 成功才清 pending、ROLLBACK 保留。因此**启动期零 IO**（`busy_timeout=2000ms` 最坏把启动拖住 2s 的风险归零）、不新增 timer（复用既有 5 秒 flush）。代价：补写延迟 ≤ 一个 flush 周期，其间读 `startup_ms` 仍为 NULL。同时 `el-chronos-collect-stop` 的清理顺序改为「先摘启动打点钩子与 timer → 再 `--sample-tick` 收尾 → 再摘其余钩子」：补写回调若在清理途中被触发，会往「正在关闭」的会话里再登记一次 pending，`store-close` 的 flush 就把它写进库了。
 - **org 报告节数 10 → 11**：新增「GC 与内存」节，位置在「趋势」之后、「阻塞事件」之前；无数据时该节显示可见降级说明而非静默省略。
 - **`hourly_gc` 的 `heap_bytes` 采用 `COALESCE` 覆盖语义**：堆大小每 N 个采样窗口才采一次，其余窗口传 NULL；若用普通覆盖写入，同一小时后到的窗口会把已采到的堆值抹成 NULL，因此改为 `COALESCE` 保留已有值。
@@ -72,6 +82,17 @@
 
 ### 新增
 
+- **启动分解 / 采集健康 / 配置变更：三个只读查询 + 报告三节 + 导出覆盖（T7b + T8）**：新增
+  `el-chronos-analysis-startup-breakdown`（会话启动分解：`mode-start` / `after-init` / `startup` /
+  `first-idle` 确定性锚点 + 包加载 TOP，`:startup-ms` 与 `:phases` 是两套来源、任一方缺失不影响
+  另一方）、`el-chronos-analysis-health`（`hourly_health` 窗口求和 + `:ok-p` 坏消息判定 + `:rows`
+  行数）、`el-chronos-analysis-config-history`（会话序列 + 与**前一会话**比对得出的变更点，首会话
+  `:changed` 恒为 nil）。org 报告新增「启动分解」/「采集健康」/「配置变更」三节。
+  **CSV/JSON 导出同步覆盖三个新查询**：CSV 追加 `# section: startup`（阶段锚点与包加载合成
+  `kind` / `name` / `ms` 一张表）、`# section: health`（`metric` / `value`，含一行 `rows`，导出件
+  同样能区分「没采集」与「没异常」）、`# section: config-history`（会话时间 / **完整** `git-head` /
+  `config-sig` / `changed` 写 `1`/`0`）三个区块，JSON 新增 `startup` / `health` / `config_history`
+  三个键；既有 5 个 CSV 区块与既有 JSON 键一律保留。用例总数 **179 → 192**。
 - **启动耗时分解（T6）**：新增采集侧「启动打点」，落 `startup_phases` 表。① **3 个确定性锚点**：`mode-start`（`collect-start` 记，即观测起点）/ `after-init`（`after-init-hook`）/ `startup`（`emacs-startup-hook`），值均为相对 `before-init-time` 的毫秒偏移；`first-idle` 为**可选**锚点（仅在能注册 idle timer 时记一次），因 idle 时机受用户活动影响、不可预期，**不参与任何判定**。② **包加载明细**：挂内置 `after-load-functions`，把相邻两次触发的 `float-time` 差值记成「这次 load 的耗时」（**近似归因**，差值里含前一个文件的收尾逻辑与它触发的钩子执行），落 `load:<library>`；内存保存全部记录，**只在写库前**按毫秒降序截断到 top-N（新 defcustom `el-chronos-startup-top-n`，默认 50，`0`/`nil` = 不记明细只记锚点）。③ 摘钩用**确定性三元**（`emacs-startup-hook` 已触发 / 累计 load 次数达 `4 × top-n` / 30 秒一次性 timer，任一满足即摘并落库），不依赖 idle 时机，`mode -1` 后零残留（I5）。
   **物理边界（务必照此理解数据）**：用户通常在 init 末尾（或用 `emacs-startup-hook`）才开启 mode，此时启动已基本结束 → **只记 `mode-start` 锚点，无任何包加载明细，也没有 `after-init` / `startup` 锚点**（钩子**一个都不挂**，因为强行挂上只会把「启动后的日常加载」冒充成启动耗时）；要覆盖完整启动，必须把 `(el-chronos-mode 1)` 提前到 `early-init.el`。这一判断使本机这类配置的启动打点开销为零。
   用例总数 **167 → 179**（T6a 8 例：不挂判据 / 累计语义 / top-N 截断 / 摘钩 / 幂等 / 次数上限 / 锚点 / 安装清理；T6b 4 例：`startup_ms` 零 IO 捕获 / 时间缺失跳过 / `collect-stop` 顺序 / 清理完整性），含两个反向验证（去掉「启动已结束就不挂」→ 用例必红；去掉 top-N 截断 → 用例必红）。

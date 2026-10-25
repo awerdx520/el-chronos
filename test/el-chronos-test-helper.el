@@ -169,6 +169,29 @@ SESSION-ID 默认取当前会话，显式传入可造同一小时的多个会话
    (list hour-ts (or session-id el-chronos--session-id 0)
          (or gc-count 0) (float (or gc-ms 0)) heap-bytes)))
 
+(defun el-chronos-test--insert-startup-phase (session-id phase ms)
+  "插入一条启动阶段打点：SESSION-ID / PHASE / MS（毫秒）。
+PHASE 取 `mode-start' / `after-init' / `startup' / `first-idle'，包加载明细传
+\"load:<library>\"。主键是 (session_id, phase)，同键重复插入会撞约束。"
+  (el-chronos-test--exec
+   "INSERT INTO startup_phases (session_id, phase, ms) VALUES (?, ?, ?)"
+   (list session-id phase (float (or ms 0)))))
+
+(defun el-chronos-test--insert-health (hour-ts key value &optional session-id)
+  "插入一条自监控计数：HOUR-TS / KEY / VALUE；SESSION-ID 默认取当前会话。
+主键是 (hour_ts, session_id, key)，同小时同键重复插入会撞约束（要造多行请换小时）。"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_health (hour_ts, session_id, key, value) VALUES (?, ?, ?, ?)"
+   (list hour-ts (or session-id el-chronos--session-id 0) key (float (or value 0)))))
+
+(defun el-chronos-test--insert-session-meta (session-id key value)
+  "插入一条会话级元数据 KV：SESSION-ID / KEY / VALUE（VALUE 为 nil 时落 NULL）。
+KEY 取 `git-head' / `config-sig' / `mode-start' 等；主键是 (session_id, key)。"
+  (el-chronos-test--exec
+   "INSERT INTO session_meta (session_id, key, value) VALUES (?, ?, ?)"
+   (list session-id key value)))
+
+
 (provide 'el-chronos-test-helper)
 
 ;;; el-chronos-test-helper.el ends here

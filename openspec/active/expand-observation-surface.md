@@ -17,12 +17,17 @@
   已回填 `AGENTS.md`。它必须是前置的原因仍然成立：该计划修复前 nil 帧占 `unknown` 样本的 38.8%、
   其 `total_ms` 占全部样本 98.7%，任何基于 `hourly_functions` 的新增查询（本期 T7 的 GC 趋势、
   T8 的 GC 与内存节）都会被那个污染带偏。
+- **T1–T8 完成 / 剩余 T9（Web）+ T10（文档归档）**；当前基线 `make test` **192 用例**、`make lint` 零告警
 - 已完成：T1（schema v2 + `purge` 扩表 + 外键修复）✅ / T2（store 写入层 + `startup_ms` 补写 +
   孤儿会话守卫）✅ / T3（变更标记）✅ / T4（GC 与内存采集）✅ / T5（采集器自监控）✅ /
   T6（启动打点：`after-load-functions` 近似归因 + 3 个确定性锚点 + top-N 明细 +
   `startup_ms` 补写钩子 + `collect-stop` 顺序重排；基线 167 → 179 用例）✅ /
-  T7a（`gc-trend` 查询 + 报告「GC 与内存」节，基线 153 → 159 用例）✅
-- 下一步：T7b–T10（analysis 剩余查询 → 报告 3 节 → Web 路由 → 文档同步与归档）
+  T7a（`gc-trend` 查询 + 报告「GC 与内存」节，基线 153 → 159 用例）✅ /
+  T7b（`startup-breakdown` / `health` / `config-history` 三个查询）✅ /
+  T8（报告三节 + 配置变更节，节数 10 → 14；CSV/JSON 导出同步覆盖；基线 179 → 192 用例）✅
+- 剩余：**T9（Web 路由 `/api/gc` / `/api/health` / `/api/startup` + 面板）+ T10（文档同步与归档）**
+- 下一步：T9 → T10（T10 收尾时把本计划归档到 `openspec/completed/`，并按计划文档清单同步
+  `AGENTS.md` / `docs/*.org` / `Readme.org`）
 
 ## 目标
 
@@ -646,7 +651,10 @@ packed-refs 回退是必需路径。
   hash 与 pending 标志为空（I5）；`make test` 全绿。
   （依赖：T2）
 
-- [ ] **T7 analysis 4 个查询 + 测试**
+- [x] **T7 analysis 4 个查询 + 测试** ✅（2026-10-25 完成）
+  交付：`gc-trend`（T7a，153 → 159 用例）+ `startup-breakdown` / `health` / `config-history`
+  （T7b）。`health` 额外返回 `:rows`（窗口内 `hourly_health` 行数），用于把「没采集」与
+  「没异常」分开——`hourly_health` 无行时 `:ok-p` 同为 t，单看 `:ok-p` 会误读。基线 179 → 192。
   改动文件：`/home/thomas/Workspace/el-chronos/el-chronos-analysis.el`、
   `/home/thomas/Workspace/el-chronos/test/el-chronos-analysis-test.el`
   步骤：按设计 9 的签名实现 4 个函数，全部包在 `el-chronos-analysis--guard` 内，
@@ -656,7 +664,11 @@ packed-refs 回退是必需路径。
   `(:buckets nil ...)` 而非 nil；`make test` 全绿、`make lint` 零告警。
   （依赖：T1）
 
-- [ ] **T8 report 新增 3 节（GC 与内存 / 采集健康 / 启动分解）**
+- [x] **T8 report 新增 3 节（GC 与内存 / 采集健康 / 启动分解）** ✅（2026-10-25 完成）
+  交付：除计划的三节外另有「配置变更」一节（`config-history` 的天然呈现形态），**节数 10 → 14**
+  （计划预估 13）。「采集健康」按 `:rows` 分三态渲染：无数据 / 无异常 / 六行指标表。
+  CSV 与 JSON 导出同步覆盖三个新查询（CSV 8 个 `# section:` 区块，JSON 新增 `startup` /
+  `health` / `config_history` 三个键）。
   改动文件：`/home/thomas/Workspace/el-chronos/el-chronos-report.el`、
   `/home/thomas/Workspace/el-chronos/test/el-chronos-report-test.el`
   步骤：① 用现有 `el-chronos-report--table-section` 追加三节，位置：GC 与内存（「趋势」之后）、
