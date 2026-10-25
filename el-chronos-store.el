@@ -1088,6 +1088,7 @@ session_id 语义上恒非 NULL（NULL 会让主键去重失效），故宁可�
                        "会话 ID 缺失或对应会话行不存在，本次已跳过 hourly_stacks 写入。"
                        :warning))
     nil)))
+;;;###autoload
 (defun el-chronos-store-flush ()
   "把全部缓冲批量写入数据库（单事务）。无句柄或无缓冲时直接返回。
 flush 失败按计划丢弃本批（磁盘满/锁超时时数据本就无法落库），避免内存无界增长：
@@ -1404,6 +1405,7 @@ git-head / config-sig），「以为删了其实没删」比「少删几个会�
            (list before before))
         (sqlite-execute db (format "DELETE FROM %s" table)))
       0))
+;;;###autoload
 (defun el-chronos-purge (&optional before)
   "删除 BEFORE（epoch 毫秒）之前的全部数据；BEFORE 为 nil 时清空全部 11 张表。
 返回按删除顺序排列的 ((表名 . 删除行数) ...)。
@@ -1464,6 +1466,7 @@ purge 会删掉当前会话行，故结束后用 `--ensure-session' 补建一行
        (ignore-errors (sqlite-execute el-chronos-store--db "ROLLBACK"))
        (el-chronos-store--warn "purge 失败（已回滚）：%S" err)
        nil))))
+;;;###autoload
 (defun el-chronos-store-vacuum ()
   "对当前数据库执行 VACUUM 回收空间；未打开返回 nil。VACUUM 不能在事务内执行。"
   (interactive)

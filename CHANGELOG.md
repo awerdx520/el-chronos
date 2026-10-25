@@ -7,8 +7,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **autoload 契约：15 个 interactive 命令全部带 `;;;###autoload` cookie**（新增 14 处；`el-chronos-profile-command` 原本就有）。按文件分布：入口 2（`el-chronos-mode` / `el-chronos-status`）/ 归因 1 / 存储 3（`store-flush` / `purge` / `store-vacuum`）/ 采集 2（`collect-start` / `collect-stop`）/ 报告 5 / Web 2。只加 cookie 行，**不改函数体、docstring、签名**；`collect-start` / `collect-stop` / `store-flush` 虽标 interactive，仍由 `el-chronos-mode` 与 5s flush timer 编排，不建议手动调用（`docs/api.org` 已注明）。
+- **`make autoloads` 目标**：生成 `el-chronos-autoloads.el`（15 条 `(autoload SYM "定义文件" ...)` 声明，实测 221 行）。Emacs 29.1+ 走 `loaddefs-generate`（自身产物列入 `EXCLUDED-FILES` 防自引用），更早版本回退 `make-directory-autoloads`。**生成物不入库**（`.gitignore` 忽略）、**不进 L1/L2**（`EL_FILES` 的 `find` 显式 `-not -name 'el-chronos-autoloads.el'`，否则生成后括号检查与字节编译的检查范围会随生成物变化）。
+- **`test/el-chronos-autoload-test.el`（3 用例）**：① cookie 覆盖全部 interactive 命令的**计数不变量**（代码中 `(interactive` 出现次数 + `define-minor-mode` 数 = cookie 数 = 命令清单长度，用 `syntax-ppss` 排除注释与字符串、不写死数字）；② 按与 Makefile 同源逻辑生成 autoloads 后 15 个命令 `autoloadp` 为 `t`（`loaddefs-generate` 缺失时 `ert-skip`）；③ 每条 autoload 的库名等于其定义文件。用例总数 **234 → 237**（0 skipped）。
+- **use-package 集成文档**：`Readme.org`「安装」新增「方式 C：use-package」（`:straight nil` / `:load-path` 字符串字面量绝对路径 / `:demand t` / `:init` 五条显式 autoload / `:config` 实例守卫 + lambda 形态 hook）与「为什么不建议 `:defer t`」；`docs/operations.org` 新增「autoloads 生成」「三个静默陷阱」「`:hook` 无参 toggle 陷阱」「排障：`M-x` 命令未定义」四节，卸载节补「删除 `el-chronos-autoloads.el`」；`docs/api.org` 新增「autoload 与 use-package 集成」节（15 命令 ↔ 定义文件 ↔ 生成入口 ↔ 为何库名必须是定义文件）。（v3 已改为 straight `:local-repo`，见下文「变更」条）
+
 ### 修复
 
+- **`:if` 包不住 `:straight`（配置示例与 init-chronos 的降级判据）**：原写法用 `use-package` 的 `:if (file-exists-p ...)` 表达「仓库缺失就不安装」。实测 `(macroexpand-1 '(use-package el-chronos :if nil :straight (el-chronos …)))` 返回 `(progn (straight-use-package '(el-chronos …)) (when nil (require 'el-chronos nil nil)))` —— straight 安装调用位于 `progn` 顶层、`:if` 之后只包住 `require`，条件为假时**照样执行**（以 `cl-letf` 把 `straight-use-package` 换成记录器实测：旧形态被调用、新形态不被调用）。修法：用 `if` 包住整个 `use-package`（`(if (file-exists-p …) (use-package …) (display-warning …))`），展开后安装调用落进 `if` 的 then 分支。文档同步：`Readme.org`「方式 C」示例与陷阱节、`docs/operations.org`「方式 C」示例 + 表格 + 陷阱 ④（原「三个静默陷阱」增至四个）、`docs/api.org`「配置侧写法」要点、`AGENTS.md`「已知边界」、`openspec/completed/add-use-package-support.md`（新增 P8 + 修订记录 v4）；`thomas-emacs` 仓的 `lisp/init-chronos.el` / `CHANGELOG.md` / `AGENTS.md` 同步。
+- **`docs/api.org` 三处 interactive 标注缺失**：`el-chronos-store-flush`、`el-chronos-collect-start`、`el-chronos-collect-stop` 在源码中都是 interactive 命令（`(interactive)` 分别在 store / collect 模块内），但接口索引的签名列漏标，与源码不一致。已补「，interactive」，并保留「一般不直接调用」（由 `el-chronos-mode` 与 5s flush timer 编排）的语义说明。
 - **修复迁移链缺陷**：`--migrate` 原为互斥分支（`cond` 里逐版本 `return`），v1 老库升级后会停在 v2 且缺 `hourly_drift` 表、写入静默失败；改为版本变量逐级推进（v1→v2→v3 顺序执行）。
 - **消除命令内停转的双记**：`--finish` 结算后重置心跳基线，block / drift 只覆盖命令外停转，命令内停转由 `commands.duration_ms` 独占（两表不相交、不可相加，结构性消除而非判据近似）。
 - **「采集健康」不再把「没采集」显示成「一切正常」（I11）**：`hourly_health` 一行都没有时
@@ -57,6 +66,7 @@
 
 ### 变更
 
+- **配置侧接线口径由 `:load-path` 改为 straight `:local-repo`**（用户 2026-10-25 追加要求：本地开发仓与远端同源）：`Readme.org`「安装」（方式 A / 方式 B / 方式 C）、`docs/operations.org`（方式 A / 方式 C / 三个静默陷阱 ① / 排障第 1–2 条 / 卸载第 2 步）、`docs/api.org`「配置侧写法」、`AGENTS.md`「已知边界 › autoload 契约」与 `openspec/decisions.md`（D3 改写 + 新增 D8）全部改为 straight recipe：`:type git :host github :repo "awerdx520/el-chronos" :branch "master" :local-repo "/home/thomas/Workspace/el-chronos" :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el")) :build (:not compile native-compile)`。实测（`elisp-test` 隔离实例）：`locate-library` 落在隔离根 `straight/build-31.1/el-chronos/el-chronos.el`、straight 生成的 autoloads **15 条全注册**（5 个入口命令 + `purge` / `attrib-clear-cache` / `web-stop` 抽查 `autoloadp` 全 `t`）、build 目录内 `el-chronos-autoloads.el` 是**独立真实文件**（非软链）、源仓库同名文件 sha256 前后不变（无写穿）。文档口径变化：`:load-path` 形态降级为「方式 B / 不推荐」，`use-package` 不再需要逐条手写 `autoload`；新增两条陷阱（`:local-repo` 下 `straight-pull-package` / `straight-checkout-package` 直接改开发仓；新增 / 改名 interactive 命令后须 `straight-rebuild-package` 才有新 autoload）。
 - 心跳间隔 1000ms → **250ms**（把停转时长的高估上界从 1s 压到 250ms；实测开销 +0.0357%，距 0.5% 预算余 14 倍）。
 - 判定逻辑抽成 `el-chronos-collect--heartbeat-check`，timer / `--pre-command` / `--finish` 三处调用（前两处判定、`--finish` 只重置基线）。
 - **文档与计划归档**：`docs/schema.org` / `api.org` / `architecture.org` / `ui.org` / `operations.org` 全部同步到 schema v2 与新增观测面（10 表 / 17 路由 / 14 报告节 / 20 defcustom）；`AGENTS.md` 基线与已知边界回填（199 用例）；新增技术债 TD-15～TD-19；计划 `expand-observation-surface.md` 由 `openspec/active/` 归档至 `openspec/completed/`（含「实现期勘误」）。

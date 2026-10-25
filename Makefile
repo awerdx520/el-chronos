@@ -4,10 +4,10 @@
 # 无 .el 文件时 check-parens / lint / test 均空跑成功，保证仓库初期骨架可用。
 
 EMACS ?= emacs
-EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.local/*' 2>/dev/null)
+EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.local/*' -not -name 'el-chronos-autoloads.el' 2>/dev/null)
 TEST_FILES := $(sort $(wildcard test/*-test.el))
 
-.PHONY: all check-parens test lint full-check clean
+.PHONY: all check-parens test lint autoloads full-check clean
 
 all: full-check
 
@@ -45,6 +45,17 @@ lint:
 	fi
 
 full-check: check-parens test
+
+# autoloads：生成 `el-chronos-autoloads.el`（按需生成，**生成物不入库、不进 L1/L2**）
+#
+# 用途：use-package / 手工 autoload 场景下让 15 个 interactive 命令在包未加载时也能 M-x 调用。
+# 不入库的原因：生成物与原文件必然漂移，按需重建即可（`.gitignore` 已忽略）；
+# 不进 L1/L2 的原因：`EL_FILES` 的 find 已显式排除，否则生成后检查范围会随生成物变化。
+# 实现分流：Emacs 29+ 用 `loaddefs-generate`（自身产物列入 EXCLUDED-FILES 防自引用），
+# 更早版本回退 `make-directory-autoloads`（与 ERT 用例同源守卫，不硬编码单一实现）。
+autoloads:
+	@$(EMACS) -Q --batch -L . --eval '(progn (unless (fboundp (quote loaddefs-generate)) (require (quote autoload))) (if (fboundp (quote loaddefs-generate)) (loaddefs-generate "." "el-chronos-autoloads.el" (list "el-chronos-autoloads.el")) (make-directory-autoloads "." "el-chronos-autoloads.el")) (let ((n (with-temp-buffer (insert-file-contents "el-chronos-autoloads.el") (count-lines (point-min) (point-max))))) (message "el-chronos-autoloads.el 生成完成：%d 行" n)))'
+
 
 clean:
 	rm -rf .eln-cache eln-cache

@@ -47,6 +47,7 @@ nil 也缓存 —— 否则 `*scratch*' 这类无文件 buffer 会为每条命�
 `project-current'（它会遍历 `locate-dominating-file'，是命令热路径上的开销）。
 缓存随 buffer 走（buffer-local），`el-chronos-attrib-clear-cache' 不遍历 buffer 清它。")
 
+;;;###autoload
 (defun el-chronos-attrib-clear-cache ()
   "清空归因缓存，返回被清除的条目数。
 包含两部分：符号 → 源码路径，以及 `.eln' 路径 → 反查到的源码路径

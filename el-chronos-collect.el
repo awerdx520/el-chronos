@@ -1206,6 +1206,7 @@ idle 时机受用户活动影响、不可预期，故它只是「阶段标记」
       (el-chronos--register-timer timer)
     timer))
 
+;;;###autoload
 (defun el-chronos-collect-start ()
   "启动采集层：命令计时 hook、错误标记 advice、心跳 timer、采样 timer 与 profiler。
 命令计时装**全局默认值**，并由 `el-chronos-collect--ensure-buffer-hooks' 只给「局部值
@@ -1254,6 +1255,7 @@ buffer 也补挂则会让同一命令双跑（D1）。
     (setq el-chronos-collect--running-p t))
   el-chronos-collect--running-p)
 
+;;;###autoload
 (defun el-chronos-collect-stop ()
   "停止采集层并清空全部状态，保证零残留（I5）。幂等。
 零残留判据：`--timers' 为 nil、两个 hook 的默认值不含本模块函数、

@@ -261,6 +261,7 @@ Emacs 29 起内置 `sqlite' 库；不可用时返回 nil 而不抛错。"
 ;; 说明：模式定义故意排在其调用的内部函数之前 —— 这样内部函数引用
 ;; `el-chronos-mode' 变量时它已被 defvar（由 define-minor-mode 产生），
 ;; 字节编译不会报「自由变量」告警。
+;;;###autoload
 (define-minor-mode el-chronos-mode
   "全局次模式：启停 el-chronos 长期性能与用法观测器。
 
@@ -367,6 +368,7 @@ SQLite 不可用或启动过程中出错时，告警并把 `el-chronos-mode' 置
 
 ;;; 状态查询
 
+;;;###autoload
 (defun el-chronos-status ()
   "在 echo area 显示 el-chronos 的运行状态。
 只读命令：不启停观测、不写数据库、不修改任何状态。"

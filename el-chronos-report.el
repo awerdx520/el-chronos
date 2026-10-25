@@ -510,6 +510,7 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
       (el-chronos-report--rows (el-chronos-analysis-stacks range el-chronos-report--stack-rows)
                                '(:stack :samples :pct) '(stack num pct))))))
 
+;;;###autoload
 (defun el-chronos-report (&optional range)
   "生成（或刷新）`*el-chronos-report*' org 报告 buffer 并显示。
 RANGE 取 `1d' / `7d' / `30d'，省略时用 `7d'，交互时用 `completing-read' 选择。
@@ -530,6 +531,7 @@ buffer 内 `g' 重新生成、`q' 关闭窗口；返回报告 buffer。
       (display-buffer buffer)
       buffer)))
 
+;;;###autoload
 (defun el-chronos-weekly-report (&optional file)
   "把近 7 天的 org 报告写入 FILE（默认 `chronos-weekly.org' 落在状态目录）。
 目录不存在时自动创建；文件头带 `#+FILETAGS: :chronos:'；写入后 message 路径。
@@ -718,6 +720,7 @@ nil 转 `:null'（否则会输出 `{}'），列表转 vector（否则会被当�
            :config_history (el-chronos-analysis-config-history range))))
    "\n"))
 
+;;;###autoload
 (defun el-chronos-export (format file &optional range)
   "把 RANGE 的数据导出到 FILE。
 FORMAT 取 `csv'（多区块单文件，`# section:' 分隔）或 `json'（单个对象）；
@@ -773,6 +776,7 @@ message 路径与字节数。返回写入的文件绝对路径。"
            (choice (completing-read "阻塞事件: " choices nil t)))
       (when-let* ((id (cdr (assoc choice choices)))) id))))
 
+;;;###autoload
 (defun el-chronos-show-event (id)
   "在 `*el-chronos-event*' buffer 中展示慢事件 ID 的详情。
 ID 不存在时 `user-error'；交互时从近 7 天阻塞事件里选一条。返回事件 buffer。"

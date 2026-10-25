@@ -34,23 +34,143 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 - Emacs **29.1+**，且编译时带 SQLite 支持：=M-: (and (fboundp 'sqlite-open) (sqlite-available-p))= → =t=
 - 可选：=straight.el=（用 =:local-repo= 安装时）
 
-** straight.el（本包是独立仓库，用 =:local-repo=）
+** straight.el（方式 A：推荐，=:local-repo= 指向开发仓）
+
+本地开发仓与远端仓库是同一份代码：=:local-repo= 让 straight 软链本地工作树加载，
+=:type= / =:host= / =:repo= / =:branch= 保留 upstream 识别（与 =seshat-reader= 同款写法）。
 
 #+BEGIN_SRC elisp
 (straight-use-package
- '(el-chronos :type built-in :local-repo "~/Workspace/el-chronos"))
+ '(el-chronos :type git
+              :host github
+              :repo "awerdx520/el-chronos"
+              :branch "master"
+              :local-repo "/home/thomas/Workspace/el-chronos"
+              :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))
+              :build (:not compile native-compile)))
 
 (require 'el-chronos)
 (el-chronos-mode 1)             ; 启动观测
 #+END_SRC
 
-** 手动 =load-path=
+recipe 三处非默认值，各有实测理由：
+
+- =:local-repo "/home/thomas/Workspace/el-chronos"= —— 源码经
+  =<straight-base-dir>/straight/build-<ver>/el-chronos/= 下的**软链**加载，改完源仓库后
+  =M-x straight-rebuild-package RET el-chronos= 即生效，无需 push / pull / 重开 Emacs。
+  **注意**：straight 的 =straight-pull-package= / =straight-checkout-package= 会**直接作用在你的
+  开发仓上**（它就是那个 git 仓库），工作区有未提交改动时慎跑。
+- =:files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))= —— 只取仓库根模块，并**显式排除**
+  =make autoloads= 的生成物：straight 自己的 autoloads 步骤要写同名文件，若该名字被软链进 build 目录
+  就会穿透写回源仓库。
+- =:build (:not compile native-compile)= —— **保留** autoloads、禁用字节与 native 编译：
+  包侧 =;;;###autoload= cookie 于是真正生效（15 个 interactive 命令全部免配置可 =M-x=），
+  同时不产生 =.elc= / =.eln= 副本，源码改动立刻可见。
+  代价：**新增或改名 interactive 命令后**要 =M-x straight-rebuild-package RET el-chronos=
+  刷新 autoloads，否则新命令不在 autoload 表里。
+
+** 手动 =load-path=（方式 B：无 straight）
 
 #+BEGIN_SRC elisp
 (add-to-list 'load-path "~/Workspace/el-chronos")
 (require 'el-chronos)
 (el-chronos-mode 1)
 #+END_SRC
+
+此形态没有 straight 的 autoloads 步骤，入口命令须逐条手写（库名必须等于**定义文件名**，
+否则首次 =M-x= 报 =Autoloading file ... failed to define function=）：
+
+#+BEGIN_SRC elisp
+(autoload 'el-chronos-report "el-chronos-report" nil t)
+(autoload 'el-chronos-weekly-report "el-chronos-report" nil t)
+(autoload 'el-chronos-profile-command "el-chronos-report" nil t)
+(autoload 'el-chronos-web-start "el-chronos-web" nil t)
+(autoload 'el-chronos-web-stop "el-chronos-web" nil t)
+#+END_SRC
+
+入口 =load-path= 只写**字符串字面量**：绝对路径最稳、=~= 前缀亦可（依赖 HOME 展开）。
+禁止相对路径与 =(expand-file-name ...)= / 变量形态——在 =use-package= 的 =:load-path= 里后者会让
+整个 form 展开为 =nil=（静默失效），手写 =add-to-list= 时则会把当时 =default-directory= 固化进去。
+
+** 方式 C：use-package（已有配置框架的用户）
+
+=use-package= 只是组织形态，安装仍是方式 A 那条 =:straight= recipe —— 包侧 15 条
+=;;;###autoload= cookie 由 straight 的 autoloads 步骤生成，因此**不必**逐条手写
+=(autoload SYM "FILE")=，也**不要**退回 =:straight nil= + =:load-path= 的手动形态
+（那是「方式 B」的自动化版本，实测踩过四个静默陷阱）。
+
+#+BEGIN_SRC elisp
+;; 注意：降级判据必须用 if 包住整个 use-package —— use-package 的 :if 包不住 :straight
+;; （实测展开仍含 straight-use-package，目录缺失时会去远端 clone），详见下面「陷阱」节
+(if (file-exists-p "/home/thomas/Workspace/el-chronos/el-chronos.el")
+    (use-package el-chronos
+      :straight (el-chronos
+                 :type git
+                 :host github
+                 :repo "awerdx520/el-chronos"
+                 :branch "master"
+                 :local-repo "/home/thomas/Workspace/el-chronos"
+                 :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))
+                 :build (:not compile native-compile))
+      :demand t                    ; 模式必须尽早启用（理由见下「为什么不建议 :defer t」）
+      :config
+      ;; 实例守卫（可选示例）：本机 thomas-emacs 用它避免在隔离实例里启用观测
+      (unless (member (getenv "THOMAS_EMACS_INSTANCE") '("isolated" "pure"))
+        ;; 必须 lambda 形态：#'el-chronos-mode 交给 add-hook 会被无参调用 = toggle 模式
+        (add-hook 'emacs-startup-hook (lambda () (el-chronos-mode 1)))))
+  ;; 仓库缺失：只告警、不阻断启动
+  (display-warning 'chronos "未找到 el-chronos，性能与用法观测不可用" :warning))
+#+END_SRC
+
+四个关键字逐条说明（=:straight= 的 recipe 内部各项与实测理由见方式 A）：
+
+- =if (file-exists-p ...) ...= —— 观测器是可选组件：仓库不存在时整个 =use-package= form 不求值
+  （不 clone、不 require），启动照常完成，=display-warning= 分支给出「性能与用法观测不可用」提示、不静默。
+  **不要**改成 =use-package= 的 =:if=：=:if= 只包住 =require=，包不住 =:straight= 生成的安装调用
+  （实测见下面「陷阱」节第一条）。
+- =:straight (el-chronos ...)= —— **不要**写 =:straight nil=：本机
+  =straight-use-package-by-default= 为 =t=，缺了 =:straight= 会展开成
+  =(straight-use-package 'el-chronos)= 去解析 recipe / 尝试远端安装；写成完整 recipe 才是
+  「本地开发仓源码 + upstream 识别」的形态。
+- =:demand t= —— 立即 =require=，模式才能尽早启用（理由见下「为什么不建议 =:defer t」）。
+- =:config= 内 =add-hook 'emacs-startup-hook (lambda () (el-chronos-mode 1))= —— 不要写成
+  =#'el-chronos-mode=：=add-hook= 投递符号后是**无参调用**，而 =el-chronos-mode= 的无参形态是
+  **toggle**，重复求值会把观测关掉。实例守卫那段是可选项示例（本机 thomas-emacs 用
+  =THOMAS_EMACS_INSTANCE= 跳过隔离实例），照抄时按自己的环境改。
+
+** 方式 C 的三个新增陷阱（实测 Emacs 31.1 / straight 当前版本）
+
+- **=:if= / =:when= 包不住 straight 安装** —— 需要「仓库缺失就降级」时必须用 =if= 包住**整个**
+  =use-package=，写成 =:if (file-exists-p ...)= 无效。实测
+  =(macroexpand-1 '(use-package el-chronos :if nil :straight (el-chronos ...)))= 展开为
+  =(progn (straight-use-package '(el-chronos ...)) (when nil (require 'el-chronos nil nil)))= ——
+  安装调用在顶层、=:if= 之外；=:if= 为假时照样执行，本机表现为目录缺失也会去远端 clone 本仓。
+  正确形态 =if (file-exists-p ...) (use-package ...) (display-warning ...)= 展开为
+  =(if COND (progn (straight-use-package '...) ...) ...)=，条件为假时整段不求值。
+- **=straight-pull-package= / =straight-checkout-package= 直接作用在开发仓上** —— =:local-repo=
+  指向的就是你的 git 工作树（straight 不复刻一份副本），这两条命令会改它。开发时勿让工作区处于
+  未提交状态再跑。
+- **新增 / 改名 interactive 命令后要 rebuild 才有 autoload** —— =:build (:not compile
+  native-compile)= 保留 autoloads 生成，但生成只发生在 build 时；命令清单变了而没 rebuild 时，
+  新命令不在 autoload 表里（=M-x= 找不到）。修法：=M-x straight-rebuild-package RET el-chronos=。
+
+> 若你选择 =:load-path= 而不是 =:local-repo=（不推荐）：它只能写**字符串字面量**——绝对路径最稳、
+> =~= 前缀亦可；禁止相对路径（宏展开期按当时 =user-emacs-directory= 固化成绝对路径，隔离实例里
+> 等于静默指向错误目录），也禁止 =(expand-file-name ...)= 或变量形态（整个 form 展开为 =nil=，
+> 静默失效）。此时 autoload 须逐条手写（库名 = 定义文件名；=:autoload= / =:commands= 做不到跨文件），
+> 明细见 [[file:docs/operations.org][docs/operations.org]]「autoload 契约」与「四个静默陷阱」。
+
+** 为什么不建议 =:defer t=
+
+延迟加载对本包是**净损失**，不是优化：
+
+- =startup_phases= 的**包加载明细**只在 =el-chronos-mode= 早于 =after-init-hook= 启用时才存在。
+  模式晚启用（=:defer t=，或挂在 =emacs-startup-hook= 上）时，启动分解只剩 =mode-start= 一个锚点、
+  没有任何包加载明细——观测器无法观测自己被加载之前发生的事，这是物理边界不是 bug
+  （见 [[file:docs/operations.org][docs/operations.org]]「启动分解的物理边界」）。
+- 延迟也省不到什么：=el-chronos.el= 本身很薄，真正的重活（=sqlite= / =org=）本来就在 mode 启动
+  之后的首次需要时才加载。
+- 需要「只在看报告时才加载」的延迟形态不在设计目标内：代价就是拿不到启动分解。
 
 * 使用（两种形态）
 
@@ -133,7 +253,8 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 * 卸载与数据清理
 
 1. =(el-chronos-mode -1)= —— 清理 timer、hook（含每 buffer 的局部 hook）、profiler、未 flush 缓冲（零残留）。
-2. 从配置里删掉 =(require 'el-chronos)= / straight 段并移除 =load-path=（可选：删除本地 clone）。
+2. 从配置里删掉 straight recipe（=:local-repo= 软链随后消失）或 =(require 'el-chronos)= 与
+   =load-path= 条目（可选：删除本地 clone）。
 3. 删数据（可选）：先做完第 1 步，再删
    =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=（连同 =-wal= / =-shm=）。
 
@@ -152,13 +273,20 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 234 用例，0 skipped）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 237 用例，0 skipped）
+make autoloads      # 按需生成 el-chronos-autoloads.el（生成物不入库、不进 L1/L2）
 make full-check     # check-parens + test
 #+END_SRC
 
+=make autoloads= 生成 =el-chronos-autoloads.el=——**15 个 interactive 命令**的 autoload 声明
+（每个都指向自己的定义文件，如 =(autoload 'el-chronos-report "el-chronos-report" ...)=）。
+**生成物不入库**（=.gitignore= 已忽略，改了源码按需重建即可，入库必然与源码漂移），
+**也不进 L1/L2**（=EL_FILES= 的 =find= 显式排除该文件，否则生成后括号检查与字节编译的检查范围
+会随生成物变化）。Emacs 29+ 用 =loaddefs-generate=，更早版本回退 =make-directory-autoloads=。
+
 测试文件固定命名 =test/*-test.el=（Makefile 用 =$(wildcard test/*-test.el)= 自动发现，
-新增测试无需改 Makefile）。234 用例分布：=collect= 66 / =store= 60 / =report= 33 / =attrib= 28 /
-=analysis= 29 / =web= 18。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
+新增测试无需改 Makefile）。237 用例分布：=collect= 66 / =store= 60 / =report= 33 / =autoload= 3 /
+=analysis= 29 / =attrib= 28 / =web= 18。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
 =M-x el-chronos-report=；详细清单见 [[file:docs/operations.org][docs/operations.org]]「验证步骤」。
 
 * 当前状态
@@ -167,7 +295,9 @@ make full-check     # check-parens + test
   **11 表 + 3 索引**（schema v3 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）+ =hourly_drift=（v3））、
   六条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick / 启动打点 / GC 与自监控）、归因、
   **18 个**只读聚合查询、org 报告（**14 节**）、Web dashboard（**18 条只读路由**）、单命令剖析、
-  ERT **234** 用例、文档全集。
+  ERT **237** 用例（含 =test/el-chronos-autoload-test.el= 的 3 条 autoload 契约用例）、文档全集。
+  **autoload 契约**：15 个 interactive 命令全部带 =;;;###autoload= cookie，生成入口 =make autoloads=
+  （产物不入库、不进 L1/L2），供 =use-package= 等声明式配置使用。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]（核心，2026-10-24 归档）、
   [[file:openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]（观测面扩展 S1 已完成，T1–T10，2026-10-25 归档）
 - 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]

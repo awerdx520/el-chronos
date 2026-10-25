@@ -19,3 +19,6 @@ eln-cache/
 
 # 运行时数据库（仓库根兜底忽略，正常落 .local/state/chronos/）
 /chronos.sqlite*
+
+# autoloads 生成物（`make autoloads` 产出，按需重建、不入库）
+/el-chronos-autoloads.el

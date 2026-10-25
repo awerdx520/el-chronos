@@ -17,46 +17,48 @@
 
 **非目标**：自动调优/自动禁用功能、跨机器数据汇聚、源码行级采样、记录按键序列与文件内容。
 
-当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **234** 用例全绿、0 skipped，`make lint` 零告警）。
+当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **237** 用例全绿、0 skipped，`make lint` 零告警）。
 观测面已从「时间」扩展到「时间 + 内存/GC + 启动 + 配置变更」（ADR-0004）：schema v2 增 4 表、
 GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-sig` 变更标记、采集器自监控（`hourly_health`）。
 **S2（亚秒级「命令外停转」可见）已实现**（ADR-0005）：schema **v3 增 `hourly_drift`（共 11 表）**、
 两档阈值（block 2000ms 明细 + drift 500ms 小时聚合）、心跳 1s → **250ms**（block 高估上界 1s → 250ms）、
 命令结算后重置心跳基线以**结构性消除双记**；analysis **18** 个查询 / Web **18** 条路由 / org 报告仍 **14 节**
 （drift 摘要嵌在「阻塞事件」节内，不新开节）。
-7 个源码模块 + 7 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
+7 个源码模块 + 8 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
 剩余项是仍待实测的性能/覆盖率数字与 D1 的 GUI 实机验证（见 `openspec/tech-debt.md`）。
 计划见 `openspec/completed/el-chronos-core.md`（2026-10-24 归档）；
 观测面扩展计划见 `openspec/completed/expand-observation-surface.md`（2026-10-25 归档，T10c）；
-drift 两档阈值计划见 `openspec/completed/add-drift-detection.md`（T1–T4 已完成，2026-10-25 归档）。
+drift 两档阈值计划见 `openspec/completed/add-drift-detection.md`（T1–T4 已完成，2026-10-25 归档）；
+use-package 适配计划见 `openspec/completed/add-use-package-support.md`（T1–T8 已完成，2026-10-25 归档）。
 
 ## 目录结构
 
 | 路径 | 用途 | 行数 / 状态 |
 |---|---|---|
-| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 389 行 / 19 defcustom（项目合计 21） |
-| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、启动打点、自监控计数 | 1327 行 |
-| `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 342 行 |
-| `el-chronos-store.el` | SQLite schema（v3，11 表 + 3 索引）、批量 flush、drift 小时聚合、保留策略、top-N 淘汰、purge 11 表 | 1477 行 |
+| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 392 行 / 19 defcustom（项目合计 21） |
+| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、启动打点、自监控计数 | 1329 行 |
+| `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 343 行 |
+| `el-chronos-store.el` | SQLite schema（v3，11 表 + 3 索引）、批量 flush、drift 小时聚合、保留策略、top-N 淘汰、purge 11 表 | 1480 行 |
 | `el-chronos-analysis.el` | 18 个只读聚合查询（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/会话/回归/GC/启动/健康/配置变更） | 822 行 |
-| `el-chronos-report.el` | org 报告（14 节，含「阻塞事件」节内的 drift 汇总行）、周报、CSV/JSON 导出（9 个区块）、按需高精度剖析、报告期间自观测抑制 | 1151 行 |
-| `el-chronos-web.el` | 最小 HTTP server（18 条路由 = 1 页 + 16 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1093 行 |
+| `el-chronos-report.el` | org 报告（14 节，含「阻塞事件」节内的 drift 汇总行）、周报、CSV/JSON 导出（9 个区块）、按需高精度剖析、报告期间自观测抑制 | 1155 行 |
+| `el-chronos-web.el` | 最小 HTTP server（18 条路由 = 1 页 + 16 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1095 行 |
 | `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 198 行 |
 | `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史 / drift 趋势） | 709 行 / 29 用例 |
 | `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 371 行 / 28 用例 |
+| `test/el-chronos-autoload-test.el` | autoload 契约：cookie 覆盖 15 个 interactive 命令（计数不变量）、生成物让命令 `autoloadp`、库名等于定义文件 | 294 行 / 3 用例 |
 | `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控 | 1619 行 / 66 用例 |
 | `test/el-chronos-report-test.el` | org 报告 14 节、阻塞事件节内的 drift 汇总行、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 759 行 / 33 用例 |
 | `test/el-chronos-store-test.el` | schema/迁移（v0→v3、v1→v3、v2→v3 三条守门与回滚）/批量写入/drift 聚合/保留策略/top-N 淘汰/purge 11 表/`note-startup-ms` 补写 | 1654 行 / 60 用例 |
 | `test/el-chronos-web-test.el` | 内嵌 Web server（启停/路由/边界/loopback/自观测抑制/四个 v2 端点 + `/api/drift`） | 484 行 / 18 用例 |
-| `docs/architecture.org` | 分层、六条采集路径（路径 3 = 心跳两档判定 + 三处调用点）、可视化数据流、**实测结论**、已知偏差 | 620 行 |
+| `docs/architecture.org` | 分层、六条采集路径（路径 3 = 心跳两档判定 + 三处调用点）、可视化数据流、**实测结论**、已知偏差 | 621 行 |
 | `docs/schema.org` | 最终 DDL（**11 表 + 3 索引**）、迁移 v1→v2 与 v2→v3（含迁移链陷阱）、top-N 淘汰 SQL、保留分类、purge 11 表删除顺序 | 624 行 |
 | `docs/ui.org` | 两形态总览（浏览器 Web dashboard + org 报告）、**18 条 Web 路由**、org 报告 **14 节**（drift 摘要嵌在「阻塞事件」内）、性能注意与降级规则 | 226 行 |
-| `docs/api.org` | elisp 对外接口索引（7 个模块、签名单、21 个 defcustom 清单、内部函数约定） | 249 行 |
-| `docs/operations.org` | 安装/卸载/数据清理/排障/**drift 调档指引**/验证步骤/隐私与保留表 | 302 行 |
+| `docs/api.org` | elisp 对外接口索引（7 个模块、签名单、21 个 defcustom 清单、内部函数约定） | 319 行 |
+| `docs/operations.org` | 安装/卸载/数据清理/排障/**drift 调档指引**/验证步骤/隐私与保留表 | 425 行 |
 | `docs/adr/` | `0001-observer-architecture.md`、`0002-dual-visualization.md`（**已被 0003 取代**）、`0003-web-only-visualization.md`（可视化收敛为 Web dashboard + org 报告两形态）、`0004-observation-surface-expansion.md`（观测面扩展到内存/GC/启动/配置变更）、`0005-two-tier-block-detection.md`（两档阈值：block 明细 + drift 聚合，v3 schema） | 已完成 |
 | `openspec/` | 计划与决策工件（`active/`、`completed/`、`decisions.md`、`tech-debt.md`） | 已建 |
-| `Makefile` | 验证入口：`check-parens` / `test` / `lint` / `full-check` | 已建 |
-| `Readme.org` / `CHANGELOG.md` | 项目说明与变更日志 | 182 行 / 138 行 |
+| `Makefile` | 验证入口：`check-parens` / `test` / `lint` / `full-check` / `autoloads`（生成 `el-chronos-autoloads.el`，产物不入库、不进 L1/L2） | 已建 |
+| `Readme.org` / `CHANGELOG.md` | 项目说明与变更日志 | 251 行 / 153 行 |
 
 ## 编码约定
 
@@ -73,6 +75,13 @@ drift 两档阈值计划见 `openspec/completed/add-drift-detection.md`（T1–T
 - 必须含 `lexical-binding: t`；文件末行必须是 `;;; el-chronos-xxx.el ends here`。
 - **符号前缀**：对外接口用 `el-chronos-<domain>-<verb>`（如 `el-chronos-store-record-command`）；
   内部实现用 `el-chronos--`（双连字符）。禁止无前缀的公共符号。
+- **autoload 契约（不变量，机械可检）**：**所有 interactive 命令必须带 `;;;###autoload` cookie**
+  （当前 15 个：入口 2 / 归因 1 / 存储 3 / 采集 2 / 报告 5 / Web 2）。cookie 紧贴 `defun` /
+  `define-minor-mode` 的上一行；生成入口 `make autoloads`，产物 `el-chronos-autoloads.el`
+  **不入库、不进 L1/L2**（`EL_FILES` 的 `find` 显式排除，否则生成后检查范围会随生成物变化）。
+  守门用例在 `test/el-chronos-autoload-test.el`：计数不变量（代码中 `(interactive` 出现次数
+  + `define-minor-mode` 数 = cookie 数 = 命令清单长度，**不写死数字**，增删命令时用例自动跟随）。
+  新增 interactive 命令时须**同一次改动**内补 cookie，否则用例变红。
 - **依赖边界（两档）**：
   - **核心模块**（`collect` / `attrib` / `store` / `analysis` / `report`）仅使用 Emacs 内置库——
     `sqlite`（29+ 内置）、`profiler`、`cl-lib`、`subr-x`、`org`。
@@ -141,16 +150,19 @@ I9 / I11 已按 ADR-0003 改写；I10 仅删除了随 dashboard 下线的实现�
 make check-parens   # L1：逐文件括号平衡（无 .el 时空跑成功）
 make test           # L2：自动发现并加载全部 test/*-test.el（无测试文件时空跑成功）
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
+make autoloads      # 生成 el-chronos-autoloads.el（按需生成；产物不入库、不进 L1/L2）
 make full-check     # check-parens + test
 ```
 
-全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。
+全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。`make autoloads` 在 Emacs 29.1+ 走
+`loaddefs-generate`，更早版本回退 `make-directory-autoloads`（ERT 用例同源守卫，不硬编码单一实现）。
 
-**当前基线**（实测 2026-10-25，本次基线回填时重测）：`make test` = **234 用例**（`Ran 234 tests, 234 results as expected, 0 unexpected`，约 10.6 秒，**0 skipped**）；
-分布：collect 66 / store 60 / report 33 / analysis 29 / attrib 28 / web 18 用例；
-行数：collect 1327 / store 1477 / report 1151 / web 1093 / analysis 822 / attrib 342 / 入口 389（源码 7 模块 **6601 行**）；
-测试：store 1654 / collect 1619 / report 759 / analysis 709 / web 484 / attrib 371 / helper 198（测试 7 文件 **5794 行**）；源码 + 测试合计 **12395 行**。
-`make lint` **零告警**（14 个文件逐个字节编译）。新增或修改行为时基线只准上升，改测试要说明原因。
+**当前基线**（实测 2026-10-25，本次基线回填时重测）：`make test` = **237 用例**（`Ran 237 tests, 237 results as expected, 0 unexpected`，约 11.1 秒，**0 skipped**）；
+分布：collect 66 / store 60 / report 33 / autoload 3 / analysis 29 / attrib 28 / web 18 用例；
+行数：collect 1329 / store 1480 / report 1155 / web 1095 / analysis 822 / attrib 343 / 入口 392（源码 7 模块 **6616 行**）；
+测试：store 1654 / collect 1619 / report 759 / analysis 709 / web 484 / attrib 371 / autoload 294 / helper 198（测试 8 文件 **6088 行**）；源码 + 测试合计 **12704 行**。
+`make lint` **零告警**（15 个文件逐个字节编译；`el-chronos-autoloads.el` 由 `EL_FILES` 排除，不在检查范围）。
+新增或修改行为时基线只准上升，改测试要说明原因。
 
 **测试文件命名**：测试文件必须命名为 `test/*-test.el`；`make test` 通过 `$(sort $(wildcard test/*-test.el))` 自动发现该模式并按排序全部加载（无匹配时输出 `no test files` 并成功退出），禁止在 Makefile 里硬编码单个文件名（否则拆分测试后会静默漏跑）。
 
@@ -197,6 +209,7 @@ ss -lntH "sport = :8787"
 | **自观测抑制（report / Web，三层 + 心跳侧感知）** | 观测者会观测到自己的重查询，必须抑制。**机制**：`el-chronos-collect--heartbeat-check` 用 `bound-and-true-p` 读取 `el-chronos-collect--suppress-block-p`——抑制期间**推进 `--last-heartbeat` 基线并跳过判定**（**block 与 drift 两档共用这个门**）；report（`el-chronos-report--without-block-events`）与 Web（`el-chronos-web--without-block-events`）在渲染 / 请求处理前各自绑定该抑制变量、把 `el-chronos-block-threshold-ms` 临时抬到 60s，并在 `unwind-protect` 清理段**再重置基线**（这一层不可省：渲染期间没有命令结算，`--finish` 的重置替代不了它）。**结论**：抑制期间不产生 block / drift，解除绑定后也不补记整段 gap。**取舍**：抑制期间若真发生阻塞同样不记（有意接受——用户主动触发的重查询耗时不属待排查卡顿）。**覆盖面**：report 与 Web 均抑制，两份为**内联重复实现**（web 刻意不 require report / collect，保持零额外依赖），改动需同步两处；TD-12 已关闭 | `docs/architecture.org`「自观测抑制（report / Web）」 |
 | **内存 / GC 观测口径** | `heap_bytes` 来自 `(garbage-collect-heapsize)`（Emacs **31.1+** 才有，29/30 恒 NULL）；`gc_count` / `gc_ms` 来自 `gcs-done` / `gc-elapsed` 的**增量**（只读全局计数器，**零副作用、不触发 GC**；采集路径**禁止**调 `garbage-collect`，也禁止用 `memory-info`——那是系统内存）；首个采样窗口只建基线（丢 ≤1 窗口增量，故首桶计数可能为 0 而非「没发生 GC」）；`hourly_gc.heap_bytes` 用 `COALESCE` 保留本行最后一次非 NULL 观测值（同会话同小时的稀疏写入，非跨版本问题）；跨 Emacs 版本共用同一库时曲线会空洞，阅读时按 `sessions.emacs_version` 分组（TD-15） | `docs/architecture.org`「路径 6：GC 与自监控」/「已知偏差」、TD-15 |
 | **启动分解覆盖范围** | `startup_phases` 的包加载明细基于 `after-load-functions` **相邻两次回调的时间差**（**近似归因**，差值含前一文件的收尾逻辑与它触发的钩子）；**mode 在 `after-init-hook` 之前启用**才记明细，启动已结束时只有 `mode-start` 锚点、且**根本不挂** `after-load-functions`（否则启动后的交互式 load 会被记成「启动耗时」）——观测器无法观测自己被加载之前的事，这是物理边界不是 bug；要完整剖析须把 `(el-chronos-mode 1)` 提前到 `early-init.el`（TD-16） | `docs/architecture.org`「路径 5：启动打点」/「已知偏差」、`docs/operations.org`「启动分解的物理边界」、TD-16 |
+| **autoload 契约（配置侧入口）** | **15 个 interactive 命令**全部带 `;;;###autoload` cookie，`make autoloads` 生成 `el-chronos-autoloads.el`（**不入库、不进 L1/L2**，`EL_FILES` 排除）。**`use-package` 的 `:autoload` / `:commands` 无法声明跨文件入口**（实测：库名恒为包名 `el-chronos`，而 report / web 命令不在 `el-chronos.el` 里 → 首次调用报 `Autoloading file ... failed to define function`），配置侧**推荐用 straight `:local-repo` recipe 并保留 autoloads**（`:build (:not compile native-compile)`）：straight 依 cookie 生成 `build-<ver>/el-chronos/el-chronos-autoloads.el` 并自动加载，15 个命令免配置可 `M-x`（实测 `autoloadp` 全 `t`）；`straight-pull-package` / `straight-checkout-package` 会作用到**开发仓本身**（`:local-repo` 就是那个 git 工作树），**新增 / 改名 interactive 命令后须 `M-x straight-rebuild-package RET el-chronos`** 刷新 autoloads；`:files` 须显式 `(:exclude "el-chronos-autoloads.el")`，否则生成物被软链进 build 目录会穿透写回源仓库；**降级判据须用 `if` 包住整个 `use-package`**——`:if` / `:when` **包不住** `:straight`（实测 `(macroexpand-1 '(use-package el-chronos :if nil :straight …))` 返回 `(progn (straight-use-package '…) (when nil (require …)))`，条件为假照样去 clone 本仓；`(if (file-exists-p …) (use-package …) (display-warning …))` 才把安装调用关进 then 分支）。若仍用 `:load-path` 形态（无 straight），则须在 `:init` 里逐条显式 `(autoload SYM "定义文件")`，且 `:load-path` 只能写字符串字面量（绝对路径最稳、`~` 前缀亦可——实测 `locate-library` 能解析，依赖 HOME 展开；**禁止**相对路径——宏展开期按当时 `user-emacs-directory` 固化——与变量 / sexp 形态——整个 form 静默展开为 `nil`） | `docs/api.org`「autoload 与 use-package 集成」、`docs/operations.org`「四个静默陷阱」、`test/el-chronos-autoload-test.el` |
 | 仍待实测 | P95 精度（TD-7）、阻塞捕获残余缺口（TD-11） | `openspec/tech-debt.md` |
 | 采样开销 | 10ms 默认间隔的常驻开销**低于本机测量分辨率**（噪声地板 ±0.7–1.1%）：1ms 间隔（采样率约 10×）实测 +0.46%，按单样本成本外推 10ms ≈ 0.02–0.2%，**远低于 0.5% 阈值**，保持 10ms 默认（TD-3 已关闭） | `docs/architecture.org`「实测结论 11」 |
 
@@ -211,7 +224,8 @@ ss -lntH "sport = :8787"
 | 用户文档 | `Readme.org`；变更日志 `CHANGELOG.md`（Keep a Changelog 格式） |
 | 技术文档 | `docs/architecture.org`（时序、数据流、实测结论）、`docs/schema.org`（DDL 与查询示例）、`docs/ui.org`（两形态界面、Web dashboard 路由与降级规则）、`docs/api.org`（接口索引）、`docs/operations.org`（装卸、清理、排障）、`docs/adr/0001`–`0004`（架构决策，0004 = 观测面扩展） |
 
-> 当前 `openspec/active/` **为空**（全部计划已归档）；`expand-observation-surface.md`（Phase 4 已完成，含「实现期勘误」）、`remove-dashboard-web-only.md`、`fix-web-block-suppression.md`、`fix-sampling-attribution.md`、`add-drift-detection.md`（S2 收尾 T4c，ADR-0005）均在 `openspec/completed/`（2026-10-24 / 2026-10-25）。
+> 当前 `openspec/active/` **为空**（`add-use-package-support.md` 已于 2026-10-25 归档到 `completed/`）。
+> 其余均已归档：`add-use-package-support.md`（包侧 autoload 契约 + 配置侧 use-package 迁移，Phase 4 已完成，2026-10-25）、`expand-observation-surface.md`（Phase 4 已完成，含「实现期勘误」）、`remove-dashboard-web-only.md`、`fix-web-block-suppression.md`、`fix-sampling-attribution.md`、`add-drift-detection.md`（S2 收尾 T4c，ADR-0005）均在 `openspec/completed/`（2026-10-24 / 2026-10-25）。
 
 文档与代码同步：改接口/改 schema 必须同时更新 `docs/schema.org` 与 ADR 相关条目；
 新增已完成任务须在 `CHANGELOG.md` 的 `[Unreleased]` 段记录。

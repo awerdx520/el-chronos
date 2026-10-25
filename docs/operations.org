@@ -21,17 +21,34 @@
 
 ** 方式 A：straight.el（=:local-repo=，本包为独立仓库）
 
+本包是独立仓库（不与 thomas-emacs 同仓），开发仓与远端是同一份代码：=:local-repo= 让 straight
+软链本地工作树、=:type= / =:host= / =:repo= / =:branch= 保留 upstream 识别（与 =seshat-reader=
+同款写法）。远端：=git@github.com:awerdx520/el-chronos.git=，分支 =master=。
+
 #+BEGIN_SRC elisp
-;; 本包是独立仓库（不与 thomas-emacs 同仓），用 :local-repo 指向本地 clone。
 (straight-use-package
- '(el-chronos :type built-in :local-repo "~/Workspace/el-chronos"))
+ '(el-chronos :type git
+              :host github
+              :repo "awerdx520/el-chronos"
+              :branch "master"
+              :local-repo "/home/thomas/Workspace/el-chronos"
+              :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))
+              :build (:not compile native-compile)))
 
 (require 'el-chronos)
 (el-chronos-mode 1)
 #+END_SRC
 
-若希望从远端拉取，把上例换成 =:type git :host ... :repo ...= 指向实际仓库地址
-（本仓库尚未发布远端地址，不要凭猜测填写）。
+三处非默认值，各有实测理由：
+
+| recipe 项 | 作用与理由 |
+|---|---|
+| =:local-repo= | 源码经 =<straight-base-dir>/straight/build-<ver>/el-chronos/= 下的**软链**加载；改完源仓库后 =M-x straight-rebuild-package RET el-chronos= 即生效，无需 push / pull / 重开 Emacs |
+| =:files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))= | 只取仓库根模块，并**显式排除** =make autoloads= 的生成物：straight 的 autoloads 步骤要写同名文件，若该名字被软链进 build 目录就会穿透写回源仓库（实测：排除后 build 目录里是独立真实文件，源仓库 sha256 不变） |
+| =:build (:not compile native-compile)= | **保留** autoloads、禁用字节与 native 编译：包侧 15 条 =;;;###autoload= cookie 因此真正生效（命令免配置可 =M-x=），且不产生 =.elc= / =.eln= 副本，源码改动立刻可见。代价：新增 / 改名 interactive 命令后须 rebuild 才有新 autoload |
+
+> =straight-pull-package= / =straight-checkout-package= 会**直接改你的开发仓**（=:local-repo= 就是
+> 那个 git 工作树，straight 不复刻副本）。工作区有未提交改动时慎跑。
 
 ** 方式 B：手动 =load-path=（无 straight）
 
@@ -41,6 +58,47 @@
 (el-chronos-mode 1)
 #+END_SRC
 
+** 方式 C：use-package（已有配置框架的用户）
+
+=use-package= 只是组织形态，安装仍是方式 A 那条 =:straight= recipe。包侧提供标准
+=;;;###autoload= 契约（**15 个 interactive 命令**全部带 cookie），straight 的 autoloads 步骤会
+依据 cookie 生成 autoload 声明，**不必**再逐条手写 =(autoload SYM "FILE")=。
+下面整段可复制，只需把两处 =/home/thomas/Workspace/el-chronos= 换成你自己的 clone 路径、
+实例守卫那行按自己的环境删改。实测环境：Emacs **31.1** / use-package **2.4.5**（Emacs 自带）。
+
+#+BEGIN_SRC elisp
+;; 降级判据必须用 if 包住整个 use-package：use-package 的 :if 包不住 :straight（见陷阱 ④）
+(if (file-exists-p "/home/thomas/Workspace/el-chronos/el-chronos.el")
+    (use-package el-chronos
+      ;; ① 完整 recipe：本地开发仓 + upstream 识别（与方式 A 同款）
+      :straight (el-chronos
+                 :type git
+                 :host github
+                 :repo "awerdx520/el-chronos"
+                 :branch "master"
+                 :local-repo "/home/thomas/Workspace/el-chronos"
+                 :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))
+                 :build (:not compile native-compile))
+      :demand t                                    ; ② 尽早启用（不要 :defer t）
+      :config
+      ;; ③ 实例守卫（可选）+ 必须 lambda 形态的 hook
+      (unless (member (getenv "THOMAS_EMACS_INSTANCE") '("isolated" "pure"))
+        (add-hook 'emacs-startup-hook (lambda () (el-chronos-mode 1)))))
+  ;; 仓库缺失：可见性靠这条告警，不阻断启动
+  (display-warning 'chronos "未找到 el-chronos，性能与用法观测不可用" :warning))
+#+END_SRC
+
+| 关键字 | 为什么必须是这个形态（实测） |
+|---|---|
+| =if (file-exists-p ...) ...= | 观测器是可选组件：仓库不存在时整段 =use-package= 不求值（不 clone、不 require），启动照常完成；=display-warning= 分支给出「性能与用法观测不可用」，不静默。**不要**换成 =use-package= 的 =:if=——它只包住 =require=，包不住 =:straight= 的安装调用（陷阱 ④） |
+| =:straight (el-chronos ...)= | **不要**写 =:straight nil=：本机 =straight-use-package-by-default= 为 =t=，缺了 =:straight= 会展开成 =(straight-use-package 'el-chronos)= 去解析 recipe / 尝试远端安装；写成完整 recipe 才是「本地开发仓源码 + upstream 识别」的形态。recipe 内部三项（=:local-repo= / =:files= / =:build=）的理由见方式 A 的表格 |
+| =:demand t= | 立即 =require=，让 mode 尽早启用。延迟加载会让启动分解退化为单锚点（见「启动分解的物理边界」节），对本包是净损失。另：=:demand t= 生成的 require 是 =(require 'el-chronos nil nil)=（=noerror= 为 nil），加载失败会直接抛错、不静默 |
+| =:config=（实例守卫 + lambda） | =add-hook= 投递符号后是**无参调用**，而 =el-chronos-mode= 无参形态是 **toggle** → 必须 =(lambda () (el-chronos-mode 1))=。守卫段只是本机 thomas-emacs 的示例（它在隔离实例里跳过观测），照抄请按自己的环境改或删掉 |
+
+> **旧形态（=:straight nil= + =:load-path=）已不推荐**：它依赖逐条手写 autoload 才让跨文件命令可用，
+> 且 =:load-path= 有若干静默陷阱（见「四个静默陷阱」①）。若仍要用，注意 =:load-path= 只能写
+> **字符串字面量**（绝对路径最稳、=~= 前缀亦可），且入口命令必须逐条 =(autoload SYM "定义文件名" nil t)=。
+
 ** 安装后确认
 
 #+BEGIN_SRC elisp
@@ -48,6 +106,103 @@
 (el-chronos-status)          ; echo area 显示运行状态与 DB 路径
 el-chronos-db-path           ; 确认数据落点
 #+END_SRC
+
+* autoloads 与 use-package 排障
+
+** autoloads 生成（=make autoloads=）
+
+| 项 | 内容 |
+|---|---|
+| 用途 | 生成 =el-chronos-autoloads.el=：**15 个 interactive 命令**的 =(autoload SYM "定义文件" ...)= 声明，让包**未加载**时 =M-x= 也能直接调用 |
+| 产物位置 | 仓库根 =el-chronos-autoloads.el=（约 221 行，随命令增删变化） |
+| 为何不入库 | 生成物与源码必然漂移，入库就得每次改源码后重新生成并提交；=.gitignore= 已显式忽略该文件 |
+| 为何不进 L1/L2 | Makefile 的 =EL_FILES= 用 =find ... -not -name 'el-chronos-autoloads.el'= 排除；若不排除，生成后 =make check-parens= / =make lint= 的检查范围会随生成物变化（等于让门禁跟着生成器行为漂移） |
+| 实现分流 | Emacs **29.1+** 用 =loaddefs-generate=（自身产物列入 =EXCLUDED-FILES= 防自引用）；更早版本 =(require 'autoload)= + =make-directory-autoloads=。ERT 用例 =el-chronos-autoload-test-autoloads-file-makes-commands-callable= 用**同源守卫**（=loaddefs-generate= 不存在即 =ert-skip=），不硬编码单一实现 |
+| 契约守门 | =test/el-chronos-autoload-test.el=（3 用例）锁住三件事：cookie 覆盖全部 interactive 命令（计数不变量）、生成物让 15 个命令 =autoloadp= 为 =t=、每条 autoload 的库名等于定义文件名 |
+
+#+BEGIN_SRC sh
+make autoloads
+# 生成结果自检：每条 autoload 都应指向定义文件（而不是包名 el-chronos）
+grep -n '^(autoload' el-chronos-autoloads.el
+#+END_SRC
+
+=:local-repo= 形态下这段**不需要手写**：straight 的 autoloads 步骤在 build 时把生成物写到
+=build-<ver>/el-chronos/el-chronos-autoloads.el= 并在加载包时自动 load（实测：15 条 autoload 全部
+注册、=autoloadp= 全 =t=）。手工 =load= 只用于方式 B 这类没有 straight 的场合——此时生成物可能
+不存在（不入库），故用 =noerror= 形态：
+
+#+BEGIN_SRC elisp
+(load (expand-file-name "el-chronos-autoloads" "/home/thomas/Workspace/el-chronos") nil t)
+#+END_SRC
+
+** 四个静默陷阱（实测 Emacs 31.1 / use-package 2.4.5）
+
+四个都**不报错**，只让配置「看起来写了却没生效」——是 use-package 接入本包最常见的坑。
+
+| # | 陷阱 | 现象 | 正确写法 / 排查 |
+|---|---|---|---|
+| ① | =:local-repo= 下游跑 =straight-pull-package= / =straight-checkout-package= | 改的是**你的开发仓本身**（=:local-repo= 就是那个 git 工作树，straight 不复刻副本）：未提交改动会被 pull 合入、被 checkout 置于覆盖风险 | 开发仓有未提交改动时**不要**跑这两条；只想刷新源码用 =M-x straight-rebuild-package RET el-chronos=。若你选择 =:load-path= 而非 =:local-repo=，注意它只能写**字符串字面量**（相对路径在宏展开期按当时 =user-emacs-directory= 固化，sexp / 变量形态让整个 form 展开为 =nil=） |
+| ② | 关键字参数形态非法 | 整个 use-package form 展开为 **=nil=**：不报错、不加载，命令全是 void | =M-: (pp (macroexpand-1 '(use-package el-chronos ...)))= 看展开；展开为 =nil= 说明某个关键字形态不合法（实测触发：=:load-path (expand-file-name ...)=、=:autoload (sym "file")=） |
+| ③ | =:commands= 与 =:demand t= 同存 | autoload 被**静默抑制**，只剩 require（=:commands= 隐含 defer，=:demand= 在关键字序中位于其后，handler 用 =(plist-get state :demand)= 抑制 autoload 生成） | 需要 autoload 就不要同时写两者；本包因「库名恒为包名」问题本就不用 =:commands= |
+| ④ | =:if= / =:when= 想表达「仓库缺失就跳过安装」 | **包不住 =:straight=**：安装调用被生成在 =:if= 之外（=progn= 顶层），条件为假时照样执行，本机表现为目录缺失也会去远端 clone 本仓 | 用 =if= 包住**整个** =use-package=：=if (file-exists-p ...) (use-package ...) (display-warning ...)=。判据形态用 =(macroexpand-1 '(use-package PKG :if nil :straight …))= 自检，返回的 =progn= 里若出现 =straight-use-package= 即命中本陷阱 |
+
+实测展开片段（②③④ 的依据；末两条另附 =:load-path= 旧形态的展开作为对照）：
+
+#+BEGIN_SRC elisp
+;; ③ 有 :demand t —— autoload 完全不生成，只剩 require
+(progn (require 'el-chronos nil nil))
+;; ③ 无 :demand —— 生成 autoload，但库名是包名 el-chronos
+(progn (unless (fboundp 'el-chronos-report) (autoload #'el-chronos-report "el-chronos" nil t)))
+;; ④ :if 形态 —— straight-use-package 在 progn 顶层，:if 只包住 when（条件为假照样安装）
+(progn (straight-use-package '(el-chronos :type git :local-repo "…"))
+       (when nil (require 'el-chronos nil nil)))
+;; ④ if 包裹形态（正确写法）—— straight-use-package 落在 if 的 then 分支内，条件为假整段不求值
+(if (file-exists-p "/home/thomas/Workspace/el-chronos/el-chronos.el")
+    (progn (straight-use-package '(el-chronos :type git :local-repo "…"))
+           (require 'el-chronos nil nil))
+  (display-warning 'chronos "未找到"))
+;; 附（旧 :load-path 形态）相对路径 "lisp" → 宏展开期固化
+(eval-and-compile (add-to-list 'load-path "/home/thomas/.cache/thomas-emacs-elisp-test/lisp"))
+;; 附（旧 :load-path 形态）sexp / 变量形态 → 整个 form 失效
+nil
+#+END_SRC
+
+第三条的另一半：=:autoload (sym "file")= 的 per-symbol 文件名语法**不存在**——=use-package-core.el=
+里 =:autoload= 复用 =:commands= 的 normalizer（只吃符号），直接调 normalizer 报
+=use-package: :autoload wants a symbol, or list of symbols=。所以跨文件入口只能走
+=:init= 显式 =(autoload SYM "FILE")=，库名必须等于定义文件名。
+
+** =:hook= 无参 toggle 陷阱
+
+=el-chronos-mode= 的无参形态是 **toggle**（=define-minor-mode= 的默认行为），而 hook 是**无参调用**：
+
+- 错：=(add-hook 'emacs-startup-hook #'el-chronos-mode)= —— 每次求值都把模式**反转**（开着就关掉）；
+  重复求值（重载配置、多个 hook 位）会来回翻转。
+- 对：=(add-hook 'emacs-startup-hook (lambda () (el-chronos-mode 1)))= —— 显式 =1=，幂等。
+
+=use-package= 的 =:hook= 同理：=:hook (emacs-startup . el-chronos-mode)= 展开为
+=(add-hook 'emacs-startup-hook #'el-chronos-mode)=，仍是符号形态；要安全就写
+=:hook (emacs-startup . (lambda () (el-chronos-mode 1)))=。本包推荐 =:demand t= + =:config= 内挂
+lambda（见「方式 C」），不用 =:hook=。
+
+** 排障：=M-x= 提示命令未定义（void-function）
+
+按顺序逐条排除，前一条成立就不用往下：
+
+1. **包装上了没有**：=M-: (locate-library "el-chronos")= 应返回
+   =<straight-base-dir>/straight/build-<ver>/el-chronos/el-chronos.el=（软链到开发仓）；
+   返回 =nil= 说明 recipe 没生效——用 =:load-path= 形态时则多半是「四个静默陷阱」的 ②。
+2. **autoloads 生成了没有**：=M-: (file-exists-p (expand-file-name "el-chronos-autoloads.el"
+   (file-name-directory (locate-library "el-chronos"))))= → =t=。为 =nil= 说明 straight 的
+   autoloads 步骤没跑（=:build= 被写成 =(:not autoloads ...)= 就会这样），
+   跑 =M-x straight-rebuild-package RET el-chronos= 后重试。
+3. **命令是否真是 autoload**：=M-: (autoloadp (symbol-function 'el-chronos-report))= → =t= 表示
+   「已声明、首次调用才加载」；=nil= 且 =M-: (fboundp 'el-chronos-report)= 也为 =nil=，就是完全没声明。
+4. **库名对不对**：=M-: (nth 1 (symbol-function 'el-chronos-report))= 应是 ="el-chronos-report"=。
+   若为 ="el-chronos"=（包名），首次调用会报 =Autoloading file ... failed to define function=
+   —— =el-chronos.el= 不 =require= 报告模块与 Web 模块，加载它并不会定义该命令。
+5. **版本门槛**：=make autoloads= 在 Emacs **29.1+** 走 =loaddefs-generate=，更低版本回退
+   =make-directory-autoloads=（结果等价，只是入口不同）；本包运行本身要求 Emacs **29.1+**（内置 =sqlite=）。
 
 * 阻塞提示（echo area）
 
@@ -154,8 +309,10 @@ sqlite3 -readonly "file:$HOME/.emacs.d/.local/state/chronos/chronos.sqlite?mode=
 
 1. **停止观测**： =(el-chronos-mode -1)= —— 清理 timer、hook（含每 buffer 的局部 hook）、
    profiler、未 flush 缓冲（I5 零残留）。确认：=M-: el-chronos--running-p= → =nil=。
-2. **移除加载路径**：删掉配置里的 =(require 'el-chronos)= / straight 的 =straight-use-package= 段，
-   再从 =load-path= 移除目录；（可选）删除本地 clone。
+2. **移除加载路径**：删掉配置里的 straight recipe（=:local-repo= 软链随之消失，留下
+   =<straight-base-dir>/straight/{repos,build-<ver>}/el-chronos= 时用 =M-x straight-remove-package
+   RET el-chronos= 清理），或删掉 =(require 'el-chronos)= 与 =load-path= 条目；
+   （可选）删除本地 clone。
 3. **删除数据**（可选）：删
    =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=（连同同目录的
    =chronos.sqlite-wal= / =chronos.sqlite-shm=）。删除前请先做完第 1 步。
@@ -166,6 +323,9 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 #+END_SRC
 
 不删库也不影响其他功能：下次重新启用会复用同一库继续累积。
+
+若你用过 =make autoloads=，顺手删掉仓库根的 =el-chronos-autoloads.el=：它是生成物、
+**不在版本控制内**，删掉后需要时再 =make autoloads= 重建即可。
 
 * 数据清理
 
@@ -219,7 +379,8 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 |---|---|---|---|
 | =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
 | =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
-| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 234 tests, 234 results as expected, 0 unexpected= |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 237 tests, 237 results as expected, 0 unexpected= |
+| =make autoloads= | 生成物 | 生成 =el-chronos-autoloads.el=（按需生成，不入库、不进 L1/L2） | 15 条 =(autoload ...)= 声明，库名为各自定义文件 |
 | =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
 
 ** 手动 smoke（端到端，5 分钟）

@@ -721,6 +721,7 @@ analysis 返回 nil（查询失败）时降级为 `:sessions' 为 null、计数�
   (let ((proc el-chronos-web--process))
     (and (processp proc) (process-live-p proc) t)))
 
+;;;###autoload
 (defun el-chronos-web-start (&optional port)
   "启动 Web dashboard，返回 server 进程对象。
 只绑定 127.0.0.1 的 PORT（默认 `el-chronos-web-port'）；已在运行时先关闭再启动。
@@ -752,6 +753,7 @@ message 与返回值都反映**实际绑定**的端口：PORT 为 0 时由内核
              (or (process-contact proc :service) port))
     proc))
 
+;;;###autoload
 (defun el-chronos-web-stop ()
   "关闭 Web dashboard 并释放监听端口；返回 t 表示确有 server 被关闭。
 同时清理未完成请求缓冲，避免残留 hash 项泄漏。"

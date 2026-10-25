@@ -111,7 +111,7 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 | =el-chronos-store-record-startup-phase= | =(SESSION-ID PHASE MS)= | 无 | 记录启动阶段耗时（v2）。=PHASE= 取 =mode-start= / =after-init= / =startup= / =first-idle=，包加载明细用 ="load:<library>"=；同 =(SESSION-ID, PHASE)= 重复打点**覆盖**。 |
 | =el-chronos-store-record-session-meta= | =(SESSION-ID KEY VALUE)= | 无 | 写会话级元数据（v2，=git-head= / =config-sig=）。**直接 =sqlite-execute= 写入、不走缓冲**（每会话一次的冷路径，立即可见、不占缓冲、失败可独立告警）；=VALUE= 为 nil 时**不写行**。 |
 | =el-chronos-store-note-startup-ms= | =(MS)= | 无 | 登记待补写的 =sessions.startup_ms=，落库并入**下一次 flush 的既有事务**。**纯内存、零 IO**：不碰 sqlite、不告警、不登记 timer（见「内部函数约定」）。 |
-| =el-chronos-store-flush= | =()= | 无 | 全部缓冲单事务写库（含 v2 四表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。 |
+| =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 四表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
 | =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含六张 =hourly_*= 与两张会话级表）：**共 11 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 11 表删除顺序」）。=BEFORE= 为 nil 时清空全部 11 张表。与自动 retention 的区别是连聚合一起删。 |
 | =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
 
@@ -126,8 +126,8 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
-| =el-chronos-collect-start= | =()= | =t= / =nil= | 启动采集：命令计时 hook（全局 + 每 buffer 局部补挂，TD-9）、错误标记 advice、心跳 timer、采样 timer 与 profiler。幂等。 |
-| =el-chronos-collect-stop= | =()= | =t= / =nil= | 停止采集并清空全部状态，保证零残留（I5）。幂等。 |
+| =el-chronos-collect-start= | =()=，interactive | =t= / =nil= | 启动采集：命令计时 hook（全局 + 每 buffer 局部补挂，TD-9）、错误标记 advice、心跳 timer、采样 timer 与 profiler。幂等。 |
+| =el-chronos-collect-stop= | =()=，interactive | =t= / =nil= | 停止采集并清空全部状态，保证零残留（I5）。幂等。 |
 | =el-chronos-collect-notify-blocks= | defcustom，默认 =nil= | =(choice (const nil) (const messages) (const t))= | 心跳检测到阻塞时**如何提示**（不影响采集与记录：=slow_events(kind="block")= 恒照记）。=nil= 静默；=messages= 只写 =*Messages*=（=(let ((inhibit-message t)) (message ...))=，不占 echo area）；=t= 在 echo area 提示（旧语义）。详见 [[file:operations.org][docs/operations.org]]「阻塞提示」。 |
 | =el-chronos-collect--suppress-block-p= | defvar，默认 =nil= | boolean | **跨模块控制变量**：声明在 collect 侧（=el-chronos-collect.el=），**report 与 Web 侧各自绑定**（=el-chronos-report--without-block-events= 在报告生成期间、=el-chronos-web--without-block-events= 在请求处理期间各自 =let= 为 =t=；后者是前者的内联重复实现，为保持 web 零额外依赖，两处改动需同步），**collect 侧读取**（=el-chronos-collect--heartbeat= 用 =bound-and-true-p= 判断：非 =nil= 时跳过阻塞判定，只把 =--last-heartbeat= 推进到当前时刻，故解除绑定后不会补记整段 gap）。report 与 web 各自必须先 =defvar= 同名声明，否则跨模块 =let= 绑定未声明变量会 =void-variable=；两侧同名同义，重复声明无副作用。语义上它只抑制「重查询耗时的假阻塞」——其间真实发生的阻塞同样不记，属有意取舍。 |
 | =el-chronos-collect--last-heartbeat= | defvar，默认 =nil= | 浮点秒 | 上一次心跳的实际触发时刻。**跨模块写入点**有三个：report 侧在报告生成结束、Web 侧在请求处理结束（两者都在各自的 =unwind-protect= 清理段）重设基线，以及 collect 心跳自身在抑制期间推进基线；目的都是避免补跑的心跳把整段非采集耗时记成阻塞（详见 [[file:architecture.org][docs/architecture.org]]「自观测抑制（report / Web）」）。 |
@@ -202,6 +202,100 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 (el-chronos-web-running-p)    ; => t
 (el-chronos-web-stop)         ; => t
 #+END_SRC
+
+* autoload 与 use-package 集成
+
+包侧提供标准 autoload 契约：**15 个 interactive 命令**全部带 =;;;###autoload= cookie，
+由 =make autoloads= 生成 =el-chronos-autoloads.el=。契约由
+=test/el-chronos-autoload-test.el=（3 用例）守门——cookie 覆盖全部 interactive 命令（计数不变量）、
+生成后 15 个命令 =autoloadp= 为 =t=、每条 autoload 的库名等于其定义文件。
+
+** 15 个 interactive 命令与定义文件
+
+| # | 命令 | 定义文件 | 生成 autoloads 后可直接 =M-x= | 备注 |
+|---|---|---|---|---|
+| 1 | =el-chronos-mode= | =el-chronos.el= | 是 | =define-minor-mode= 的 autoload 只定义函数、不定义变量（=add-hook= 投递符号即可）；无参 =M-x= 是 **toggle** |
+| 2 | =el-chronos-status= | =el-chronos.el= | 是 | |
+| 3 | =el-chronos-attrib-clear-cache= | =el-chronos-attrib.el= | 是 | 重载包后清归因缓存 |
+| 4 | =el-chronos-collect-start= | =el-chronos-collect.el= | 是 | **一般不直接调用**：由 =el-chronos-mode= 编排 |
+| 5 | =el-chronos-collect-stop= | =el-chronos-collect.el= | 是 | 同上 |
+| 6 | =el-chronos-report= | =el-chronos-report.el= | 是 | |
+| 7 | =el-chronos-weekly-report= | =el-chronos-report.el= | 是 | |
+| 8 | =el-chronos-export= | =el-chronos-report.el= | 是 | 需 =FORMAT= 与 =FILE= 两个参数 |
+| 9 | =el-chronos-show-event= | =el-chronos-report.el= | 是 | 需事件 =ID= |
+| 10 | =el-chronos-profile-command= | =el-chronos-report.el= | 是 | |
+| 11 | =el-chronos-store-flush= | =el-chronos-store.el= | 是 | **一般不直接调用**：由 5s flush timer 编排 |
+| 12 | =el-chronos-purge= | =el-chronos-store.el= | 是 | |
+| 13 | =el-chronos-store-vacuum= | =el-chronos-store.el= | 是 | |
+| 14 | =el-chronos-web-start= | =el-chronos-web.el= | 是 | |
+| 15 | =el-chronos-web-stop= | =el-chronos-web.el= | 是 | |
+
+按文件分布：入口 2 / 归因 1 / 存储 3 / 采集 2 / 报告 5 / Web 2 = **15**。
+
+** =make autoloads= 的作用与产物
+
+#+BEGIN_SRC sh
+make autoloads      # → 仓库根 el-chronos-autoloads.el（约 221 行）
+grep -n '^(autoload' el-chronos-autoloads.el
+#+END_SRC
+
+生成结果里每条都指向自己的定义文件（不是包名）：
+
+#+BEGIN_SRC elisp
+(autoload 'el-chronos-mode "el-chronos" nil t)             ; 定义文件即 el-chronos.el
+(autoload 'el-chronos-report "el-chronos-report" nil t)    ; 定义文件是报告模块
+#+END_SRC
+
+- **不入库**：生成物与源码必然漂移，按需重建即可（=.gitignore= 已忽略）。
+- **不进 L1/L2**：Makefile 的 =EL_FILES= 显式排除该文件，否则生成后 =make check-parens= /
+  =make lint= 的检查范围会随生成物变化。
+- **实现分流**：Emacs 29.1+ 用 =loaddefs-generate=，更早版本回退 =make-directory-autoloads=
+  （ERT 用例同源守卫，不硬编码单一实现）。
+
+** 配置侧写法
+
+推荐形态是 straight =:local-repo= recipe（本地开发仓 + upstream 识别，与 =seshat-reader= 同款）：
+
+#+BEGIN_SRC elisp
+(use-package el-chronos
+  :straight (el-chronos
+             :type git
+             :host github
+             :repo "awerdx520/el-chronos"
+             :branch "master"
+             :local-repo "/home/thomas/Workspace/el-chronos"
+             :files ("el-chronos*.el" (:exclude "el-chronos-autoloads.el"))
+             :build (:not compile native-compile))
+  :demand t)
+#+END_SRC
+
+straight 的 autoloads 步骤依据包侧 cookie 生成 =build-<ver>/el-chronos/el-chronos-autoloads.el=
+并自动加载，因此**不必**逐条手写 =(autoload SYM "定义文件")=。要点只有四条：
+=:straight= 必须写成完整 recipe（本机 =straight-use-package-by-default= 为 =t=，缺了它 straight
+会去远端解析安装）、=:local-repo= 下游跑 =straight-pull-package= / =straight-checkout-package=
+会改到开发仓本身、新增或改名 interactive 命令后须 =M-x straight-rebuild-package RET el-chronos=
+刷新 autoloads、**需要「仓库缺失就降级」时必须用 =if= 包住整个 =use-package=**——=:if= / =:when=
+包不住 =:straight= 生成的安装调用（实测展开仍是 =(progn (straight-use-package …) (when COND …))=，
+条件为假照样去 clone；正确形态的展开把该调用关进 =if= 的 then 分支）。
+
+完整逐项解释与陷阱见 [[file:operations.org][docs/operations.org]]「方式 A / 方式 C」与「四个静默陷阱」，
+面向使用者的简版见 [[file:../Readme.org][Readme.org]]「安装」。若坚持 =:load-path= 形态（无 straight），
+则须逐条 =(autoload SYM "定义文件")=，库名规则见下一节。
+
+** 为什么 autoload 库名必须是定义文件
+
+=(autoload SYM "LIB" ...)= 的 =LIB= 是「首次调用时要 =load= 哪个库文件」。若把报告命令声明成
+包名——=(autoload 'el-chronos-report "el-chronos")=——首次 =M-x el-chronos-report= 会去加载
+=el-chronos.el=，而该文件**不** =require= =el-chronos-report=（mode 启动时只软加载
+=el-chronos-store= / =el-chronos-collect=），于是命令没被定义，Emacs 报
+=Autoloading file ... failed to define function=（实测原文）。
+
+这也正是 =use-package= 的 =:autoload= / =:commands= 无法直接用于跨文件入口的原因：这两个关键字
+生成的 autoload 库名**恒为包名**（=:autoload= 复用 =:commands= 的 normalizer，只吃符号，
+没有 per-symbol 文件名语法）。所以手写 autoload（=:load-path= 形态）必须在 =:init= 里显式
+=(autoload SYM "FILE")=；而 straight 的 autoloads 步骤直接读 cookie 生成、天然带定义文件名，
+这也是推荐 =:local-repo= recipe 的原因之一。
+配置侧排查步骤见 [[file:operations.org][docs/operations.org]]「排障：=M-x= 提示命令未定义」。
 
 * 内部函数约定
 
