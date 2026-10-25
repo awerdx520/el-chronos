@@ -314,6 +314,19 @@ SQLite 不可用或启动过程中出错时，告警并把 `el-chronos-mode' 置
           (require 'el-chronos-collect nil t)
           (el-chronos--call-if-bound 'el-chronos-store-open)
           (el-chronos--call-if-bound 'el-chronos-collect-start)
+          ;; 阈值配错会让 drift 静默永不触发（cond 里 block 分支在前，drift 区间为空），
+          ;; 属「数据悄悄错」；启动时一次性告警，把它变成可见问题。
+          (let ((hb-ms (* 1000 el-chronos-heartbeat-seconds))
+                (drift el-chronos-drift-threshold-ms)
+                (block el-chronos-block-threshold-ms))
+            (when (and (numberp drift) (numberp block) (>= drift block))
+              (display-warning 'el-chronos
+                (format "el-chronos-drift-threshold-ms（%s）>= el-chronos-block-threshold-ms（%s），drift 将永不触发；请把 drift 调到小于 block。" drift block)
+                :warning))
+            (when (and (numberp drift) (numberp hb-ms) (<= drift hb-ms))
+              (display-warning 'el-chronos
+                (format "el-chronos-drift-threshold-ms（%s）<= 心跳间隔（%s ms），每次心跳都会记 drift；请调大。" drift hb-ms)
+                :warning)))
           (setq el-chronos--running-p t)
           t)
       (error

@@ -377,6 +377,50 @@
     (when (fboundp 'profiler-cpu-running-p)
       (should-not (profiler-cpu-running-p)))))
 
+(ert-deftest el-chronos-collect-test-start-warns-on-inverted-thresholds ()
+  "阈值配错时 `--start' 各告警一次，且不阻断启动。
+drift >= block → drift 区间为空（cond 里 block 分支在前），drift 永不触发；
+drift <= 心跳间隔 → 每次心跳都记一条 drift。两者都是「数据悄悄错」，故启动时告警。"
+  (let ((el-chronos-enabled t)
+        warnings)
+    (cl-letf (((symbol-function 'el-chronos--sqlite-available-p) #'always)
+              ((symbol-function 'el-chronos-store-open) #'ignore)
+              ((symbol-function 'el-chronos-collect-start) #'ignore)
+              ((symbol-function 'el-chronos-collect-stop) #'ignore)
+              ((symbol-function 'el-chronos-store-close) #'ignore)
+              ((symbol-function 'display-warning)
+               (lambda (type msg &optional level)
+                 (push (list type msg level) warnings))))
+      (unwind-protect
+          ;; ① drift >= block
+          (let ((el-chronos-drift-threshold-ms 3000)
+                (el-chronos-block-threshold-ms 2000)
+                (el-chronos-heartbeat-seconds 0.25))
+            (should (eq t (el-chronos--start)))
+            (should (= 1 (length warnings)))
+            (should (eq 'el-chronos (caar warnings)))
+            (should (string-match-p "永不触发" (cadar warnings))))
+        (setq el-chronos--running-p nil))
+      ;; ② drift <= 心跳间隔（0.25s → 250ms）
+      (setq warnings nil)
+      (unwind-protect
+          (let ((el-chronos-drift-threshold-ms 200)
+                (el-chronos-block-threshold-ms 2000)
+                (el-chronos-heartbeat-seconds 0.25))
+            (should (eq t (el-chronos--start)))
+            (should (= 1 (length warnings)))
+            (should (string-match-p "每次心跳都会记 drift" (cadar warnings))))
+        (setq el-chronos--running-p nil))
+      ;; ③ 阈值合法时零告警（默认值）
+      (setq warnings nil)
+      (unwind-protect
+          (let ((el-chronos-drift-threshold-ms 500)
+                (el-chronos-block-threshold-ms 2000)
+                (el-chronos-heartbeat-seconds 0.25))
+            (should (eq t (el-chronos--start)))
+            (should-not warnings))
+        (setq el-chronos--running-p nil)))))
+
 ;;; D1 双跑（局部 hook 值带 t）+ D2 帧名归一
 
 (ert-deftest el-chronos-collect-test-skip-local-hook-when-t-marker ()

@@ -211,7 +211,11 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
    才补跑、看到整段 gap 的。只做 1、2 两层拦不住这一次补跑，必须重置基线。
 
 代价：请求处理期间恰好发生的**真实**阻塞也不会被记录。这是有意取舍 —— Web 请求是用户
-主动触发的重查询，其耗时属预期行为，不该混进「待排查的卡顿」里。"
+主动触发的重查询，其耗时属预期行为，不该混进「待排查的卡顿」里。
+
+注意：drift 的抑制**完全依赖** `el-chronos-collect--suppress-block-p' 这一道门，
+没有像 block 那样的「临时抬高阈值」兜底层（抬 block 阈值对 drift 无效）。
+若将来删改这道门，drift 会立即产生假阳性。"
   (declare (indent 0) (debug t))
   `(let ((el-chronos-collect--suppress-block-p t)
          (el-chronos-block-threshold-ms el-chronos-web--suppress-block-threshold-ms))
