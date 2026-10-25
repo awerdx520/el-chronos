@@ -32,6 +32,13 @@
 (require 'el-chronos)
 (require 'el-chronos-store)
 (require 'el-chronos-web)
+(eval-and-compile
+  ;; `make lint' 只带 `-L .'（不编译 test/ 目录）：编译期据 `byte-compile-current-file'
+  ;; 把本文件所在目录加进 load-path，否则下面的 `require' 找不到 helper。
+  ;; 运行期由 `make test' 的 `-L test' 提供，本段自然跳过。
+  (when (bound-and-true-p byte-compile-current-file)
+    (add-to-list 'load-path (file-name-directory byte-compile-current-file))))
+(require 'el-chronos-test-helper)
 
 ;;; 测试夹具与辅助
 
@@ -266,6 +273,169 @@
             ;; ③ 基线被重置到 ≈now（进入前是 now-100，不重置则相差约 100 秒）
             (should (> el-chronos-collect--last-heartbeat (+ baseline 50)))
             (should (< (- (float-time) el-chronos-collect--last-heartbeat) 2))))))))
+
+;;; 新查询路由（GC / 启动分解 / 采集健康 / 配置变更）与 CSV 新区块
+
+(defun el-chronos-web-test--open-fixture-db ()
+  "打开临时库（父宏已把 `el-chronos-db-path' 绑到临时目录）以便插入 fixture 行。
+`make test' 的用例里 analysis 层会惰性打开库；这里先显式打开，才能用
+`el-chronos-test-helper' 的插入函数造数据。"
+  (should (el-chronos-store-open)))
+
+(ert-deftest el-chronos-web-test-api-gc ()
+  "GET /api/gc 返回 200 + JSON：空库 items 为空，有数据时按桶聚合。
+`heap-bytes' 无样本（Emacs < 31.1 口径）时该字段为 null，页面渲染 \"-\" 而非 0。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((empty-resp (el-chronos-web-test--http "GET" "/api/gc?range=1d&buckets=4"))
+             (empty (el-chronos-web-test--json empty-resp)))
+        (should (equal 200 (plist-get empty-resp :status)))
+        (should (string-match-p "application/json" (plist-get empty-resp :headers)))
+        (should (equal "1d" (plist-get empty :range)))
+        (should (= 4 (plist-get empty :bucket-count)))
+        ;; 空数组经 `--json-value' 序列化为 null（nil 分支），前端按 `items||[]' 处理
+        (should (eq :null (plist-get empty :items)))
+        (should (zerop (or (plist-get empty :gc-total) 0))))
+      (el-chronos-test--insert-gc (el-chronos-test--hour-ts) 3 12.5 52428800)
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/gc?range=1d"))
+             (parsed (el-chronos-web-test--json resp))
+             (items (plist-get parsed :items))
+             (first (aref items 0)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (= 1 (length items)))
+        (should (= 3 (plist-get first :gc-count)))
+        (should (= 52428800 (plist-get first :heap-bytes)))
+        (should (= 3 (plist-get parsed :gc-total)))
+        (should (= 52428800 (plist-get parsed :heap-latest)))
+        ;; buckets 省略时由 analysis 按窗口长度决定，响应里为 null（不是 0）
+        (should (plist-member parsed :bucket-count))
+        (should (eq :null (plist-get parsed :bucket-count)))
+        (should (integerp (plist-get parsed :bucket-span)))))))
+
+(ert-deftest el-chronos-web-test-api-health-rows-semantics ()
+  "GET /api/health：空库 rows=0 且 ok-p 为 true；有丢弃计数时 ok-p 为 false 且 rows>0。
+`:rows' 是区分「没采集」与「没异常」的唯一依据（T7b 报告层同口径，I11）——
+反向验证：把 `:rows' 从响应里去掉，本用例的 rows 断言必红。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((empty-resp (el-chronos-web-test--http "GET" "/api/health?range=1d"))
+             (empty (el-chronos-web-test--json empty-resp)))
+        (should (equal 200 (plist-get empty-resp :status)))
+        (should (equal 0 (plist-get empty :rows)))
+        ;; 无数据时 analysis 也给 ok-p 为 t —— 故必须靠 rows 区分
+        (should (eq t (plist-get empty :ok-p))))
+      (el-chronos-test--insert-health (el-chronos-test--hour-ts) "dropped-commands" 5)
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/health?range=1d"))
+             (parsed (el-chronos-web-test--json resp)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (equal 1 (plist-get parsed :rows)))
+        (should (= 5 (plist-get parsed :dropped-commands)))
+        (should (eq :false (plist-get parsed :ok-p)))))))
+
+(ert-deftest el-chronos-web-test-api-startup-missing-session ()
+  "GET /api/startup?session=<不存在> → 200 + 同构空结构（不 404、不 500）。
+会话可能已被保留策略清理，属正常空结果而非路径错误（与 `/api/event' 的 200 + null 同取舍）。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/startup?session=999999"))
+             (parsed (el-chronos-web-test--json resp)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (string-match-p "application/json" (plist-get resp :headers)))
+        (should (= 999999 (plist-get parsed :session-id)))
+        ;; 同构空结构：键都在，值为 JSON null（json-parse 把 null 读成 `:null'）
+        (should (plist-member parsed :phases))
+        (should (eq :null (plist-get parsed :phases)))
+        (should (eq :null (plist-get parsed :loads)))
+        (should (eq :null (plist-get parsed :startup-ms)))))))
+
+(ert-deftest el-chronos-web-test-api-startup-with-fixture ()
+  "GET /api/startup?session=N：阶段锚点按固定顺序返回、包加载按耗时降序。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (let* ((started (- (el-chronos-test--now-ms) 60000))
+           (id (el-chronos-test--insert-session started 1500)))
+      (el-chronos-test--insert-startup-phase id "mode-start" 100)
+      (el-chronos-test--insert-startup-phase id "load:dashboard" 40)
+      (el-chronos-test--insert-startup-phase id "load:org" 60)
+      (el-chronos-web-test--with-server
+        (let* ((resp (el-chronos-web-test--http "GET" (format "/api/startup?session=%d" id)))
+               (parsed (el-chronos-web-test--json resp))
+               (phases (plist-get parsed :phases))
+               (loads (plist-get parsed :loads)))
+          (should (equal 200 (plist-get resp :status)))
+          (should (= id (plist-get parsed :session-id)))
+          (should (= 1500 (plist-get parsed :startup-ms)))
+          (should (= 1 (length phases)))
+          (should (equal "mode-start" (aref (aref phases 0) 0)))
+          (should (= 100 (aref (aref phases 0) 1)))
+          (should (= 2 (length loads)))
+          (should (equal "org" (aref (aref loads 0) 0)))
+          (should (= 60 (aref (aref loads 0) 1)))
+          (should (equal "dashboard" (aref (aref loads 1) 0))))))))
+
+(ert-deftest el-chronos-web-test-api-config-history ()
+  "GET /api/config-history：首会话 changed 为 null（无从比较），标记变化后为 true；
+`:changes' 等于返回列表里 changed 为 true 的条数。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (let* ((now (el-chronos-test--now-ms))
+           (auto el-chronos--session-id)
+           (old (el-chronos-test--insert-session (- now 7200000)))
+           (new (el-chronos-test--insert-session (- now 3600000))))
+      (el-chronos-test--insert-session-meta old "git-head" "aaaa1111")
+      (el-chronos-test--insert-session-meta old "config-sig" "cccc0000")
+      (el-chronos-test--insert-session-meta new "git-head" "bbbb2222")
+      (el-chronos-test--insert-session-meta new "config-sig" "cccc0000")
+      ;; 删掉 store-open 自动建的当前会话行，让 fixture 成为窗口内唯二会话
+      (when auto (el-chronos-test--exec "DELETE FROM sessions WHERE id = ?" (list auto)))
+      (el-chronos-web-test--with-server
+        (let* ((resp (el-chronos-web-test--http "GET" "/api/config-history?range=1d"))
+               (parsed (el-chronos-web-test--json resp))
+               (sessions (plist-get parsed :sessions)))
+          (should (equal 200 (plist-get resp :status)))
+          (should (= 2 (length sessions)))
+          (should (equal "aaaa1111" (plist-get (aref sessions 0) :git-head)))
+          ;; 首会话：无从比较 → analysis 给 nil → JSON null（不是 false）
+          (should (eq :null (plist-get (aref sessions 0) :changed)))
+          (should (eq t (plist-get (aref sessions 1) :changed)))
+          (should (= 1 (plist-get parsed :changes)))
+          (should (= 2 (plist-get parsed :total-sessions)))
+          (should (eq :false (plist-get parsed :truncated))))))))
+
+(ert-deftest el-chronos-web-test-export-csv-new-sections ()
+  "GET /api/export.csv 含 11 个 `# section:'，其中 startup / health / config-history 三块齐备。
+三个新块的区块名、表头与 report 侧逐字一致（两处内联重复实现，改动需同步）。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/export.csv?range=1d"))
+             (body (plist-get resp :body)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (string-match-p "text/csv" (plist-get resp :headers)))
+        (should (string-match-p "^# section: overview$" body))
+        (should (string-match-p "^# section: startup$" body))
+        (should (string-match-p "^# section: health$" body))
+        (should (string-match-p "^# section: config-history$" body))
+        ;; 表头逐字对齐 report 侧
+        (should (string-match-p "^kind,name,ms$" body))
+        (should (string-match-p "^metric,value$" body))
+        (should (string-match-p "^session_id,started_at_ms,git_head,config_sig,changed$" body))
+        ;; health 必带 rows 行（区分「没采集」与「没异常」）
+        (should (string-match-p "^rows," body))
+        (should (= 11 (length (cl-remove-if-not
+                               (lambda (line) (string-prefix-p "# section: " line))
+                               (split-string body "\n")))))))))
+
+(ert-deftest el-chronos-web-test-routes-count ()
+  "路由表共 17 条且四个新查询路由已注册、无重复键。
+新增路由必须同步 `docs/ui.org' 的 16 条 API 路由表（T10）。"
+  (should (= 17 (length el-chronos-web--routes)))
+  (should (= 17 (length (delete-dups (mapcar #'car el-chronos-web--routes)))))
+  (dolist (path '("/api/gc" "/api/startup" "/api/health" "/api/config-history"))
+    (should (assoc path el-chronos-web--routes))))
 
 (provide 'el-chronos-web-test)
 

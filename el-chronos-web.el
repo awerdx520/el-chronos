@@ -62,6 +62,18 @@
 (defconst el-chronos-web--max-limit 1000
   "limit 参数上限，防止单次响应过大。")
 
+(defconst el-chronos-web--config-history-sessions 50
+  "`/api/config-history' 最多返回的会话数（取最近的 N 个，输出仍按启动时间升序）。
+限流的理由：会话行随每次重启单调增长（每次启动一行），30d 窗口在频繁重启的机器上可达
+数千行；Web 是单线程同步处理、浏览器还要一次性渲染整张表，全量返回会让主线程查询与渲染
+时间一起变长。analysis 层不限条数（org 报告与 CSV 导出需要完整序列），因此限流只做在
+Web 的 JSON 接口上，CSV 导出（`/api/export.csv'）保持完整序列。")
+
+(defconst el-chronos-web--startup-load-rows 10
+  "CSV 里「启动分解」包加载 TOP 最多输出的条数。
+与 `el-chronos-report--startup-load-rows' 取值一致 —— 两处是**内联重复实现**
+（本模块不 require report），改一处必须同步另一处。")
+
 (defconst el-chronos-web--json-type "application/json; charset=utf-8"
   "JSON 响应的 Content-Type。")
 
@@ -233,9 +245,14 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
     ("/api/sessions" . el-chronos-web--route-sessions)
     ("/api/blocking" . el-chronos-web--route-blocking)
     ("/api/regressions" . el-chronos-web--route-regressions)
+    ("/api/gc" . el-chronos-web--route-gc)
+    ("/api/startup" . el-chronos-web--route-startup)
+    ("/api/health" . el-chronos-web--route-health)
+    ("/api/config-history" . el-chronos-web--route-config-history)
     ("/api/event" . el-chronos-web--route-event)
     ("/api/export.csv" . el-chronos-web--route-export-csv))
-  "路由表：路径 → 处理函数。全部只读，没有任何写入 / 执行入口。")
+  "路由表：路径 → 处理函数。全部只读，没有任何写入 / 执行入口。
+共 17 条（1 条 HTML + 15 条 JSON + 1 条 CSV）；新增路由必须同步 `docs/ui.org' 的路由表。")
 
 (defun el-chronos-web--dispatch (req)
   "把解析后的请求 REQ 分发到路由，返回响应 plist。
@@ -382,9 +399,70 @@ STATUS 是 `200 OK' 这类状态行文本，TYPE 是 Content-Type，BODY 是响�
      (:function :current-ms :previous-ms :growth :current-samples :previous-samples)))
   "CSV 明细区块：(区块名 表头 查询函数 LIMIT 字段)；再加 overview 共 8 个 `# section:'。")
 
+;; 下面三个区块的生成函数与 `el-chronos-report--csv-startup' / `--csv-health' /
+;; `--csv-config-history' 是**内联重复实现**：web 刻意不 require report（保持零额外依赖，
+;; 见文件头「自观测抑制」段的同一取舍），代价是同一份 CSV 口径存在两处。
+;; **两处需同步**：区块名（`# section:' 的值）、表头与列顺序、截断条数（启动分解 10 条）、
+;; `changed' 写 `1' / `0' 而非空串、`health' 必带 `rows' 行。改任何一处都要同步另一处。
+
+(defun el-chronos-web--csv-startup (breakdown)
+  "生成「启动分解」CSV 区块（`# section: startup'）：阶段锚点与包加载 TOP 合成一张表。
+两段用 `kind' 列区分（`phase' / `load'），其余列是 `name' 与 `ms'：合成一张表而不是两个
+同名区块，是为了让下游只靠 `# section:' 就能定位区块。
+包加载按 `el-chronos-web--startup-load-rows' 截断（与 report 侧口径一致）；
+BREAKDOWN 为 nil 时只输出表头（I11：无数据不省略区块）。"
+  (let* ((phases (and breakdown (plist-get breakdown :phases)))
+         (loads (and breakdown (plist-get breakdown :loads))))
+    (el-chronos-web--csv-block
+     "startup" '("kind" "name" "ms")
+     (append
+      (cl-loop for (phase ms) in phases collect (list "phase" phase ms))
+      (cl-loop for (library ms) in
+               (last loads (min el-chronos-web--startup-load-rows (length loads)))
+               collect (list "load" library ms))))))
+
+(defun el-chronos-web--csv-health (health)
+  "生成「采集健康」CSV 区块（`# section: health'）：`metric' / `value' 两列的窄表。
+键名沿用 `hourly_health.key' 的写法（snake_case），并**必须带 `rows' 一行**（窗口内行数）
+—— 导出件同样要能区分「没采集」与「没异常」，否则下游会重犯报告层曾犯的错（I11）。
+HEALTH 为 nil（查询失败）时只输出表头。"
+  (el-chronos-web--csv-block
+   "health" '("metric" "value")
+   (when health
+     (list (list "dropped_commands" (plist-get health :dropped-commands))
+           (list "dropped_events" (plist-get health :dropped-events))
+           (list "flush_failures" (plist-get health :flush-failures))
+           (list "flush_count" (plist-get health :flush-count))
+           (list "flush_ms" (plist-get health :flush-ms))
+           (list "flush_avg_ms" (plist-get health :flush-avg-ms))
+           (list "sample_misses" (plist-get health :sample-misses))
+           (list "rows" (plist-get health :rows))))))
+
+(defun el-chronos-web--csv-config-history (history)
+  "生成「配置变更」CSV 区块（`# section: config-history'）。
+列：`session_id' / `started_at_ms' / `git_head' / `config_sig' / `changed'；两个哈希写
+**完整值**（org 报告截 8 位只为排版，导出件要给下游做 join 与比对），`changed' 写
+`1' / `0' 而不是空串 —— 空串与「首会话无从比较」无法区分（与 report 侧同）。
+HISTORY 为 nil 时只输出表头；此处**不做** `/api/config-history' 的 50 会话截断：导出件
+的定位是完整序列（与 report 一致）。"
+  (el-chronos-web--csv-block
+   "config-history" '("session_id" "started_at_ms" "git_head" "config_sig" "changed")
+   (cl-loop for item in (and history (plist-get history :sessions))
+            collect (list (plist-get item :id)
+                          (plist-get item :started-at)
+                          (plist-get item :git-head)
+                          (plist-get item :config-sig)
+                          (if (plist-get item :changed) "1" "0")))))
+
+
 (defun el-chronos-web--csv-string (range)
-  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块，用 `# section:' 注释行分隔。
-字段一律保持原始值（毫秒/计数），便于下游脚本解析。"
+  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块 + 3 个新查询区块，共 11 个 `# section:'。
+字段一律保持原始值（毫秒/计数），便于下游脚本解析。
+前 8 个区块由 `el-chronos-web--csv-sections' 的通用规格生成（查询 → 行 → 列）；
+后 3 个（startup / health / config-history）返回结构不齐整（启动分解是两段嵌套列表、
+采集健康是扁平 plist、配置变更嵌在 `:sessions' 里，且启动分解不吃 RANGE），各自手写
+区块生成函数 —— 与 `el-chronos-report--csv-string' 同款取舍，字段口径见那三个函数的
+docstring（两处需同步）。"
   (let ((overview (el-chronos-analysis-overview range)))
     (concat
      (el-chronos-web--csv-block
@@ -398,7 +476,10 @@ STATUS 是 `200 OK' 这类状态行文本，TYPE 是 Content-Type，BODY 是响�
                        (funcall (nth 2 spec) range))))
           (el-chronos-web--csv-block (nth 0 spec) (nth 1 spec)
                                      (el-chronos-web--csv-rows items (nth 4 spec)))))
-      el-chronos-web--csv-sections ""))))
+      el-chronos-web--csv-sections "")
+     (el-chronos-web--csv-startup (el-chronos-analysis-startup-breakdown nil))
+     (el-chronos-web--csv-health (el-chronos-analysis-health range))
+     (el-chronos-web--csv-config-history (el-chronos-analysis-config-history range)))))
 
 ;;; 路由处理函数
 
@@ -462,6 +543,106 @@ KIND 取 `range'（QUERY 只接受 range，如 sessions）、`all'（range + nil
 (defun el-chronos-web--route-regressions (params)
   "GET /api/regressions：按 `el-chronos-regression-window-days' 判定的回归列表。"
   (el-chronos-web--list-response params #'el-chronos-analysis-regressions))
+
+(defun el-chronos-web--route-gc (params)
+  "GET /api/gc：窗口内按桶聚合的 GC 与堆内存趋势。
+查询参数 `range'（1d / 7d / 30d）与 `buckets'（正整数；省略时由 analysis 按窗口长度选择，
+1d / 7d / 30d 分别对应 24 / 168 / 720，并受整小时倍数合并约束）。
+
+响应键：`:range' 归一化范围、`:bucket-count' 请求的桶数（省略时为 null）、`:bucket-span'
+桶宽（毫秒）、`:gc-total' 窗口内 GC 次数合计、`:heap-latest' 窗口内最后一个非空堆大小
+（**Emacs 31.1 以下恒为 null**，不是数据丢失）、`:items' 桶列表
+`[{:bucket :gc-count :gc-ms :heap-bytes}]'。
+
+`:items' 就是 `el-chronos-analysis-gc-trend' 的 `:buckets'，改名为 `:items' 以与其它
+列表接口（`:range' `:limit' `:items'）保持同一形状；`:heap-bytes' 为 null 表示该桶内
+没有任何堆样本（桶内全 NULL），前端渲染 \"-\" 而非 0。
+GC 次数与耗时全 0 的桶是**会话首个采样窗口的基线桶**，不等于「没有发生 GC」——
+页面在本期全为基线桶时给降级说明（I11）。
+analysis 返回 nil（库打不开 / 查询失败）时降级为空结构（`:items' 为 null），仍返回 200。"
+  (let* ((range (el-chronos-web--range-param params))
+         (buckets (el-chronos-web--int-param params "buckets" nil))
+         (trend (el-chronos-analysis-gc-trend range buckets)))
+    (el-chronos-web--json-response
+     (list :range (format "%s" range)
+           :bucket-count buckets
+           :bucket-span (plist-get trend :bucket-span)
+           :gc-total (plist-get trend :gc-total)
+           :heap-latest (plist-get trend :heap-latest)
+           :items (plist-get trend :buckets)))))
+
+(defun el-chronos-web--route-startup (params)
+  "GET /api/startup[?session=N]：单会话的启动耗时分解。
+`session' 省略、非数字或非正数时取**最近一次有启动数据**的会话（判据见
+`el-chronos-analysis--startup-session'）；提供了但库里没有该会话 →
+`:session-id' 回填请求的 id、其余键为 null 的**同构空结构**，**不返回 404**：会话可能
+已被保留策略清理，属正常空结果而非路径错误（与 `/api/event' 的 200 + null 同一取舍）。
+
+响应即 `el-chronos-analysis-startup-breakdown' 的 plist：
+`:session-id' `:started-at' `:startup-ms' `:phases'（`[[阶段 耗时ms] ...]'，固定顺序
+mode-start → after-init → startup → first-idle，缺的跳过）、`:loads'（`[[库 耗时ms] ...]'
+按耗时降序，采集层已按 `el-chronos-startup-top-n' 截断）。
+
+**覆盖范围必须显式标注**（页面已标）：包加载耗时是相邻 `after-load-functions' 的时间差，
+属近似归因；且只覆盖 mode 启动之后发生的 load —— 用户通常在 init 末尾才启用 mode，
+此时只有 `mode-start' 一个锚点，本接口的数据不能冒充「完整启动剖析」。
+analysis 返回 nil（查询失败）时降级为 JSON `null'。"
+  (let* ((raw (el-chronos-web--param params "session"))
+         (num (and raw (not (string-empty-p raw)) (string-to-number raw)))
+         (id (and num (> num 0) (truncate num))))
+    (el-chronos-web--json-response
+     (el-chronos-analysis-startup-breakdown id))))
+
+(defun el-chronos-web--route-health (params)
+  "GET /api/health：窗口内采集器自监控计数的汇总。
+响应是 `el-chronos-analysis-health' 的 plist 加一个 `:range'：
+`:dropped-commands' `:dropped-events' `:flush-failures' `:flush-count'
+`:flush-ms' `:flush-avg-ms' `:sample-misses' `:ok-p' `:rows'。
+**`:rows' 必须出现在响应里**：它是区分「本期无采集异常」（`:ok-p' 为 true 且 `:rows' > 0）
+与「本期无采集数据」（`:rows' = 0）的唯一依据 —— analysis 在一条 health 行都没有时同样
+返回 `:ok-p' 为 t，只看 `:ok-p' 会把「没采集」读成「一切正常」（T7b 在报告层修过的同一
+语义，Web 页面按 `:rows' 先行分支，不复犯）。
+`:ok-p' 显式归一为 JSON 布尔（true / false）：analysis 的 nil 经 `--json-value' 会变成
+null，而「没有坏消息」是一个确定的 false/true 判断，不该与「未知」共用一个 JSON 值。
+analysis 返回 nil（查询失败）时降级为 JSON `null'（页面显示「（无数据）」）。"
+  (let* ((range (el-chronos-web--range-param params))
+         (health (el-chronos-analysis-health range)))
+    (el-chronos-web--json-response
+     (when health
+       (let ((payload (copy-sequence health)))
+         (plist-put payload :ok-p (if (plist-get health :ok-p) t :false))
+         (append (list :range (format "%s" range)) payload))))))
+
+(defun el-chronos-web--route-config-history (params)
+  "GET /api/config-history：窗口内各会话的变更标记时间线（按启动时间升序）。
+响应：`:range' `:sessions'（元素 `{:id :started-at :git-head :config-sig :changed}'）
+`:changes'（返回列表里 `:changed' 为 true 的条数）`:total-sessions'（截断前条数）
+`:truncated'（是否被截断，显式归一为 JSON 布尔：nil 经 `--json-value' 会变成 null，
+而「有没有截断」是确定判断，不该与「未知」共用 null）。
+
+**只返回最近 `el-chronos-web--config-history-sessions' 个会话**（取尾部）：会话行随每次
+重启单调增长，全量返回会让单线程 Web 的主线程查询与浏览器渲染时间一起变长。截断后
+`:changes' 按**返回的**会话重算，保证「计数 = 表里打勾的行数」；保留下来的第一条若
+`:changed' 为 true，它参照的前一会话已不在列表里（analysis 的 `:changed' 语义是「与前一
+会话相比」），这是截断的固有代价，由 `:truncated' 标出。
+`git-head' / `config-sig' 为 null 表示会话启动时未取到（store 层取不到就不写行），
+不是「取了但为空」；`changed' 为 null 表示无变化或首会话无从比较（analysis 层不区分二者，
+页面与 CSV 都按「无变化」渲染）。
+
+analysis 返回 nil（查询失败）时降级为 `:sessions' 为 null、计数为 0 的空结构。"
+  (let* ((range (el-chronos-web--range-param params))
+         (history (el-chronos-analysis-config-history range))
+         (all (plist-get history :sessions))
+         (limit el-chronos-web--config-history-sessions)
+         (kept (last all (min limit (length all)))))
+    (el-chronos-web--json-response
+     (list :range (format "%s" range)
+           :total-sessions (length all)
+           :truncated (if (> (length all) (length kept)) t :false)
+           :changes (cl-count-if (lambda (item)
+                                   (eq t (plist-get item :changed)))
+                                 kept)
+           :sessions kept))))
 
 (defun el-chronos-web--route-event (params)
   "GET /api/event?id=N：单条慢事件详情；id 缺失、非法或记录不存在时 body 为 JSON `null'。
@@ -545,6 +726,9 @@ button{cursor:pointer}button.on{border-color:var(--acc);color:var(--acc)}input[t
 main{max-width:1200px;margin:0 auto;padding:16px;display:grid;gap:14px}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:hidden}
 section>h2{margin:0 0 10px;font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+section h3{margin:10px 0 6px;font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut)}
+section h3:first-child{margin-top:0}
+.ok{color:var(--good)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
 .card{background:#12151b;border:1px solid var(--line);border-radius:8px;padding:9px}
 .card b{display:block;font-size:17px}.card span{color:var(--mut);font-size:11px}
@@ -577,26 +761,32 @@ tbody tr:hover{background:#1c212b;cursor:pointer}tfoot td{border:0;color:var(--m
 <main>
 <section><h2>概览</h2><div class='cards' id='ov'></div></section>
 <section><h2>趋势</h2><svg id='trend' viewBox='0 0 800 200' preserveAspectRatio='none' style='width:100%;height:200px'></svg><div class='legend' id='trend-legend'></div></section>
+<section><h2>GC 与内存</h2><table id='t-gc'></table><div class='legend' id='gc-legend'></div></section>
+<section><h2>启动分解</h2><div id='startup'></div></section>
 <section><h2>包 / 模块占比</h2><div style='display:flex;gap:16px;flex-wrap:wrap;align-items:center'><svg id='donut' viewBox='0 0 120 120' style='width:120px;height:120px'></svg><div class='legend' id='donut-legend' style='flex-direction:column;gap:4px'></div></div></section>
 <section><h2>用法热力</h2><div class='hm' id='heat'></div></section>
 <section><h2>慢命令</h2><input id='q-slow' placeholder='搜索命令…'><table id='t-slow'></table></section>
 <section><h2>热点函数</h2><input id='q-func' placeholder='搜索函数 / 包…'><table id='t-func'></table></section>
 <section><h2>阻塞事件</h2><table id='t-block'></table></section>
 <section><h2>回归</h2><table id='t-reg'></table></section>
+<section><h2>采集健康</h2><div id='health'></div></section>
+<section><h2>配置变更</h2><div id='conf'></div></section>
 <section><h2>会话</h2><table id='t-sess'></table></section>
 <section><h2>火焰图（调用栈）</h2><svg id='flame' viewBox='0 0 800 200' preserveAspectRatio='none' style='width:100%;height:200px'></svg><div class='legend' id='flame-legend'></div></section>
 </main>
 <aside id='panel'><button id='panel-close'>关闭</button><div id='panel-body'></div></aside>
 "
-  "内嵌页面结构（顶栏 → 概览 → 趋势 → 占比 → 热力 → 慢命令 → 热点函数 → 阻塞 → 回归 → 会话 → 火焰图 + 下钻侧栏）。")
+  "内嵌页面结构（顶栏 → 概览 → 趋势 → GC 与内存 → 启动分解 → 占比 → 热力 → 慢命令 →
+热点函数 → 阻塞 → 回归 → 采集健康 → 配置变更 → 会话 → 火焰图 + 下钻侧栏）。")
 
 (defconst el-chronos-web--script
   "
 const RANGES=['1d','7d','30d'];
 const S={range:'7d',auto:true,timer:null,per:10,data:{},view:{},
-  sort:{slow:'total-ms',func:'self-ms',block:'duration-ms',sess:'started-at',reg:'growth'},
-  dir:{slow:-1,func:-1,block:-1,sess:-1,reg:-1},
-  page:{slow:1,func:1,block:1,sess:1,reg:1},q:{slow:'',func:'',block:'',sess:'',reg:''}};
+  sort:{slow:'total-ms',func:'self-ms',block:'duration-ms',sess:'started-at',reg:'growth',gc:'bucket'},
+  dir:{slow:-1,func:-1,block:-1,sess:-1,reg:-1,gc:1},
+  page:{slow:1,func:1,block:1,sess:1,reg:1,gc:1},q:{slow:'',func:'',block:'',sess:'',reg:'',gc:''}};
+const EMPTY={gc:'本期无 GC 采样数据（Emacs 31.1 以下不采集堆大小）'};
 const $=id=>document.getElementById(id);
 const DQ=String.fromCharCode(34),SQ=String.fromCharCode(39);
 const esc=v=>{const s=String(v==null?'':v);return s.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split(DQ).join('&quot;').split(SQ).join('&#39;');};
@@ -611,6 +801,8 @@ const COLS={
  block:[{k:'id',t:'#'},{k:'ts',t:'时间',f:ts},{k:'duration-ms',t:'耗时',f:ms},{k:'command',t:'命令'},{k:'mode',t:'mode'},{k:'project',t:'项目'}],
  sess:[{k:'id',t:'#'},{k:'started-at',t:'启动',f:ts},{k:'startup-ms',t:'启动耗时',f:ms},{k:'emacs-version',t:'Emacs'},{k:'host',t:'主机'}],
  reg:[{k:'function',t:'函数'},{k:'current-ms',t:'当前',f:ms},{k:'previous-ms',t:'上一窗口',f:ms},{k:'growth',t:'增长',f:v=>'+'+Math.round(Number(v||0)*100)+'%'},{k:'current-samples',t:'样本',n:1}]};
+COLS.gc=[{k:'bucket',t:'时间',f:ts},{k:'gc-count',t:'GC 次数',n:1},{k:'gc-ms',t:'GC 耗时',f:ms},
+  {k:'heap-bytes',t:'内存',f:v=>v==null?'-':bytes(v)}];
 async function getJSON(path,extra){
   const q=new URLSearchParams(Object.assign({range:S.range},extra||{}));
   const r=await fetch(path+'?'+q.toString(),{cache:'no-store'});
@@ -671,6 +863,73 @@ function flame(items){
   $('flame').setAttribute('viewBox','0 0 800 '+Math.max(40,depth*28));
   $('flame').innerHTML=svg;
   $('flame-legend').innerHTML=`<span>${depth} 层 · ${items.length} 条栈 · ${nf(total)} 样本</span>`;}
+function miniTable(headers,rows,empty){
+  const head=`<thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead>`;
+  const body=rows.length
+    ?`<tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>`
+    :`<tbody><tr><td class='mut' colspan='${headers.length}'>${esc(empty)}</td></tr></tbody>`;
+  return `<table>${head}${body}</table>`;}
+function gcLegend(items){
+  // 全 0 的桶是会话首个采样窗口的基线桶（按 0 差值入库），不等于「没发生 GC」——
+  // 与 report 侧 `--gc-rows' 同口径：全为基线桶时给降级说明而不是铺一整张 0 表。
+  const list=items||[],el=$('gc-legend');
+  if(!list.length){el.textContent='';return;}
+  const allZero=list.every(d=>!Number(d['gc-count']||0)&&!Number(d['gc-ms']||0));
+  const noHeap=list.every(d=>d['heap-bytes']==null);
+  el.innerHTML=(allZero?`<span>${esc('本期只有基线桶（GC 计数与耗时全为 0，不代表没有发生 GC）')}</span>`:'')
+    +(noHeap?`<span>${esc('无堆大小样本：Emacs 31.1 以下不采集（该列显示 -）')}</span>`:'')
+    +`<span>${list.length} 桶</span>`;}
+function startupPanel(d){
+  const el=$('startup'),s=d||{};
+  if(s['session-id']==null){
+    el.innerHTML=`<p class='mut'>${esc('本期无启动分解数据（需在启动结束前启用 el-chronos-mode，最早可在 early-init.el 里启用）')}</p>`;
+    return;}
+  const phases=s.phases||[],loads=(s.loads||[]).slice(0,10);
+  const m0=phases.filter(p=>p[0]==='mode-start').map(p=>p[1]);
+  const total=s['startup-ms'];
+  const head=`<p class='mut'>${esc('覆盖范围：自 mode 启动起 '
+    +(m0.length?ms(m0[0]):'-')+' / 总 '+(total==null?'-':ms(total))
+    +'（会话 #'+s['session-id']+' · '+(s['started-at']==null?'-':ts(s['started-at']))+'）')}</p>`
+    +`<p class='mut'>${esc('包加载耗时是相邻 after-load-functions 回调的时间差（近似归因），且只覆盖 mode 启动之后的 load')}</p>`;
+  el.innerHTML=head
+    +'<h3>阶段锚点</h3>'
+    +miniTable(['阶段','耗时'],phases.map(p=>[esc(p[0]),ms(p[1])]),
+      '（无阶段锚点：mode 启动时启动已结束，只能记录 mode-start 之后的阶段）')
+    +'<h3>包加载 TOP（前 10）</h3>'
+    +miniTable(['包','耗时'],loads.map(p=>[esc(p[0]),ms(p[1])]),
+      '（无包加载明细：mode 启动时启动已结束，不记录 after-load-functions）');}
+function healthPanel(h){
+  const el=$('health');
+  // 四个分支与 report 侧 `--section-health' 同序：无数据 / 没采集 / 没异常 / 完整表。
+  // 顺序不可调换：analysis 在「一条 health 行都没有」时同样返回 ok-p 为 true，
+  // 先判 ok-p 会把「没采集」显示成「一切正常」。
+  if(!h){el.innerHTML=`<table><tbody><tr><td class='mut'>（无数据）</td></tr></tbody></table>`;return;}
+  if(Number(h.rows||0)===0){
+    el.innerHTML=`<p class='mut'>${esc('本期无采集数据（采集器尚未写入健康指标）')}</p>`;return;}
+  if(h['ok-p']){
+    el.innerHTML=`<p class='ok'>${esc('本期无采集异常（flush '+nf(h['flush-count']||0)+' 次，平均 '
+      +(h['flush-avg-ms']==null?'-':ms(h['flush-avg-ms']))+'）')}</p>`;
+    if(!Number(h['flush-count']||0))el.innerHTML+=`<p class='mut'>${esc('（本期无 flush 记录）')}</p>`;
+    return;}
+  const v=k=>h[k]==null?'-':nf(h[k]);
+  el.innerHTML=miniTable(['指标','值'],[
+    ['丢弃命令',v('dropped-commands')],['丢弃事件',v('dropped-events')],
+    ['flush 失败',v('flush-failures')],['flush 次数',v('flush-count')],
+    ['flush 总耗时',h['flush-ms']==null?'-':ms(h['flush-ms'])],
+    ['flush 平均耗时',h['flush-avg-ms']==null?'-':ms(h['flush-avg-ms'])],
+    ['采样窗口丢失',v('sample-misses')],['健康行数',v('rows')]],'（无数据）');}
+function confPanel(c){
+  const el=$('conf'),items=(c&&c.sessions)||[];
+  if(!items.length){
+    el.innerHTML=`<p class='mut'>${esc('本期无会话变更记录（会话启动时未取到 git-head / config-sig，或窗口内没有会话）')}</p>`;
+    return;}
+  const dig=v=>esc(String(v||'').slice(0,8)||'-');
+  el.innerHTML=miniTable(['会话启动时间','提交','配置指纹','变化'],
+      items.map(x=>[ts(x['started-at']),dig(x['git-head']),dig(x['config-sig']),
+        x.changed?`<span class='ok'>✓</span>`:'-']),
+      '（无数据）')
+    +`<p class='mut'>${esc('共 '+items.length+' 个会话 · 变化 '+nf(c.changes||0)+' 次'
+      +(c.truncated?'（仅显示最近 '+items.length+' 个）':''))}</p>`;}
 function table(key){
   const cols=COLS[key],rows=(S.data[key]&&S.data[key].items)||[],q=S.q[key].toLowerCase();
   let data=rows.slice();
@@ -686,7 +945,7 @@ function table(key){
   const head=`<thead><tr>${cols.map(c=>`<th data-t='${key}' data-k='${c.k}'>${c.t}${sk===c.k?(dir<0?' ↓':' ↑'):''}</th>`).join('')}</tr></thead>`;
   const body=slice.length
     ?`<tbody>${slice.map((r,i)=>`<tr data-t='${key}' data-i='${(page-1)*S.per+i}'>${cols.map(c=>`<td>${cellHtml(c,r)}</td>`).join('')}</tr>`).join('')}</tbody>`
-    :`<tbody><tr><td class='mut' colspan='${cols.length}'>（无数据）</td></tr></tbody>`;
+    :`<tbody><tr><td class='mut' colspan='${cols.length}'>${esc(EMPTY[key]||'（无数据）')}</td></tr></tbody>`;
   const foot=`<tfoot><tr><td colspan='${cols.length}'>共 ${data.length} 行 · 第 ${page}/${pages} 页 <button data-pg='${key}' data-d='-1'>上一页</button> <button data-pg='${key}' data-d='1'>下一页</button></td></tr></tfoot>`;
   $('t-'+key).innerHTML=head+body+foot;}
 function panel(title,obj){
@@ -706,14 +965,17 @@ async function openEvent(id){
 async function load(){
   $('status').textContent='加载中…';
   try{
-    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg]=await Promise.all([
+    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg,gcD,suD,heD,cfD]=await Promise.all([
       getJSON('/api/summary'),getJSON('/api/top-functions',{limit:50}),getJSON('/api/slow-commands',{limit:50}),
       getJSON('/api/packages'),getJSON('/api/trend'),getJSON('/api/heatmap',{limit:12}),
       getJSON('/api/stacks',{limit:40}),getJSON('/api/sessions'),getJSON('/api/blocking',{limit:30}),
-      getJSON('/api/regressions',{limit:30})]);
-    S.data={sum:sum,func:func,slow:slow,pkg:pkg,trend:tr,heat:hm,stacks:st,sess:sess,block:block,reg:reg};
+      getJSON('/api/regressions',{limit:30}),
+      getJSON('/api/gc'),getJSON('/api/startup'),getJSON('/api/health'),getJSON('/api/config-history')]);
+    S.data={sum:sum,func:func,slow:slow,pkg:pkg,trend:tr,heat:hm,stacks:st,sess:sess,block:block,reg:reg,
+      gc:gcD,startup:suD,health:heD,conf:cfD};
     cards(sum.overview||{});trend(tr.items||[]);donut(pkg.items||[]);heat(hm.items||[]);flame(st.items||[]);
-    ['slow','func','block','reg','sess'].forEach(table);
+    gcLegend(gcD.items||[]);startupPanel(suD);healthPanel(heD);confPanel(cfD);
+    ['slow','func','block','reg','sess','gc'].forEach(table);
     $('status').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){$('status').textContent='加载失败：'+e.message;}}
 function setAuto(){

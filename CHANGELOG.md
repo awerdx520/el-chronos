@@ -55,6 +55,8 @@
 
 ### 变更
 
+- `/api/config-history` 返回最近 50 个会话并附 `total-sessions` / `truncated` 标示；CSV 导出不截断（镜像 org 报告的完整序列）。
+- `/api/health` 的 `ok-p` 显式归一为 JSON 布尔值，避免 `nil` 被序列化成 `null` 而与「未知」混淆。
 - **org 报告节数 11 → 14**：新增「启动分解」「采集健康」「配置变更」三节，位置在「GC 与内存」之后、
   「阻塞事件」之前（三者都回答「这台机器这个时期的状态如何」，与趋势族相邻）。三节都遵守 I11：
   无数据时给**具体**的降级文案而不是静默省略。
@@ -82,6 +84,9 @@
 
 ### 新增
 
+- **Web dashboard 接入观测面扩展数据**：新增 4 条只读路由 `/api/gc`、`/api/startup`、`/api/health`、`/api/config-history`（路由总数 13 → 17），以及对应的 GC 与内存、启动分解、采集健康、配置变更四个面板（沿用 30 秒轮询）。
+- **CSV 导出同步覆盖**：Web 侧 CSV 区块 8 → 11，新增 startup / health / config-history 三块，字段与 org 报告侧逐列对齐。
+  用例总数 **192 → 199**（web 用例 10 → 17）。
 - **启动分解 / 采集健康 / 配置变更：三个只读查询 + 报告三节 + 导出覆盖（T7b + T8）**：新增
   `el-chronos-analysis-startup-breakdown`（会话启动分解：`mode-start` / `after-init` / `startup` /
   `first-idle` 确定性锚点 + 包加载 TOP，`:startup-ms` 与 `:phases` 是两套来源、任一方缺失不影响
