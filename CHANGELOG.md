@@ -48,6 +48,7 @@
 
 ### 变更
 
+- **org 报告节数 10 → 11**：新增「GC 与内存」节，位置在「趋势」之后、「阻塞事件」之前；无数据时该节显示可见降级说明而非静默省略。
 - **`hourly_gc` 的 `heap_bytes` 采用 `COALESCE` 覆盖语义**：堆大小每 N 个采样窗口才采一次，其余窗口传 NULL；若用普通覆盖写入，同一小时后到的窗口会把已采到的堆值抹成 NULL，因此改为 `COALESCE` 保留已有值。
 - **阻塞提示默认静默**：`el-chronos-collect-notify-blocks` 默认由 `t` 改为 `nil`——心跳检测到主线程
   阻塞后不再往 echo area 打「el-chronos：主线程阻塞约 N ms（已记录）」，因为该行会盖住 minibuffer
@@ -70,6 +71,8 @@
 
 ### 新增
 
+- **GC 与内存趋势**：新增只读查询 `el-chronos-analysis-gc-trend`，按时间桶聚合 `hourly_gc`（GC 次数与耗时求和、堆大小取桶内最后一个非 NULL 值），并在 org 报告中新增第 11 节「GC 与内存」。
+- 用例总数 **153 → 159**（`make test`，增量集中在 analysis 查询与 report 渲染两侧：analysis 4 例 + report 2 例）。
 - **观测面扩展 S1 采集侧（schema v2）**：新增 `hourly_gc`（GC 次数 / 耗时 / 堆大小）、`startup_phases`（启动耗时分解）、`hourly_health`（采集健康自监控）、`session_meta`（变更标记）四张表。
 - **变更标记**：每个会话记录 `git-head`（**零子进程**直接读 `.git`）与 `config-sig`（配置文件 mtime / size 指纹），用于把回归结论归因到「哪天改了什么」。
 - **GC 与内存采集**：`gcs-done` / `gc-elapsed` 增量（零副作用）＋ `garbage-collect-heapsize`（Emacs 31.1+ 可用，更低版本该字段写入 NULL），与 profiler 采样解耦。

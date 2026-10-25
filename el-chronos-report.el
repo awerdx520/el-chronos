@@ -42,6 +42,12 @@
 (defconst el-chronos-report--session-rows 20 "会话最多展示条数。")
 (defconst el-chronos-report--stack-rows 10 "调用栈排行最多展示条数。")
 (defconst el-chronos-report--stack-frames 8 "调用栈展示保留的帧数（自 leaf 起）。")
+(defconst el-chronos-report--gc-rows 48 "「GC 与内存」最多展示的桶数（取最近若干桶）。")
+(defconst el-chronos-report--gc-degrade
+  "本期无 GC 采样数据（Emacs 31.1 以下不采集堆大小）。"
+  "「GC 与内存」节的降级说明。
+I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位等价，但更具体 —— 用户需要
+知道「没数据」的可能原因是 Emacs 版本低于 31.1、堆大小无从采集）。")
 (defconst el-chronos-report--empty "（无数据）" "空数据占位文本。")
 
 (defvar-local el-chronos-report--current-range nil
@@ -208,6 +214,32 @@
                                 (el-chronos-report--cell overview key kind)))
         "\n")))))
 
+(defun el-chronos-report--gc-rows (trend)
+  "把 `el-chronos-analysis-gc-trend' 的结果 TREND 转成「GC 与内存」表格行。
+取最近 `el-chronos-report--gc-rows' 个桶；TREND 为 nil、无桶、或全部桶的
+`gc-count' / `gc-ms' 都是 0 时返回 nil（由 `el-chronos-report--section-gc' 渲染降级
+说明）。全 0 也算「无可展示数据」：会话首个采样窗口只建基线、按 0 差值入库，把整表 0
+铺出来只会误导用户以为「一直在 GC」。"
+  (let ((items (and trend (plist-get trend :buckets))))
+    (when (and items
+               (not (cl-every (lambda (i)
+                                (and (zerop (or (plist-get i :gc-count) 0))
+                                     (zerop (or (plist-get i :gc-ms) 0))))
+                              items)))
+      (el-chronos-report--rows
+       (last items (min el-chronos-report--gc-rows (length items)))
+       '(:bucket :gc-count :gc-ms :heap-bytes) '(time num ms bytes)))))
+
+(defun el-chronos-report--section-gc (trend)
+  "渲染「GC 与内存」节；TREND 为 `el-chronos-analysis-gc-trend' 的结果或 nil。
+表头 `时间' / `GC 次数' / `GC 耗时' / `内存'，其中内存无样本渲染为 \"-\"。
+无数据时输出一行 `el-chronos-report--gc-degrade' 说明 —— 按 I11 降级必须可见，
+不得静默省略整节。"
+  (if-let* ((rows (el-chronos-report--gc-rows trend)))
+      (el-chronos-report--table-section
+       "GC 与内存" '("时间" "GC 次数" "GC 耗时" "内存") rows)
+    (concat "* GC 与内存\n" el-chronos-report--gc-degrade "\n\n")))
+
 (defun el-chronos-report--usage-rows (range)
   "构造「用法 TOP」行（plist `:name' `:count' `:total-ms'）。
 次数与总耗时都取自 `hourly_usage' 的 command 维度热力图（前 20 个命令跨桶求和），
@@ -228,6 +260,9 @@
 (defun el-chronos-report--content (range)
   "生成 RANGE 的 org 报告全文（字符串）。任一 analysis 查询返回 nil 时按空数据渲染。"
   (let* ((trend (el-chronos-analysis-trend range))
+         ;; GC 与内存趋势单独一节：堆大小是瞬时量、口径与 `trend' 的计数型指标不同，
+         ;; 混进「趋势」表会既撑宽表格又混淆单位，因此拆成紧随其后的独立节。
+         (gc-trend (el-chronos-analysis-gc-trend range))
          (blocking (cl-sort (copy-sequence (el-chronos-analysis-blocking-events
                                             range el-chronos-report--blocking-rows))
                             #'> :key (lambda (r) (or (plist-get r :ts) 0))))
@@ -253,6 +288,8 @@
       "趋势" '("小时" "样本" "慢命令" "阻塞")
       (el-chronos-report--rows (last trend (min el-chronos-report--trend-rows (length trend)))
        '(:bucket :samples :slow-commands :blocked) '(time num num num)))
+     ;; 紧随「趋势」：同属时间桶视角，用户从「慢/阻塞」往下看自然想知道「是不是内存涨了」
+     (el-chronos-report--section-gc gc-trend)
      (el-chronos-report--table-section
       "阻塞事件" '("时间" "时长" "命令" "mode" "project")
       (el-chronos-report--rows

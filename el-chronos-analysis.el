@@ -311,6 +311,66 @@ BUCKETS 省略时按窗口长度取 24（≤1 天）/168（≤8 天）/720；窗
                  into items
                  finally return (cl-sort items #'< :key (lambda (i) (plist-get i :bucket))))))))
 
+;;; GC 与内存趋势
+(defun el-chronos-analysis-gc-trend (range &optional buckets)
+  "窗口 RANGE 内按桶聚合的 GC 与内存趋势。
+返回 plist：`:range' 是归一化后的半开区间 (START . END)（毫秒）、`:bucket-span' 是桶宽
+（毫秒）、`:buckets' 是按桶起点升序的桶列表、`:gc-total' 是窗口内 `gc-count' 合计、
+`:heap-latest' 是窗口内最后一个非空堆大小（无任何堆样本时为 nil）。
+
+`:buckets' 的元素是 `(:bucket START-MS :gc-count N :gc-ms X :heap-bytes N)'：
+`:gc-count' / `:gc-ms' 为桶内求和，`:heap-bytes' 取桶内**按 hour_ts 升序最后一个非
+NULL 值**（代表该时段末的 Emacs 堆大小；桶内全为 NULL 时 nil）。BUCKETS 省略时与
+`el-chronos-analysis-trend' 用同一套默认（`el-chronos-analysis--range-buckets'），并同样
+受 `el-chronos-analysis--bucket-span' 的整小时倍数合并约束。SQL 只做窗口过滤、不做聚合
+（桶内「最后一个非 NULL」用 SQL 表达需要窗口函数或相关子查询，代价与可读性都更差），
+聚合在 Elisp 层完成。空桶不返回；无数据时 `:buckets' 为 nil 而整体仍返回 plist
+（与同层其他查询不同：不返回 nil，避免调用方判空分支分叉）。
+
+三点口径必须知晓，否则会把有意为之当 bug 修：
+① `:heap-bytes' 只在 Emacs 31.1+ 有值（采集层用 `garbage-collect-heapsize' 守卫，
+   函数不存在就不采），更低版本该列恒 NULL，本函数也就恒为 nil —— 不是数据丢失；
+② 会话首个采样窗口只建立 `gcs-done' / `gc-elapsed' 基线、按 0 差值入库，因此可能出现
+   `gc-count' / `gc-ms' 全 0 的桶（那是基线窗口，不等于「没有发生 GC」）；
+③ 桶内堆大小取「最后一个非 NULL」而非求和或平均：heap_bytes 是瞬时量，求和没有意义、
+   平均会被采样间隔不均拉偏，只有「时段末的值」能回答「是不是越用越胖」。同一 hour_ts
+   若有多个会话行（主键含 session_id），按 session_id 升序取最后一个非 NULL —— 跨会话的
+   堆大小本就该由最新一条代表，这个顺序同时保证结果确定、可复现。"
+  (el-chronos-analysis--guard 'gc-trend
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((buckets (max 1 (or buckets (el-chronos-analysis--range-buckets start end))))
+             (span (el-chronos-analysis--bucket-span start end buckets))
+             (table (make-hash-table :test #'equal)))
+        ;; 按 hour_ts 升序扫描：后到的非 NULL 覆盖前值 ⟺ 桶内「最后一个非 NULL」
+        (dolist (row (el-chronos-analysis--select
+                      db
+                      (concat "SELECT hour_ts, gc_count, gc_ms, heap_bytes FROM hourly_gc"
+                              " WHERE hour_ts >= ? AND hour_ts < ?"
+                              " ORDER BY hour_ts, session_id")
+                      (list start end)))
+          (cl-destructuring-bind (ts count ms heap) row
+            (let* ((bucket (- ts (% ts span)))
+                   (cell (or (gethash bucket table)
+                             (puthash bucket (vector 0 0.0 nil) table))))
+              (aset cell 0 (+ (aref cell 0) (or count 0)))
+              (aset cell 1 (+ (aref cell 1) (float (or ms 0))))
+              (when (numberp heap) (aset cell 2 heap)))))
+        (let ((items (cl-sort
+                      (cl-loop for bucket being the hash-keys of table
+                               using (hash-values cell)
+                               collect (list :bucket bucket :gc-count (aref cell 0)
+                                             :gc-ms (aref cell 1)
+                                             :heap-bytes (aref cell 2)))
+                      #'< :key (lambda (i) (plist-get i :bucket)))))
+          (list :range (cons start end)
+                :bucket-span span
+                :buckets items
+                :gc-total (cl-loop for i in items sum (plist-get i :gc-count))
+                :heap-latest (car (last (delq nil (mapcar (lambda (i)
+                                                            (plist-get i :heap-bytes))
+                                                          items))))))))))
+
 ;;; 用法热力图
 (defun el-chronos-analysis-heatmap (range &optional limit)
   "窗口 RANGE 内的命令用法热力图。

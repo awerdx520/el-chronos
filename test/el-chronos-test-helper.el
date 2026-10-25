@@ -160,6 +160,15 @@ TS 为毫秒；OUTCOME 默认 \"ok\"，KIND 默认 \"interactive\"。"
    (list hour-ts (or session-id el-chronos--session-id 0)
          (secure-hash 'sha1 stack-json) stack-json (or samples 0))))
 
+(defun el-chronos-test--insert-gc (hour-ts gc-count gc-ms &optional heap-bytes session-id)
+  "插入一条 GC 聚合行。HEAP-BYTES 为 nil 时落库为 NULL（Emacs 31.1 以下不采集）；
+SESSION-ID 默认取当前会话，显式传入可造同一小时的多个会话行（主键含 session_id）。"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_gc (hour_ts, session_id, gc_count, gc_ms, heap_bytes)\
+ VALUES (?, ?, ?, ?, ?)"
+   (list hour-ts (or session-id el-chronos--session-id 0)
+         (or gc-count 0) (float (or gc-ms 0)) heap-bytes)))
+
 (provide 'el-chronos-test-helper)
 
 ;;; el-chronos-test-helper.el ends here

@@ -275,25 +275,50 @@
 ;;; 报告渲染
 
 (ert-deftest el-chronos-report-test--content-sections ()
-  "fixture 下报告含 10 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。"
+  "fixture 下报告含 11 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。"
   (el-chronos-test-with-db
     (el-chronos-report-test--seed)
     (let ((content (el-chronos-report--content '7d)))
       (should (stringp content))
       (should (string-match-p "\\`#\\+TITLE: el-chronos 报告" content))
-      (should (= 10 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 11 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (string-match-p "save-buffer" content))
       (should (string-match-p "leaf-fn" content))
       (should (string-match-p "900 ms" content))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
 
 (ert-deftest el-chronos-report-test--content-empty-db ()
-  "空库时报告仍然成型：10 节、8 处 `（无数据）'、无 `nil' 字面量。"
+  "空库时报告仍然成型：11 节、8 处 `（无数据）'、无 `nil' 字面量。
+「GC 与内存」节空库走更具体的降级说明（见 `report-gc-section-degrades-visible'），
+因此不计入 `（无数据）' 的 8 处。"
   (el-chronos-test-with-db
     (let ((content (el-chronos-report--content '7d)))
-      (should (= 10 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 11 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (= 8 (el-chronos-report-test--count-matches "（无数据）" content)))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
+
+(ert-deftest el-chronos-report-test-gc-section-renders ()
+  "有 GC 数据时「GC 与内存」节渲染出表头与格式化后的单元格。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-gc hour 3 1500.0 1048576)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* GC 与内存$" content))
+        (should (string-match-p "| 时间 | GC 次数 | GC 耗时 | 内存 |" content))
+        (should (string-match-p "| 3 | 1.50 s | 1.00 MB |" content))
+        (should-not (string-match-p "本期无 GC 采样数据" content))))))
+
+(ert-deftest el-chronos-report-test-gc-section-degrades-visible ()
+  "无 GC 数据时该节仍然出现，并给出可见的降级说明（I11：不得静默省略整节）。"
+  (el-chronos-test-with-db
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\* GC 与内存$" content))
+      (should (string-match-p "本期无 GC 采样数据（Emacs 31.1 以下不采集堆大小）" content))
+      ;; 全 0 的桶（首个采样窗口只建基线）同样按「无数据」降级，不铺一屏 0
+      (el-chronos-test--insert-gc (el-chronos-test--hour-ts) 0 0.0 nil)
+      (let ((zero (el-chronos-report--content '7d)))
+        (should (string-match-p "本期无 GC 采样数据" zero))
+        (should-not (string-match-p "| 时间 | GC 次数" zero))))))
 
 (ert-deftest el-chronos-report-test--report-buffer ()
   "`el-chronos-report' 返回 org 只读 buffer，并登记 `g' 重生成所需的 range。"
@@ -306,7 +331,7 @@
             (should buffer-read-only)
             (should (eq '1d el-chronos-report--current-range))
             (should (functionp revert-buffer-function))
-            (should (= 10 (el-chronos-report-test--count-matches
+            (should (= 11 (el-chronos-report-test--count-matches
                            "^\\* " (buffer-substring-no-properties
                                     (point-min) (point-max))))))
         (kill-buffer buffer)))))

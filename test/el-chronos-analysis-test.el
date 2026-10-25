@@ -205,6 +205,110 @@
         (should (cl-every (lambda (i) (zerop (mod (plist-get i :bucket) 3600000)))
                           coarse))))))
 
+;;; GC 与内存趋势
+
+(defun el-chronos-analysis-test--gc-hours (range buckets count)
+  "返回 RANGE / BUCKETS 下**同一个桶内**连续 COUNT 个 hour_ts（升序）。
+先按实现的口径（`el-chronos-analysis--bucket-span'）算出桶宽，再把起点向上对齐到桶
+边界，于是 `(- ts (% ts span))' 对返回的每个 ts 都相同 —— 无需猜测桶对齐方式。"
+  (let* ((bounds (el-chronos-analysis--range range))
+         (span (el-chronos-analysis--bucket-span (car bounds) (cdr bounds) buckets))
+         (b0 (* span (ceiling (/ (car bounds) (float span))))))
+    (cl-loop for i below count collect (+ b0 (* i 3600000)))))
+
+(ert-deftest el-chronos-analysis-test-gc-trend-aggregates-buckets ()
+  "GC 趋势按桶对 gc-count / gc-ms 求和（同小时多会话也累加），桶升序且为整小时倍数。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (prev (- hour 3600000))
+           (trend nil))
+      ;; 上一小时：1 次 / 7.5ms / 堆 1000；当前小时两个会话：3+4 次、12.5+5.0ms
+      (el-chronos-test--insert-gc prev 1 7.5 1000)
+      (el-chronos-test--insert-gc hour 3 12.5 nil)
+      (el-chronos-test--insert-gc hour 4 5.0 nil 999)
+      (setq trend (el-chronos-analysis-gc-trend window))
+      (let ((items (plist-get trend :buckets)))
+        (should (= 2 (length items)))          ; 空桶不返回
+        (should (equal (mapcar (lambda (i) (plist-get i :bucket)) items) (list prev hour)))
+        (should (cl-every (lambda (i) (zerop (mod (plist-get i :bucket) 3600000))) items))
+        (should (= 1 (plist-get (car items) :gc-count)))
+        (should (= 7.5 (plist-get (car items) :gc-ms)))
+        (should (= 1000 (plist-get (car items) :heap-bytes)))
+        (should (= 7 (plist-get (nth 1 items) :gc-count)))   ; 3 + 4，跨会话累加
+        (should (= 17.5 (plist-get (nth 1 items) :gc-ms)))   ; 12.5 + 5.0
+        (should-not (plist-get (nth 1 items) :heap-bytes))
+        (should (= 8 (plist-get trend :gc-total)))
+        (should (= 1000 (plist-get trend :heap-latest)))
+        (should (equal (cons (- hour (* 3600000 23)) (+ hour 3600001))
+                       (plist-get trend :range)))
+        (should (integerp (plist-get trend :bucket-span)))))))
+
+(ert-deftest el-chronos-analysis-test-gc-trend-heap-takes-last-non-nil ()
+  "桶内堆大小取按 hour_ts 升序「最后一个非 NULL」值：后行 NULL 不覆盖前值，后行有值则覆盖。"
+  (el-chronos-test-with-db
+    (let* ((range (el-chronos-analysis-test--window))
+           ;; 桶数压到 2 → 桶宽 > 1 小时，两个连续小时落在同一桶
+           (hours (el-chronos-analysis-test--gc-hours range 2 2))
+           (h1 (nth 0 hours)) (h2 (nth 1 hours))
+           (span (plist-get (el-chronos-analysis-gc-trend range 2) :bucket-span)))
+      (should (< (- h2 h1) span))           ; 前提：两行确实同桶
+      ;; 情形 a：前有值、后 NULL → 取前值（NULL 不是「归零」）
+      (el-chronos-test--insert-gc h1 1 1.0 1000)
+      (el-chronos-test--insert-gc h2 1 1.0 nil)
+      (let ((items (plist-get (el-chronos-analysis-gc-trend range 2) :buckets)))
+        (should (= 1 (length items)))
+        (should (= 1000 (plist-get (car items) :heap-bytes))))
+      ;; 情形 b：改成前 NULL、后有值 → 取后值
+      (el-chronos-test--exec "UPDATE hourly_gc SET heap_bytes = NULL WHERE hour_ts = ?"
+                             (list h1))
+      (el-chronos-test--exec "UPDATE hourly_gc SET heap_bytes = 2000 WHERE hour_ts = ?"
+                             (list h2))
+      (let ((items (plist-get (el-chronos-analysis-gc-trend range 2) :buckets)))
+        (should (= 1 (length items)))
+        (should (= 2000 (plist-get (car items) :heap-bytes)))
+        (should (= 2000 (plist-get (el-chronos-analysis-gc-trend range 2)
+                                   :heap-latest))))
+      ;; 情形 c（判别用例）：两行都有值且值不同 → 必须取后者；取前者会在这里变红
+      (el-chronos-test--exec "UPDATE hourly_gc SET heap_bytes = 1000 WHERE hour_ts = ?"
+                             (list h1))
+      (el-chronos-test--exec "UPDATE hourly_gc SET heap_bytes = 2000 WHERE hour_ts = ?"
+                             (list h2))
+      (let ((items (plist-get (el-chronos-analysis-gc-trend range 2) :buckets)))
+        (should (= 2000 (plist-get (car items) :heap-bytes)))))))
+
+(ert-deftest el-chronos-analysis-test-gc-trend-empty-range ()
+  "无数据时返回与有数据同构的空 plist（不是 nil），`:buckets' 为 nil。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (empty (el-chronos-analysis-gc-trend window)))
+      (should (listp empty))
+      (should-not (plist-get empty :buckets))
+      (should (= 0 (plist-get empty :gc-total)))
+      (should-not (plist-get empty :heap-latest))
+      (should (consp (plist-get empty :range)))
+      (should (integerp (plist-get empty :bucket-span)))
+      ;; 有数据时键集合完全一致（同构：调用方不必分叉判空）
+      (el-chronos-test--insert-gc (el-chronos-test--hour-ts) 2 3.0 4096)
+      (let ((filled (el-chronos-analysis-gc-trend window)))
+        (should (equal (cl-loop for (key _v) on empty by #'cddr collect key)
+                       (cl-loop for (key _v) on filled by #'cddr collect key)))
+        (should (plist-get filled :buckets))))))
+
+(ert-deftest el-chronos-analysis-test-gc-trend-all-null-heap ()
+  "所有行 heap_bytes 为 NULL 时每桶堆大小为 nil、`:heap-latest' 为 nil，且不报错。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-gc hour 2 5.0 nil)
+      (el-chronos-test--insert-gc (- hour 3600000) 1 2.0 nil)
+      (let ((trend (el-chronos-analysis-gc-trend window)))
+        (should (= 2 (length (plist-get trend :buckets))))
+        (should (cl-every (lambda (i) (null (plist-get i :heap-bytes)))
+                          (plist-get trend :buckets)))
+        (should-not (plist-get trend :heap-latest))
+        (should (= 3 (plist-get trend :gc-total)))))))
+
 ;;; 热力图
 
 (ert-deftest el-chronos-analysis-test-heatmap ()
