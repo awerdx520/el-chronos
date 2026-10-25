@@ -25,7 +25,7 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 | 3 | 归因到哪个 straight 包 / =lisp/init-*.el= 模块 / site-lisp 文件？ | =attrib= 归因（符号 → 源码文件 → 包/模块） |
 | 4 | 长期趋势如何、某次改动是否引入回归？ | 五张 =hourly_*= 小时聚合表 + 回归判定（近 N 天 vs 前 N 天） |
 | 5 | 哪些高频用法值得优先优化？ | =hourly_usage= 的 command / mode / project 维度 |
-| 6 | 怎么把它们都看见？ | 两种形态：org 报告（**14 节**）/ 浏览器 Web dashboard（**17 条只读 GET 路由** = 1 页 + 16 条 =/api/*=） |
+| 6 | 怎么把它们都看见？ | 两种形态：org 报告（**14 节**）/ 浏览器 Web dashboard（**18 条只读 GET 路由** = 1 页 + 17 条 =/api/*=） |
 
 * 安装
 
@@ -57,7 +57,7 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 | 形态 | 启动 | 适合 |
 |---|---|---|
 | org 报告 | =M-x el-chronos-report=（**14 节**，默认近 7 天，可 =1d= / =30d=） | 归档、版本间 diff；=M-x el-chronos-weekly-report= 写周报，=M-x el-chronos-export= 导出 CSV/JSON |
-| 浏览器 Web dashboard | =M-x el-chronos-web-start=（默认 =http://127.0.0.1:8787/=，**17 条只读 GET 路由** = 1 页 + 16 条 =/api/*=） | 深度分析：多图表、火焰图、搜索/排序/分页、多会话对比、CSV 导出 |
+| 浏览器 Web dashboard | =M-x el-chronos-web-start=（默认 =http://127.0.0.1:8787/=，**18 条只读 GET 路由** = 1 页 + 17 条 =/api/*=） | 深度分析：多图表、火焰图、搜索/排序/分页、多会话对比、CSV 导出 |
 
 单条命令的深挖：=M-x el-chronos-profile-command= 在 1ms CPU 采样下**当场**跑一次命令并生成剖析报告
 （热点 / 调用链 / 包归属 / 优化建议），不查库、不依赖历史数据；结果默认只出报告、不落库
@@ -152,29 +152,31 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 199 用例，0 skipped）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 233 用例，0 skipped）
 make full-check     # check-parens + test
 #+END_SRC
 
 测试文件固定命名 =test/*-test.el=（Makefile 用 =$(wildcard test/*-test.el)= 自动发现，
-新增测试无需改 Makefile）。199 用例分布：=collect= 49 / =store= 47 / =report= 31 / =attrib= 28 /
-=analysis= 27 / =web= 17。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
+新增测试无需改 Makefile）。233 用例分布：=collect= 65 / =store= 60 / =report= 33 / =attrib= 28 /
+=analysis= 29 / =web= 18。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
 =M-x el-chronos-report=；详细清单见 [[file:docs/operations.org][docs/operations.org]]「验证步骤」。
 
 * 当前状态
 
 - 阶段：**Phase 4（Review & Document）**，核心计划与观测面扩展计划均已归档。已实现：
-  **10 表 + 3 索引**（schema v2 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=）、
-  六条采集路径（启动 / 命令边界 / 心跳 / 采样 tick / 启动打点 / GC 与自监控）、归因、
-  **17 个**只读聚合查询、org 报告（**14 节**）、Web dashboard（**17 条只读路由**）、单命令剖析、
-  ERT **199** 用例、文档全集。
+  **11 表 + 3 索引**（schema v3 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）+ =hourly_drift=（v3））、
+  六条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick / 启动打点 / GC 与自监控）、归因、
+  **18 个**只读聚合查询、org 报告（**14 节**）、Web dashboard（**18 条只读路由**）、单命令剖析、
+  ERT **233** 用例、文档全集。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]（核心，2026-10-24 归档）、
   [[file:openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]（观测面扩展 S1 已完成，T1–T10，2026-10-25 归档）
 - 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]
-- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]。仍未实施：P95 精度 TD-7、阻塞捕获残余缺口 TD-11、
-  清理粒度不一致 TD-17、JSON 导出键名风格 TD-18、CSV 导出两处内联重复 TD-19；
+- 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]。仍未实施：P95 精度 TD-7、
+  清理粒度不一致 TD-17、JSON 导出键名风格 TD-18、CSV 导出两处内联重复 TD-19、
+  GUI 侧开销与 redisplay 未实测 TD-21、drift 阈值未经数据校准 TD-22、
+  连续命令流累计卡顿不可见 TD-23、命令边界钩子开销未实测 TD-24；
   按设计**不修**的边界：堆大小需 Emacs **31.1+**（TD-15）、启动分解覆盖范围受加载时机限制（TD-16）；
-  已关闭：TD-1 =.eln= 归因、TD-2 阻塞覆盖率、TD-3 采样开销、TD-5 ETAF 性能、TD-9 局部 hook、TD-12 Web 自观测抑制、TD-13 全 nil 栈
+  已关闭：TD-1 =.eln= 归因、TD-2 阻塞覆盖率、TD-3 采样开销、TD-5 ETAF 性能、TD-9 局部 hook、TD-11 阻塞捕获残余缺口（主体 2026-10-25，残余转 TD-21～TD-24）、TD-12 Web 自观测抑制、TD-13 全 nil 栈
 - 文档：[[file:docs/architecture.org][架构与实测结论]]、[[file:docs/schema.org][数据模型]]、[[file:docs/ui.org][界面与路由]]、[[file:docs/api.org][接口索引]]、[[file:docs/operations.org][运维手册]]
 
 * 许可证

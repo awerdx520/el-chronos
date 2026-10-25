@@ -55,6 +55,13 @@ el-chronos-db-path           ; 确认数据落点
 事件**始终**写入 =slow_events=（=kind="block"=）并出现在 =el-chronos-report= 与
 Web 页面的阻塞列表里；=el-chronos-collect-notify-blocks= 只控制**要不要提示**：
 
+**两条与提示相关的口径**（v3）：
+
+- 本开关只管 **block 档**。亚秒级的 drift（500–2000 ms，落 =hourly_drift= 小时聚合）**从不发提示**：
+  亚秒级不配占用 echo area，且它默认就在报告 / Web 的「阻塞事件」节里可见。
+- block 只记**命令外**停转（命令执行时间被 =--finish= 的基线重置切出 gap），因此「某条命令执行
+  期间卡了 3 秒」不会产生 block 提示 —— 那条命令自己在「慢命令」里。
+
 | 取值 | 行为 | 适用 |
 |---|---|---|
 | =nil=（默认） | 完全不提示：不占 echo area，也不写 =*Messages*= | 默认。提示会盖住 minibuffer 候选、打断正在进行的输入与补全 |
@@ -71,6 +78,48 @@ sqlite3 -readonly "file:$HOME/.emacs.d/.local/state/chronos/chronos.sqlite?mode=
 
 （=ts= 是毫秒时间戳，用 =date -d @$((ts/1000))= 换算；=context_json= 里的 =mode= 是
 判定时刻的 major-mode，可据此定位当时在哪个 buffer。）
+
+* 命令外停转（drift）与调档指引
+
+**drift 是什么**：主线程在**命令之外**停转 **500–2000 ms** 的按小时聚合（表 =hourly_drift=，
+每会话每小时一行：次数 / 累计 / 最坏）。超过 2000 ms 改记 =slow_events(kind='block')= 明细，
+两档互斥。**命令内**的停转不进 drift —— 它在 =commands= 里有精确 =duration_ms=，
+两表**不可相加、也不该相加**（不相交集合：命令间隙的停转 vs 命令总耗时）。
+
+**两个相关 defcustom**（硬约束：drift 阈值必须 **小于** block 阈值、且**大于**心跳间隔 × 1000）：
+
+| 变量 | 默认 | 含义 | 调档含义 |
+|---|---|---|---|
+| =el-chronos-drift-threshold-ms= | =500= | drift 档最低记录阈值（毫秒） | 上调 → drift 变少、只剩更明显的停顿；下调 → 更灵敏但小时行更密（更「噪」） |
+| =el-chronos-block-threshold-ms= | =2000= | block 档（明细）阈值 | 一般不动；drift 阈值必须低于它 |
+| =el-chronos-heartbeat-seconds= | =0.25= | 心跳间隔 | 决定两档的**高估上界**（= 一个间隔）与 drift 的检出下界（= 阈值 − 一个间隔） |
+
+**调档指引（可执行）**：
+
+1. **上线先跑一周再动**（默认值不动）。真实频率未知：batch 只能注入人造延迟，量不出真实
+   工作负载下 500 ms–2 s 停转的发生率，因此 500 ms 是估计值，不是实测最优。
+2. 观察期结束后看两个数：`select sum(count), max(max_ms) from hourly_drift;`。
+   - 每小时行数与次数**过多**、噪声感强 → 把 =el-chronos-drift-threshold-ms= 上调到 **800–1000**；
+   - 想看见 0.3–0.5 s 的卡顿 → 下调到 **300**，但**不要低于心跳间隔**（=250=）：
+     `阈值 < 250` 时每一次正常心跳间隔都可能被判成 drift，只会把噪声灌进库。
+3. 觉得自己机器上 timer 唤醒开销明显（笔记本电池、低功耗设备）→ 把
+   =el-chronos-heartbeat-seconds= 回调到 **0.5**：开销约减半，但 block / drift 的**高估上界升到
+   500 ms**、drift 检出下界相应上移。
+4. 代码里**不做断言**（运行中可改），所以上面两条硬约束由你自己遵守。
+
+#+BEGIN_SRC elisp
+;; 想更灵敏：只记命令外 ≥300 ms 的停转（心跳仍 250ms，勿低于它）
+(setq el-chronos-drift-threshold-ms 300)
+;; 觉得太吵：只记 ≥1 s 的命令外停转
+(setq el-chronos-drift-threshold-ms 1000)
+;; 低功耗设备：把心跳拉回 500ms（高估上界随之升到 500ms）
+(setq el-chronos-heartbeat-seconds 0.5)
+#+END_SRC
+
+**250ms 心跳的开销**：实测相对开销 **+0.0357%**（[[file:architecture.org][docs/architecture.org]]
+「实测结论 13」；噪声地板 ±0.0003% 的 119 倍，距 0.5% 预算余 14 倍）。**但该数字是在
+=emacs -Q --batch= 下测的：GUI 主循环未实测**（batch 无 redisplay、无输入事件队列，唤醒路径更短），
+只能作为**上界估计**使用；GUI 侧若观感异常就按上面的第 3 条回调。
 
 * 启动分解的物理边界（重要：不是 bug）
 
@@ -122,11 +171,11 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 
 | 操作 | 入口 | 作用范围 | 备注 |
 |---|---|---|---|
-| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 五张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理 |
-| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含五张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **10 张表** |
-| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 10 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
+| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 六张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理 |
+| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含六张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **11 张表** |
+| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 11 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
 | 回收空间 | =M-x el-chronos-store-vacuum= | =VACUUM=（重写库文件） | 不能在事务内执行；purge 后跑一次可显著缩小文件 |
-| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库（=user_version= 2、10 表 + 3 索引） |
+| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库（=user_version= 3、11 表 + 3 索引） |
 
 #+BEGIN_SRC elisp
 (el-chronos-purge (truncate (* 1000 (float-time (date-to-time "2026-09-01 00:00:00")))))
@@ -158,6 +207,9 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | 采集健康显示「本期无采集数据」 | **不是故障**：采集器还没写过 =hourly_health= 行（=:rows= = 0），例如刚开始用、或这段时间内没有一次 flush 成功过 | 与「本期无采集异常」是两个不同结论：先确认 =el-chronos-mode= 在跑、=M-x el-chronos-status= 能显示库路径，然后等一个 flush 周期（默认 5s）再看。只读 =:ok-p= 会把「没采集」读成「一切正常」，报告与页面都按 =:rows= 先行分支 |
 | =heap_bytes= 恒为 =−= / 为 NULL | **Emacs < 31.1 没有 =garbage-collect-heapsize=**，采集层守卫失败即不采，该列恒 NULL | 正常能力缺口，不是采集失败。=M-: (fboundp 'garbage-collect-heapsize)= 验证；升级 Emacs 后只有**新会话**才有堆值，历史会话永远是 NULL（跨版本混图会出现空洞，按 =sessions.emacs_version= 分组看） |
 | 启动分解只有 =mode-start= 一个锚点 | mode 在**启动结束之后**才启用（典型写法 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=） | **物理边界，不是 bug**：观测器无法观测自己被加载之前的事。要完整剖析就把 =(el-chronos-mode 1)= 提前到 =early-init.el=（含副作用说明，见「启动分解的物理边界」节） |
+| 报告里没有「命令外停转」数字 | ① 该窗口内确实**没有 500–2000 ms 的命令外停转**（正常，报告会写「本期无记录」）；② =el-chronos-drift-threshold-ms= 被调高（如 1000），落在阈值下的停转本就不记；③ 该窗口内主线程一直有命令在跑（命令内停转不进 drift） | ①③ 无需处理；② 查当前值 =M-: el-chronos-drift-threshold-ms=，需要更灵敏就按「命令外停转（drift）与调档指引」下调（**不要低于心跳间隔**）。直接查库确认有无记录：`select hour_ts, count, total_ms, max_ms from hourly_drift order by hour_ts desc limit 10;` |
+| 命令内卡顿没进 drift（「我明明卡了两秒」） | **设计如此**：drift 与 block 只覆盖**命令之外**的停转，命令执行期间的时间被结算时的基线重置切出 gap | 命令内的停转看「慢命令 TOP」节 / =commands.duration_ms=（≥200 ms 的另有一条 =slow_events(kind='command')=）。**两表不可相加** —— 相加会把同一段时长算两次。见「命令外停转（drift）」节 |
+| v3 前后 =slow_events(kind='block')= 的量看起来变少了 | **口径变了，不是采集退化**：v3 之前命令内 ≥2 s 停转会**同时**记 =kind='command'= 与 =kind='block'=（双记，TD-11 ③）；v3 起 block 只记命令外停转，命令内那一条不再产生 | 做跨版本趋势对比时**必须按时间点切开**（升级前后分段统计），否则会把「双记消失」误读成「阻塞变少了」。历史行不迁移、不回改 |
 
 * 验证步骤
 
@@ -167,7 +219,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 |---|---|---|---|
 | =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
 | =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
-| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 199 tests, 199 results as expected, 0 unexpected= |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 233 tests, 233 results as expected, 0 unexpected= |
 | =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
 
 ** 手动 smoke（端到端，5 分钟）
@@ -215,6 +267,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | =hourly_stacks= | **永久** | 仅 purge | ≤ 24 × =el-chronos-store-stack-top-n=（默认 200）× 会话数 / 天 |
 | =hourly_gc= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 1 行（与既有 =hourly_*= 同量级，可忽略） |
 | =hourly_health= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 6 行（6 个固定键；同量级，可忽略） |
+| =hourly_drift= | **永久**（仅 purge） | 仅 purge（=el-chronos-store--prune= **不碰它**） | 每会话每小时 ≤ 1 行；只在命令外 500–2000ms 停转发生时写入（主键去重 upsert），与 =commands= 的时长**不可相加** |
 | =startup_phases= | 随 =sessions= 由 purge 清理 | 仅 purge | **每会话 ≤ top-N + 3 行**（默认 ≤ 53，=el-chronos-startup-top-n= 为 50；=first-idle= 记录时 ≤ 54）—— 比 =sessions= 高两个量级，**频繁重启的机器上会明显增长，是本项目最值得留意的一张表** |
 | =session_meta= | 随 =sessions= 由 purge 清理 | 仅 purge | 每会话 ≤ 2 行（=git-head= / =config-sig=，取不到则不写行） |
 

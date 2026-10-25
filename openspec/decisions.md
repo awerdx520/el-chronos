@@ -12,6 +12,7 @@
 | 2026-10-24 | 可视化采用双形态（Emacs 内 ETAF 页面 + 浏览器 Web dashboard），共享同一 analysis 查询层 | Emacs 侧选 ETAF 而非内置 svg.el + tabulated-list：组件化布局、响应式状态、表格与 SVG 组合能力强，且本机已装；日常查看不离开 Emacs、深度分析在浏览器。代价：dashboard 对 ETAF 形成软依赖、需处理缺失与 terminal 降级，代码量增加约 40% | ADR-0002、I8–I11 |
 | 2026-10-24 | 可视化收敛为两形态（浏览器 Web dashboard + org 报告），删除 dashboard 模块与 ETAF 软依赖 | dashboard 与 Web 能力重叠但独占总维护成本（ETAF 软依赖、双渲染路径、10 条踩坑、TD-5 内存/重绘风险、24 个用例）；Web 已覆盖全部只读查看需求且零第三方依赖 | ADR-0003、I8–I11 改写（I 编号不变，I9/I11 语义见 `AGENTS.md` 不变量清单） |
 | 2026-10-25 | 观测面扩展到时间+内存+启动+配置变更：一次 schema v2 迁移新增 hourly_gc / startup_phases / hourly_health / session_meta 四表，GC 用 gcs-done+gc-elapsed（零副作用）与 garbage-collect-heapsize（31+ 守卫），变更标记零子进程读 .git，启动分解用 after-load-functions 近似 | 内存维度为零导致「越用越胖」不可观测；回归只能看到「变慢」看不到「什么变了」；ALTER 加列不幂等故全走新表 | ADR-0004、I5/I6/I10 |
+| 2026-10-25 | 亚秒级卡顿采用两档阈值：block(2000ms) 保持 slow_events 明细、drift(500ms) 新增 hourly_drift 小时聚合，心跳降至 250ms | 只降心跳只解决高估不解决检出下界；降 block 阈值会让明细表爆炸；聚合表使阈值定低也不会膨胀 | ADR-0005、TD-11 |
 
 ## 决策模板
 

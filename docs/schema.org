@@ -4,13 +4,16 @@
 #+OPTIONS: toc:3 num:nil
 
 #+BEGIN_QUOTE
-状态：**schema v2，DDL 与实现已对齐**（2026-10-25，=el-chronos-store.el=（~el-chronos-store--schema-ddl~））。
-当前 =user_version = 2=，共 **10 表 + 3 索引**（v1 的 6 表 + 3 索引，加上 v2 的
-=hourly_gc= / =startup_phases= / =hourly_health= / =session_meta= 四张新表）。
+状态：**schema v3，DDL 与实现已对齐**（2026-10-25，=el-chronos-store.el=（~el-chronos-store--schema-ddl~））。
+当前 =user_version = 3=，共 **11 表 + 3 索引**（v1 的 6 表 + 3 索引，加上 v2 的
+=hourly_gc= / =startup_phases= / =hourly_health= / =session_meta= 四张新表，
+再加上 v3 的 =hourly_drift=）。
 v1（6 表）的 DDL、索引与保留策略与
 [[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]「数据模型」节一致，
 v2 的扩展见 [[file:../openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]
-与 [[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]；
+与 [[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]，
+v3（=hourly_drift=，命令外停转小时聚合）见
+[[file:adr/0005-two-tier-block-detection.md][docs/adr/0005-two-tier-block-detection.md]]；
 接口签名见 [[file:api.org][docs/api.org]]，界面消费方式见 [[file:ui.org][docs/ui.org]]。
 尚未实测的项（行数估算、=EXPLAIN QUERY PLAN=、P95 精度）见文末「待补」。
 #+END_QUOTE
@@ -18,22 +21,23 @@ v2 的扩展见 [[file:../openspec/completed/expand-observation-surface.md][open
 * 数据库位置与 PRAGMA
 
 - 路径：=el-chronos-db-path=，默认 =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=。
-- 迁移：=PRAGMA user_version=（当前 =2=），**只走 =CREATE … IF NOT EXISTS=，一条 =ALTER TABLE=
-  都不用**（理由见「迁移 v1 → v2」节）。启动时幂等执行，可无条件重跑。
+- 迁移：=PRAGMA user_version=（当前 =3=），**只走 =CREATE … IF NOT EXISTS=，一条 =ALTER TABLE=
+  都不用**（理由见「迁移 v2 → v3」与「迁移 v1 → v2」节）。启动时幂等执行，可无条件重跑。
   迁移前先把 DB 文件复制为 =chronos.sqlite.bak=；迁移失败则回滚该文件 + =display-warning=，
   **不破坏原库**（宁可这轮不采集，也不留半迁移状态）。
 - =PRAGMA journal_mode = WAL=（读写不互斥）；=PRAGMA busy_timeout = 2000=（实现常量
   =el-chronos-store--busy-timeout-ms=）；=PRAGMA foreign_keys = ON=（打开库即设，
-  因此 =purge= 的删除顺序受外键约束，见「purge 的 10 表删除顺序」）。
+  因此 =purge= 的删除顺序受外键约束，见「purge 的 11 表删除顺序」）。
 - 所有时间戳为 epoch **毫秒**（I4）；所有时长为**毫秒**浮点（采样间隔用纳秒，仅存在于内存）。
 
-* 最终 DDL（=user_version= 2，10 表 + 3 索引）
+* 最终 DDL（=user_version= 3，11 表 + 3 索引）
 
 以下与 =el-chronos-store--schema-ddl= 一致，一次批量执行（全部 =IF NOT EXISTS=，幂等）；
 =commands= 有外键引用 =sessions=，**建表顺序不能改**。
 v2 的四张新表由四个单表 DDL 常量（=--ddl-hourly-gc= / =--ddl-startup-phases= /
 =--ddl-hourly-health= / =--ddl-session-meta=）=concat= 进全量串，与增量脚本
-=--sql-migrate-v2= 共用**同一批字面量**（两份字面量必然漂移，而漂移的表现是「新库对、旧库缺表」）。
+=--sql-migrate-v2= 共用**同一批字面量**（两份字面量必然漂移，而漂移的表现是「新库对、旧库缺表」）；
+v3 的 =hourly_drift= 同理由 =--ddl-hourly-drift= concat 进全量串，与 =--sql-migrate-v3= 共用字面量。
 
 #+BEGIN_SRC sql
 CREATE TABLE IF NOT EXISTS sessions (
@@ -77,6 +81,12 @@ CREATE TABLE IF NOT EXISTS hourly_health (
 CREATE TABLE IF NOT EXISTS session_meta (
   session_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT,
   PRIMARY KEY (session_id, key));
+-- ↓ v3 新增表（命令外停转的小时聚合）
+CREATE TABLE IF NOT EXISTS hourly_drift (
+  hour_ts INTEGER NOT NULL, session_id INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0, total_ms REAL NOT NULL DEFAULT 0,
+  max_ms REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour_ts, session_id));
 #+END_SRC
 
 （源码里 DDL 是单行压缩形式，字段与约束完全一致；此处为可读性重排。）
@@ -90,12 +100,13 @@ CREATE TABLE IF NOT EXISTS session_meta (
 | 函数聚合 | =INSERT … ON CONFLICT(hour_ts, session_id, function) DO UPDATE SET self_ms = self_ms + excluded.self_ms, total_ms = total_ms + excluded.total_ms, samples = samples + excluded.samples= | 累加而非覆盖 |
 | 用量聚合 | =… ON CONFLICT(hour_ts, dimension, key) DO UPDATE SET count = count + excluded.count, duration_ms = duration_ms + excluded.duration_ms= | 同上 |
 | 栈聚合 | =… ON CONFLICT(hour_ts, session_id, stack_hash) DO UPDATE SET samples = samples + excluded.samples= | =stack_hash = sha1(stack_json)= 去重 |
-| GC 聚合 | =… ON CONFLICT(hour_ts, session_id) DO UPDATE SET gc_count = gc_count + excluded.gc_count, gc_ms = gc_ms + excluded.gc_ms, heap_bytes = COALESCE(excluded.heap_bytes, heap_bytes)= | 计数与耗时**累加**；堆大小**最后一次非 NULL 胜出**（见「四张新表」） |
+| GC 聚合 | =… ON CONFLICT(hour_ts, session_id) DO UPDATE SET gc_count = gc_count + excluded.gc_count, gc_ms = gc_ms + excluded.gc_ms, heap_bytes = COALESCE(excluded.heap_bytes, heap_bytes)= | 计数与耗时**累加**；堆大小**最后一次非 NULL 胜出**（见「五张新表」） |
 | 健康计数 | =… ON CONFLICT(hour_ts, session_id, key) DO UPDATE SET value = value + excluded.value= | KV 累加（计数与耗时都是单调量） |
 | 启动阶段 | =… ON CONFLICT(session_id, phase) DO UPDATE SET ms = excluded.ms= | 覆盖：同阶段重复打点取最后一次 |
 | 会话元数据 | =… ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value= | 覆盖：同一键只保留当前值 |
+| Drift 聚合（v3） | =… ON CONFLICT(hour_ts, session_id) DO UPDATE SET count = count + excluded.count, total_ms = total_ms + excluded.total_ms, max_ms = MAX(max_ms, excluded.max_ms)= | 前两列**累加**；=max_ms= 取**标量** =MAX=（两参数，SQLite 支持），保留本小时最坏单次（见「五张新表」） |
 
-* 10 张表
+* 11 张表
 
 ** sessions（每次启动一行）
 
@@ -216,10 +227,12 @@ WHERE hour_ts = ?1 AND session_id = ?2
 - 只在 flush 时对本批涉及的组执行，不做全表扫描。
 - 被淘汰的栈在下一次窗口聚合时可能重新写入（它是「本小时 top-N」而非「永久保留 id」）。
 
-* 四张新表（v2，逐表字段语义）
+* 五张新表（v2 四张 + v3 一张，逐表字段语义）
 
-四张表都是 =CREATE TABLE IF NOT EXISTS= 新建，**没有一条 =ALTER TABLE ADD COLUMN=**
-（理由见「迁移 v1 → v2」）；既有 6 表的列、主键与索引一字未动。
+五张表都是 =CREATE TABLE IF NOT EXISTS= 新建，**没有一条 =ALTER TABLE ADD COLUMN=**
+（理由见「迁移 v1 → v2」与「迁移 v2 → v3」）；既有 6 表的列、主键与索引一字未动。
+v2 的四张（=hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=）见前四小节，
+v3 的 =hourly_drift= 见本节末（口径最容易被误读，读之前先看它的「语义限定」）。
 
 ** hourly_gc（GC 次数 / 耗时 / 堆大小的按小时聚合）
 
@@ -319,16 +332,56 @@ NULL —— 该小时最后一次写入恰好是 NULL 时，整小时采到的�
 =session_meta= 采集变更标记（=git-head= / =config-sig=）属**用户可识别信息**，
 隐私声明与 purge 覆盖见 [[file:operations.org][docs/operations.org]]「隐私边界与数据保留」。
 
-** 四张新表均不写外键（与 hourly_functions / hourly_stacks 一致）
+** hourly_drift（命令外停转的小时聚合，v3）
 
-既有 DDL 里**只有 =commands.session_id REFERENCES sessions(id)=** 一处外键。新四张表刻意不写：
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| =hour_ts= | INTEGER NOT NULL | 整点（epoch ms） |
+| =session_id= | INTEGER NOT NULL | 会话 id |
+| =count= | INTEGER NOT NULL DEFAULT 0 | 本小时 drift **次数**，upsert **累加** |
+| =total_ms= | REAL NOT NULL DEFAULT 0 | 本小时 drift **累计时长**（毫秒，**高估值**），upsert **累加** |
+| =max_ms= | REAL NOT NULL DEFAULT 0 | 本小时**最坏单次**时长（毫秒，**高估值**），upsert 取标量 =MAX= |
+
+主键：=(hour_ts, session_id)=（每会话每小时一行）。
+
+**语义限定（不读这一段必然误读）**：本表记录的是「**主线程在命令之外**停转 500–2000ms 的聚合」，
+区间上界由 =el-chronos-block-threshold-ms=（默认 2000）决定 —— 超过即改记
+=slow_events(kind='block')= 明细，两档互斥（一次 gap 只进一档）。
+
+三个列各自回答一个问题：=count= 是**次数**（这个小时卡了几次）、=total_ms= 是**累计**
+（这个小时为此付了多少代价）、=max_ms= 是**最坏单次**（最影响体感的那一次）。亚秒级卡顿的
+问题形态就是这三问，不需要时间戳与栈 —— 定位要靠同时段的 =hourly_functions= /
+=hourly_stacks= 采样。因此本表**不记时间戳、不记栈、不记命令**。
+
+**命令内的停转不进本表**：命令**内部**的停转由 =commands= 的 =duration_ms= 精确记录
+（≥ =el-chronos-slow-command-threshold-ms= 默认 200ms 时另进 =slow_events(kind='command')=）。
+排除机制**不靠任何判据**，而是采集侧在命令结算（=--finish=）后把心跳基线重置到当前时刻，
+命令执行时间**根本不进入** =gap=。推论（必须记住）：=hourly_drift= 的时长与 =commands= 的耗时
+**不可相加、也不该相加** —— 两者是不相交的集合（「命令间隙的停转」vs「命令总耗时」）。
+任何「总卡顿 = 慢命令 + block + drift」的求和式都是错的。
+
+**=total_ms= / =max_ms= 是高估值，不是精确值**：单次时长以「发现时刻距上次心跳基线的间隔」计时，
+每次最多多算一个心跳间隔（=el-chronos-heartbeat-seconds=，默认 250ms）。所以
+「=max_ms= 减掉至多 250ms」才是真实停转的下界；反过来，真实 ≥250ms 的停转才可能被记
+（检出下界是相位相关的 250–500ms，不是精确的 500ms）。
+
+**不写外键**（与 v2 四张及 =hourly_functions= / =hourly_stacks= 一致）：不与 purge 的删除顺序、
+级联删除、=foreign_keys=ON= 三者耦合。代价是孤儿行只能靠 purge 顺序约定 + 写入前的会话存在性
+校验消灭（见下节与「purge 的 11 表删除顺序」）。
+
+**保留策略**：**永久保留**（小时聚合，仅 =M-x el-chronos-purge= 清理），
+=el-chronos-store--prune= **不碰它**（自动 retention 永远只删 =commands= / =slow_events= 两张明细表）。
+
+** 五张新表均不写外键（与 hourly_functions / hourly_stacks 一致）
+
+既有 DDL 里**只有 =commands.session_id REFERENCES sessions(id)=** 一处外键。新五张表刻意不写：
 
 - 写外键会把「purge 的删除顺序」「级联删除」「=foreign_keys=ON=」三者耦合起来——任何一处顺序调整
   都可能变成运行期约束错误；
-- 代价是孤儿行只能靠 =purge= 的删除顺序约定消灭，这正是「purge 的 10 表删除顺序」要把顺序钉死、
+- 代价是孤儿行只能靠 =purge= 的删除顺序约定消灭，这正是「purge 的 11 表删除顺序」要把顺序钉死、
   并为它写用例的原因；
-- 因此写入侧要自己守门：flush 写 =hourly_gc= / =hourly_health= / =startup_phases= 前先校验会话行
-  存在（=--session-known-p=），不存在则跳过这三表并每进程只告警一次。
+- 因此写入侧要自己守门：flush 写 =hourly_gc= / =hourly_health= / =startup_phases= / =hourly_drift=
+  前先校验会话行存在（=--session-known-p=），不存在则跳过这几张表并每进程只告警一次。
 
 * 3 个典型查询
 
@@ -388,14 +441,15 @@ ORDER BY self_ms DESC;
 | =hourly_stacks= | **永久** | top-N 淘汰（默认 200/小时/会话），行数 ≤ 24 × 200 × 会话数/天 |
 | =hourly_gc= | **永久**（仅 purge） | 每会话每小时 ≤ 1 行；与既有 =hourly_*= 同量级 |
 | =hourly_health= | **永久**（仅 purge） | 每会话每小时 ≤ 6 行（6 个固定键）；与既有 =hourly_*= 同量级 |
+| =hourly_drift= | **永久**（仅 purge） | 每会话每小时 ≤ 1 行；只在命令外 500–2000ms 停转发生时写入，主键去重 upsert。与 =commands= 的时长**不可相加** |
 | =startup_phases= | 随 =sessions= 由 purge 清理 | **每会话 ≤ top-N + 3 行**（默认 ≤ 53 行，=first-idle= 记录时 ≤ 54）—— 比 =sessions= 的 1 行/会话高两个量级，长期频繁重启的机器上会明显增长，是本项目最值得留意的一张表 |
 | =session_meta= | 随 =sessions= 由 purge 清理 | 每会话 ≤ 2 行（=git-head= / =config-sig=，取不到则不写行） |
 
 - 自动 retention（=el-chronos-store--prune=）**只作用于 =commands= / =slow_events=**，不得动
-  五张 =hourly_*= 聚合表（=hourly_functions= / =hourly_usage= / =hourly_stacks= / =hourly_gc= /
-  =hourly_health=；趋势与跨年对比依赖它们），也不得动两张会话级表
+  六张 =hourly_*= 聚合表（=hourly_functions= / =hourly_usage= / =hourly_stacks= / =hourly_gc= /
+  =hourly_health= / =hourly_drift=；趋势与跨年对比依赖它们），也不得动两张会话级表
   （=startup_phases= / =session_meta=）。
-- 五张 =hourly_*= 与两张会话级表的唯一清理途径都是用户手动 =M-x el-chronos-purge=（按日期或全部）。
+- 六张 =hourly_*= 与两张会话级表的唯一清理途径都是用户手动 =M-x el-chronos-purge=（按日期或全部）。
 - 清理在低优先级 timer 中执行，避免占用交互时段。
 
 * 百分位（P95）说明：当前是近似
@@ -411,7 +465,7 @@ SQLite 没有百分位聚合函数，当前实现**不用**「=ORDER BY … LIMI
 偏差 >5%。**待实测**（见文末待补）；偏差超阈值时改为 =commands= 按 =duration_ms= 预分桶的直方图表，
 而不是在查询时排序取位。
 
-* purge 的 10 表删除顺序（钉死，不许改写）
+* purge 的 11 表删除顺序（钉死，不许改写）
 
 =el-chronos-store--purge-targets= 是 =(表名 . 删除策略)= 的列表，**顺序不可改**。
 两种策略：=ts= / =hour-ts= 表示表里有时间列、按列删（=ts < ?= / =hour_ts < ?=）；
@@ -429,12 +483,13 @@ SQLite 没有百分位聚合函数，当前实现**不用**「=ORDER BY … LIMI
 | 7 | =hourly_stacks= | =hour_ts < ?= | 同上 |
 | 8 | =hourly_gc= | =hour_ts < ?= | 同上（v2 新表） |
 | 9 | =hourly_health= | =hour_ts < ?= | 同上（v2 新表） |
-| 10 | =sessions= | =started_at < ?= 且无存活子行 | **最后**：它是第 1 步外键的父表、第 3–4 步子查询的源表 |
+| 10 | =hourly_drift= | =hour_ts < ?= | 同上（v3 新表，带 =hour_ts= 时间列 → 按列删）。位置在 =hourly_health= 之后、=sessions= 之前：与其余五张聚合表同一个顺序理由（有 =hour_ts= 列、按列删、必须早于 =sessions=） |
+| 11 | =sessions= | =started_at < ?= 且无存活子行 | **最后**：它是第 1 步外键的父表、第 3–4 步子查询的源表 |
 
 **两条互不相同的顺序理由，不要混为一谈**：
 
 1. **外键只约束 =commands=** → 第 1 步必须最早。既有 DDL 里仅 =commands.session_id REFERENCES
-   sessions(id)=；=hourly_functions= / =hourly_usage= / =hourly_stacks= 与 v2 四张新表**都没有外键**。
+   sessions(id)=；=hourly_functions= / =hourly_usage= / =hourly_stacks= 与 v2 / v3 五张新表**都没有外键**。
 2. **=startup_phases= / =session_meta= 必须在 =sessions= 之前，理由不是外键而是子查询** →
    它们的删除条件依赖 =SELECT id FROM sessions ...=。若先删 =sessions=，子查询在删完之后恒为空，
    两表的行**永远不会被删且不报错**，静默成为孤儿，直接破坏 purge「删掉这段历史」的语义。
@@ -452,7 +507,7 @@ SQLite 没有百分位聚合函数，当前实现**不用**「=ORDER BY … LIMI
 
 - =BEFORE= 为 nil（清空全部）时所有表走无条件 =DELETE FROM <table>=，子查询不参与，顺序此时
   无关紧要；但仍照上表执行，保持**单一代码路径**（一个顺序，两种 =BEFORE= 都走）。
-- 整个 purge 在单事务内（=BEGIN= / =COMMIT= / 失败 =ROLLBACK=），10 条 DELETE 同一事务。
+- 整个 purge 在单事务内（=BEGIN= / =COMMIT= / 失败 =ROLLBACK=），11 条 DELETE 同一事务。
 - purge 结束后重建当前会话行（否则后续写入撞外键）；重建时把该行的 =startup_ms= 显式置 NULL
   —— =--ensure-session= 会用 =before-init-time= → =after-init-time= 写「本进程的启动耗时」，
   而此刻 =started_at = now=，两者语义矛盾（=started_at= 说「刚启动」、=startup_ms= 说「几小时前启动」）。
@@ -479,35 +534,89 @@ v1（6 表）→ v2（10 表）的迁移**一条 =ALTER TABLE ADD COLUMN= 都没
    看似「无数据」而实际是「迁移没做完」），外部 =sqlite3= 读者看到残缺 schema。
 4. 失败分支：先 =ROLLBACK=（**必须在 =.bak= 覆盖之前**，否则覆盖时句柄仍持有未回滚事务）→
    关句柄 → =.bak= 覆盖回原文件 → 删 =-wal= / =-shm= → =display-warning= → 返回 nil。
-5. 版本分支用 =(when (= from-version 1) …)= 而不是 =(< from-version 2)=：=from-version= 0 已被
-   =--ensure-schema= 建全 10 表并置版本 2，再跑一遍 v2 脚本虽幂等但会让失败恢复路径难以推理。
+5. 版本分支用 =(when (= version 1) …)= 而不是 =(< version 2)=：进入时的 =version= 变量已按上一级推进
+   （0 号库走 =--ensure-schema= 后同步为当前常量），再跑一遍 v2 脚本虽幂等但会让失败恢复路径难以推理。
 
 **关键陷阱（改这里之前必读）**：=el-chronos-store--ensure-schema= 建完表就**无条件**把
 =user_version= 置为当前常量。所以 =--schema-ddl= **必须始终是全量 DDL** —— 若只把
-=--schema-version= 改成 2 而 DDL 还是旧的 6 表，版本 0 的新库会只建 6 表却被标记为 v2，
-之后 =--migrate= 不会再跑（版本相等），新表永远不存在，所有新写入静默失败。
+=--schema-version= 改成 3 而 DDL 还是旧的 10 表，版本 0 的新库会只建 10 表却被标记为 v3，
+之后 =--migrate= 不会再跑（版本相等），=hourly_drift= 永远不存在，所有 drift 写入静默失败。
+
+* 迁移 v2 → v3（新增 =hourly_drift=，迁移链按版本变量逐级推进）
+
+v2（10 表）→ v3（11 表）与 v1 → v2 同款：**一条 =ALTER TABLE= 都没有**，只有一条
+=CREATE TABLE IF NOT EXISTS hourly_drift=。增量脚本是常量 =--sql-migrate-v3=，
+与 =--schema-ddl= 里的 =--ddl-hourly-drift= **共用同一个字面量**（两份必然漂移，
+而漂移的表现是「新库对、旧库缺表」）。
+
+**迁移链的陷阱（本次修掉的硬缺陷，必须在改 =--migrate= 之前读完）**：
+
+S1 及之前的 =--migrate= 是两个**互斥**分支 —— =(when (< from-version 1) …ensure-schema…)=
++ =(when (= from-version 1) …v2 脚本、版本置 2…)=。若本次只追加一个
+=(when (= from-version 2) …)=，那么 **=from-version = 1= 的库**（S1 之前建的库，用户升级过一版
+但没到 v3）会：走 v2 分支把版本推到 2 → **没有任何分支继续推进 v3** → =--migrate= 返回 t、
+=--open-db= 返回可用句柄，但库里**没有 =hourly_drift= 表** → 本次会话所有 drift 写入撞
+=no such table= → flush 失败 → 限流告警 + 丢本批 → 下次启动才补上 v3。这是**静默降级型缺陷**
+（用户看不到错误，只看到 drift 数据缺一段），因此本次一并修掉。
+
+**定案写法：局部 =version= 变量逐级推进**（=el-chronos-store--migrate= 内）：
+
+#+BEGIN_SRC elisp
+(let ((version from-version))
+  (when (< version 1)
+    (el-chronos-store--ensure-schema db)          ; 建全 11 表并把 user_version 置为当前常量
+    (setq version el-chronos-store--schema-version))  ; ← 必须同步为 3，不是 1
+  (when (= version 1) …v2 脚本… (sqlite-pragma db "user_version=2") (setq version 2))
+  (when (= version 2) …v3 脚本… (sqlite-pragma db "user_version=3") (setq version 3))
+  (sqlite-pragma db (format "user_version=%d" version)))
+#+END_SRC
+
+三条必须满足的语义（各有守门用例）：
+
+| 起始版本 | 必须发生的事 | 最终状态 |
+|---|---|---|
+| **0（新库）** | 只走 =--ensure-schema=（建全 11 表 + 版本置当前常量），**不重跑** v2 / v3 脚本 | 11 表、=user_version=3= |
+| **1（S1 之前的老库）** | v2 脚本 → 版本 2 → **继续** v3 脚本 → 版本 3（**一次打开就到位**） | 11 表（含 =hourly_drift=）、=user_version=3= |
+| **2（S1 的库）** | 只跑 v3 脚本 | 11 表、=user_version=3= |
+
+**`--ensure-schema=` 的交互是本方案唯一的陷阱**：它建完表后**无条件**写
+=user_version = --schema-version=（=3=），所以那次调用返回后库里已是最新，而局部 =version=
+还停在原值。三种结局只有一种可接受：
+
+- 留在 **0** → 末尾 pragma 把已经是最新的库标成**版本 0**，下次打开又走一遍迁移
+  （幂等但版本号长期失真）—— **禁止**；
+- 置成 **1** → 版本号正确，代价是 v2 / v3 脚本各多跑一遍（=CREATE TABLE IF NOT EXISTS=
+  幂等不报错，但「刚建全表又迁移两遍」让失败恢复路径难以推理）—— 可行但不推荐；
+- 置成 **=--schema-version=（3，采用）** → 后续分支自然都不触发，末尾 pragma 写 3。
+
+其余边界沿用 v1 → v2 的四条：=.bak= 复制在 =BEGIN= **之前**、=ROLLBACK= 在 =.bak= 覆盖**之前**、
+每步各自 =BEGIN= / =COMMIT=（步骤内只把版本推进到**本步目标版本**）、末尾统一写一次最终版本。
+将来追加 v4 时，本步仍只把版本置为 3，不要「顺手」改成当前常量。
 
 * 手动清理与迁移回滚
 
-- =el-chronos-purge (&optional before)=：删除指定日期前的**全部**数据（含五张 =hourly_*= 与两张
-  会话级表，共 10 张表，顺序见上一节）。不给 =before= 时按 =el-chronos-retention-days= 计算；
+- =el-chronos-purge (&optional before)=：删除指定日期前的**全部**数据（含六张 =hourly_*= 与两张
+  会话级表，共 11 张表，顺序见上一节）。不给 =before= 时按 =el-chronos-retention-days= 计算；
   返回按删除顺序排列的 =((表名 . 删除行数) ...)=。用于用户主动清空历史，与自动 retention 区分。
 - 迁移流程概览：读 =PRAGMA user_version= → 若低于代码期望版本，先复制 DB 为 =.bak= →
-  执行迁移 SQL（v1 → v2 显式包事务）→ 全部成功则写新 =user_version=；任一步失败则用 =.bak=
-  覆盖回滚 + =display-warning=，本轮禁用采集。细节见上一节。
+  按版本变量逐级推进执行迁移 SQL（v1 → v2、v2 → v3，各步显式包事务）→ 全部成功则写新
+  =user_version=；任一步失败则用 =.bak= 覆盖回滚 + =display-warning=，本轮禁用采集。
+  细节见「迁移 v1 → v2」与「迁移 v2 → v3」两节。
 - 彻底重置：关闭 Emacs 后删除 =chronos.sqlite=（连同 =-wal= / =-shm=）即可，下次启动重建空库
-  （=user_version= 2、10 表 + 3 索引）。
+  （=user_version= 3、11 表 + 3 索引）。
 
 * 待补（Phase 4 之后）
 
 - [x] 最终 DDL 与实现对齐（v1：6 表 + 3 索引 + =user_version = 1=；v2：10 表 + 3 索引 +
-      =user_version = 2=，见「最终 DDL」节与「四张新表」节）
+      =user_version = 2=；v3：11 表 + 3 索引 + =user_version = 3=，见「最终 DDL」节与「五张新表」节）
 - [x] =hourly_stacks= 的 top-N 淘汰 SQL 与 =session_id= 非空约束说明（见对应小节）
 - [x] 保留策略表补齐 =sessions= 行与 purge 边界（自动 retention 只碰两张明细表）
-- [x] v2 四张新表的字段语义、=COALESCE= 的 carried-forward 语义、不写外键的理由
-      （见「四张新表」节）
-- [x] purge 扩到 10 表的删除顺序与两条互不相同的理由（见「purge 的 10 表删除顺序」）
+- [x] v2 四张 / v3 一张新表的字段语义、=COALESCE= 的 carried-forward 语义、不写外键的理由
+      （见「五张新表」节）
+- [x] purge 扩到 11 表的删除顺序与两条互不相同的理由（见「purge 的 11 表删除顺序」）
 - [x] v1 → v2 迁移的显式事务边界与 =.bak= 顺序约束（见「迁移 v1 → v2」）
+- [x] v2 → v3 迁移与**迁移链陷阱**（版本变量逐级推进、=--ensure-schema= 后同步版本、
+      =.bak= 在 =BEGIN= 之前）的定案写法与三条守门用例（见「迁移 v2 → v3」）
 - [ ] 各表日均行数与数据库增长速率实测（校验 86 万行/天估算；=startup_phases= 的
       「每会话 ≤ top-N + 3 行」需按真实重启频率折算）
 - [ ] =EXPLAIN QUERY PLAN= 实测：三个典型查询是否走索引（=idx_commands_ts= / =idx_commands_duration= / =idx_slow_events_ts=）

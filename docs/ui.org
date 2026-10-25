@@ -26,7 +26,7 @@
 
 * 浏览器 Web dashboard（=M-x el-chronos-web-start=）
 
-** 路由表（17 条，全部 GET、只读）
+** 路由表（18 条，全部 GET、只读）
 
 | # | 方法 | 路径 | 参数 | 返回键 |
 |---|---|---|---|---|
@@ -40,13 +40,14 @@
 | 8 | GET | =/api/stacks= | =range= =limit=（默认 50） | =range= =limit= =items=[{:stack :samples :pct}]= |
 | 9 | GET | =/api/sessions= | =range= | =range= =limit=（nil）= =items=[{:id :started-at :startup-ms :emacs-version :host}]= |
 | 10 | GET | =/api/blocking= | =range= =limit=（默认 20） | =range= =limit= =items=[{:id :ts :duration-ms :kind :command :mode :project}]= |
-| 11 | GET | =/api/regressions= | =range=（被忽略） =limit=（默认 20） | =range= =limit= =items=[{:function :current-ms :previous-ms :growth :current-samples :previous-samples}]= |
-| 12 | GET | =/api/gc= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720） | =range= =bucket-count=（省略为 null）= =bucket-span= =gc-total= =heap-latest= =items=[{:bucket :gc-count :gc-ms :heap-bytes}]= |
-| 13 | GET | =/api/startup= | =session=（正整数；省略/非法 → 取最近一次有启动数据的会话） | =session-id= =started-at= =startup-ms= =phases=[[阶段 耗时]=…]= =loads=[[库 耗时]=…]= |
-| 14 | GET | =/api/health= | =range= | =range= =dropped-commands= =dropped-events= =flush-failures= =flush-count= =flush-ms= =flush-avg-ms= =sample-misses= =ok-p= =rows= |
-| 15 | GET | =/api/config-history= | =range= | =range= =total-sessions= =truncated= =changes= =sessions=[{:id :started-at :git-head :config-sig :changed}]= |
-| 16 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
-| 17 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
+| 11 | GET | =/api/drift= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720） | =range= =bucket-count=（省略为 null）= =bucket-span= =threshold-ms= =drift-total= =ms-total= =slowest-ms= =items=[{:bucket :count :total-ms :max-ms}]= |
+| 12 | GET | =/api/regressions= | =range=（被忽略） =limit=（默认 20） | =range= =limit= =items=[{:function :current-ms :previous-ms :growth :current-samples :previous-samples}]= |
+| 13 | GET | =/api/gc= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720） | =range= =bucket-count=（省略为 null）= =bucket-span= =gc-total= =heap-latest= =items=[{:bucket :gc-count :gc-ms :heap-bytes}]= |
+| 14 | GET | =/api/startup= | =session=（正整数；省略/非法 → 取最近一次有启动数据的会话） | =session-id= =started-at= =startup-ms= =phases=[[阶段 耗时]=…]= =loads=[[库 耗时]=…]= |
+| 15 | GET | =/api/health= | =range= | =range= =dropped-commands= =dropped-events= =flush-failures= =flush-count= =flush-ms= =flush-avg-ms= =sample-misses= =ok-p= =rows= |
+| 16 | GET | =/api/config-history= | =range= | =range= =total-sessions= =truncated= =changes= =sessions=[{:id :started-at :git-head :config-sig :changed}]= |
+| 17 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
+| 18 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
 
 约定：
 
@@ -65,14 +66,24 @@
 | =/api/health= | =range= | analysis 返回 nil → JSON =null=，页面显示「（无数据）」。**=:rows= 必须先行分支**：=:rows= 为 0 → 「本期无采集数据」；=:rows= > 0 且 =:ok-p= 为 true → 「本期无采集异常（flush N 次，平均 X）」。=:ok-p= 显式归一为 JSON 布尔（analysis 的 nil 会被序列化成 null，而「没有坏消息」是确定的判断，不该与「未知」共用一个值） |
 | =/api/config-history= | =range= | analysis 返回 nil → =:sessions= 为 null、计数为 0 的空结构。**只返回最近 =el-chronos-web--config-history-sessions=（50）个会话**（取尾部）：会话行随每次重启单调增长，全量返回会让单线程 Web 的主线程查询与浏览器渲染一起变长；截断后 =:changes= 按**返回的**会话重算，=:truncated= 显式归一为 JSON 布尔标出截断；保留下来的第一条若 =changed= 为 true，它参照的前一会话已不在列表里（截断的固有代价）。=git-head= / =config-sig= 为 null 表示**未取到**（store 层取不到就不写行），不是「取了但为空」 |
 
-**四个新端点的响应体很小**：以 fixture（3 个 GC 桶 / 6 个健康键 / 3 个阶段锚点 + 3 条包加载 /
+** v3 新端点 =/api/drift= 的参数与降级行为
+
+| 项 | 内容 |
+|---|---|
+| 参数 | =range=（=1d= / =7d= / =30d=，非法或缺失回落 =7d=）、=buckets=（正整数；省略时由 analysis 按窗口长度选 24 / 168 / 720，并受整小时倍数合并约束，与 =/api/gc= 同一套） |
+| 响应键 | =range=（归一化字符串）、=bucket-count=（省略时 =null=）、=bucket-span=（桶宽，毫秒）、=threshold-ms=（**当前判定阈值，随响应下发**——取自 =el-chronos-drift-threshold-ms=，默认 500；写死会与实际判定脱节）、=drift-total=（窗口内次数合计）、=ms-total=（累计停转毫秒）、=slowest-ms=（单次最长）、=items=[{:bucket :count :total-ms :max-ms}]=（桶列表，字段名沿用 analysis 的 =:buckets= 元素，改名为 =:items= 以与其它列表接口同形） |
+| 降级（I11） | analysis 返回 nil（库打不开 / 查询失败）→ 计数键为 0 / 0.0 / 0.0、=:items= 为 =null=，**仍返回 200**；页面显示「本期无命令外停转记录（≥N ms；命令内停转见「慢命令」表，两者不可相加）」 |
+| 口径（随页面标注） | 只含**命令之外**的停转；命令内停转在 =/api/slow-commands=，两表**不可相加**；=ms-total= / =slowest-ms= 是**高估值**（每个样本最多多算一个心跳间隔，默认 250ms） |
+
+** 四个新端点的响应体很小**：以 fixture（3 个 GC 桶 / 6 个健康键 / 3 个阶段锚点 + 3 条包加载 /
 1 个会话）实测，=200= 响应体分别为 **252 / 203 / 184 / 237 字节**，均在 300 字节内；
 =range= 与 =buckets= 变大、会话变多（=config-history= 受 50 封顶）时线性增长，仍属同一量级。
 
 ** 内嵌前端结构
 
 页面结构（=el-chronos-web--markup=，无 CDN、无第三方库）：**14 个 =<section>= 面板 + 顶栏 + 下钻侧栏**
-（v2 新增 4 个面板：GC 与内存 / 启动分解 / 采集健康 / 配置变更，加粗标出）。
+（v2 新增 4 个面板：GC 与内存 / 启动分解 / 采集健康 / 配置变更，加粗标出；v3 的 drift **不新增面板**，
+它嵌在「阻塞事件」面板顶部）。
 
 | 区块 | DOM | 图表实现 |
 |---|---|---|
@@ -85,7 +96,7 @@
 | 用法热力 | =.hm#heat=（DOM 网格） | CSS 背景色深浅 + =title= 悬浮提示，命令 ≤20、桶为时间轴 |
 | 慢命令 | =#q-slow= 搜索 + =table#t-slow= | 表格：列排序、分页 10 行 |
 | 热点函数 | =#q-func= 搜索 + =table#t-func= | 同上 |
-| 阻塞事件 | =table#t-block= | 表格 + 行点击下钻 |
+| 阻塞事件 | =div#drift= + =table#t-block= | **顶部的 drift 小节**（v3）：一行「命令外停转（≥N ms）：本期 X 次，累计 Y，最坏 Z」+ 最近 24 桶小表（小时/次数/累计/最坏）；阈值 N 取自 =/api/drift= 的 =threshold-ms=。下方是 block 明细表格 + 行点击下钻。drift 小节含「仅命令之外的停转；累计与最坏为高估值（每个样本最多多算一个心跳间隔 250ms）；命令内停转见上表，两者不可相加」的口径注 |
 | 回归 | =table#t-reg= | 表格 |
 | **采集健康** | =div#health= | 六个指标 + flush 平均耗时；=rows= 为 0 时显示「本期无采集数据」（不是「无异常」） |
 | **配置变更** | =div#conf= | 表格：会话启动时间 / 提交（前 8 字符）/ 配置指纹（前 8 字符）/ 变化 ✓；截断时标注「仅显示最近 50 个会话」 |
@@ -138,11 +149,29 @@
 | 7 | 启动分解 | =el-chronos-analysis-startup-breakdown= → =--section-startup= | 阶段锚点全列 + 包加载 TOP 10 行 |
 | 8 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 六个指标 + flush 平均耗时 |
 | 9 | 配置变更 | =el-chronos-analysis-config-history= → =--section-config= | 会话全列（哈希各显示前 8 字符） |
-| 10 | 阻塞事件 | =el-chronos-analysis-blocking-events= | 20 行；列：时间/时长/命令/mode/project |
+| 10 | 阻塞事件 | =el-chronos-analysis-drift-trend= → =--drift-line=；=el-chronos-analysis-blocking-events= | 节内**先给一行 drift 汇总**，再列 block 明细 20 行（列：时间/时长/命令/mode/project）。drift 汇总**不新开节**（见下） |
 | 11 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
 | 12 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
 | 13 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
 | 14 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+
+** 「阻塞事件」节内的 drift 汇总行（v3）
+
+**节数仍是 14 —— 刻意不新增第 15 节**：报告已有 14 节，再拆一节只增加阅读负担，还会连带改一堆
+按节数断言的老用例。drift 与 block 同属「命令之外的停转」，只有放在一起读者才看得到完整图景
+（drift 覆盖 [500ms, 2000ms) 区间，block 覆盖 ≥2000ms）。
+
+这一行由 =el-chronos-report--drift-line= 生成，两种文案（与 =el-chronos-report.el= 的实现逐字一致）：
+
+- 有数据：=- 命令外停转（500–2000 ms）：本期 37 次，累计 24.10 s，最坏 1.82 s（累计与最坏为高估值，每次最多多算一个心跳间隔 250 ms；命令内停转见「慢命令」节，两者不可相加）=
+- 无数据（I11 可见降级，**不留空白**）：=- 命令外停转（500–2000 ms）：本期无记录（命令内停转见「慢命令」节；两者不可相加）=
+- 即使下方的 block 明细表降级为 =（无数据）=，这一行也照样出现。
+
+**口径必须在文案里出现**（不可删改的三处）：① 带「**命令外**」限定；② 标注**高估值**（单次时长
+以「发现时距上次心跳基线的间隔」计时，每次最多多算一个心跳间隔）；③ 无数据时也给「命令内停转
+见「慢命令」」的指引。区间上下界分别取 =el-chronos-drift-threshold-ms= 与
+=el-chronos-block-threshold-ms=、高估上界取 =el-chronos-heartbeat-seconds= 换算的毫秒 ——
+三个都是可调 defcustom，**写死会与实际判定脱节**。
 
 ** 四节新节的降级文案（I11：任何情况都不省略整节）
 
@@ -166,7 +195,8 @@
 
 - =el-chronos-report= 交互选范围（默认 =7d=），生成只读 org buffer。
 - =el-chronos-weekly-report= 把近 7 天报告写入 =chronos-weekly.org=（默认落运行时状态目录）。
-- =el-chronos-export= 导出 CSV（=# section:= 分块）或 JSON（单对象，含 overview 与各明细区块）。
+- =el-chronos-export= 导出 CSV（=# section:= 分块，**9 个区块**：5 个通用规格 + startup / health / config-history / drift 四个手写）或 JSON（单对象，含 overview 与各明细区块）。
+- Web 的 =/api/export.csv= 有 **12 个区块**（8 个通用规格 + startup / health / config-history / drift 四个手写）。两侧的区块名与表头**逐字对齐**，drift 在两侧都放**末尾**（位置一致是被用例断言的不变量）。
 - =el-chronos-show-event= 展示单条慢事件完整栈与 context（=*el-chronos-event*= 只读 buffer）。
 - =el-chronos-profile-command= 对单条命令做 1ms 高精度剖析（不查库，实时跑一次）。
 

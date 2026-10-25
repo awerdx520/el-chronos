@@ -17,15 +17,15 @@
 
 | 模块 | 文件 | 职责 | 对外符号数 |
 |---|---|---|---|
-| 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 18 defcustom |
+| 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 19 defcustom |
 | 归因 | =el-chronos-attrib.el= | 符号 → 源码文件 → 包 / 模块；命令上下文 | 4 |
-| 存储 | =el-chronos-store.el= | SQLite schema（v2，10 表）、批量 flush、保留与 purge | 15 |
+| 存储 | =el-chronos-store.el= | SQLite schema（v3，11 表）、批量 flush、保留与 purge | 16 |
 | 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合、GC / 启动打点 | 2 + 1 defcustom |
-| 分析 | =el-chronos-analysis.el= | 17 个只读聚合查询 | 17 |
+| 分析 | =el-chronos-analysis.el= | 18 个只读聚合查询 | 18 |
 | 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
-| Web | =el-chronos-web.el= | 最小 HTTP server（17 条只读 GET 路由）+ 内嵌 Web dashboard | 3 |
+| Web | =el-chronos-web.el= | 最小 HTTP server（18 条只读 GET 路由）+ 内嵌 Web dashboard | 3 |
 
-defcustom 合计 **20 个**：=el-chronos.el= 18 个 + =el-chronos-collect-notify-blocks=（collect）
+defcustom 合计 **21 个**：=el-chronos.el= 19 个 + =el-chronos-collect-notify-blocks=（collect）
 + =el-chronos-profile-save=（report）。后两个是历史分散项，**不迁移**（迁走会破坏用户已有的
 =setq= 位置与 =custom-file= 记录）；新增的 defcustom 一律落 =el-chronos.el=。
 
@@ -48,7 +48,7 @@ defcustom 合计 **20 个**：=el-chronos.el= 18 个 + =el-chronos-collect-notif
 (el-chronos-mode -1)    ; 停止，清理 timer / hook / profiler / 未 flush 缓冲
 #+END_SRC
 
-** defcustom（=el-chronos.el= 内 18 个，属于 =el-chronos= 组）
+** defcustom（=el-chronos.el= 内 19 个，属于 =el-chronos= 组）
 
 | 变量 | 默认值 | 类型 | 说明 |
 |---|---|---|---|
@@ -57,8 +57,9 @@ defcustom 合计 **20 个**：=el-chronos.el= 18 个 + =el-chronos-collect-notif
 | =el-chronos-sample-window-seconds= | =10= | integer | 采样窗口长度（秒）；每满一个窗口取走计数并重置。 |
 | =el-chronos-heap-sample-windows= | =6= | integer | 每 N 个采样窗口取一次 Emacs 堆大小（≈ N × 窗口长度，默认约 60s）。堆采样稀疏，同小时只保留最后一个非空值（=COALESCE=）；Emacs < 31.1 无 =garbage-collect-heapsize= 时该列恒 NULL。 |
 | =el-chronos-startup-top-n= | =50= | integer | 启动期包加载明细入库的条数上限（内存留全部、写库前按 ms 降序截断）。决定 =startup_phases= 每会话行数的上界（top-N + 3，=first-idle= 记录时 +4）。 |
-| =el-chronos-heartbeat-seconds= | =1= | number | 心跳间隔（秒），用于检测命令外阻塞。 |
-| =el-chronos-block-threshold-ms= | =2000= | number | 心跳漂移超过该值记一次 =block= 事件（毫秒）。 |
+| =el-chronos-heartbeat-seconds= | =0.25= | number | 心跳间隔（秒），用于检测**命令外**主线程停转。默认 **250ms**（v3 由 1 改为 0.25）：把 block / drift 两档的**高估上界从 1s 压到 250ms**。开销依据：实测相对开销 **+0.0357%**（[[file:architecture.org][docs/architecture.org]]「实测结论 13」，距 0.5% 预算余 14 倍），但该数字是 =emacs -Q --batch= 下测的，**GUI 主循环未验证**（只能作上界估计）。**硬约束**：本值必须小于 =el-chronos-drift-threshold-ms=，否则每次正常心跳间隔都会被判成 drift（代码不断言，调档见 [[file:operations.org][docs/operations.org]]）。 |
+| =el-chronos-block-threshold-ms= | =2000= | number | 心跳 drift 超过该值记一条 =block= 明细（毫秒）。v3 起 block **只覆盖命令外停转**（命令执行时间被 =--finish= 的基线重置切出 gap），=command= 列恒 =nil=。 |
+| =el-chronos-drift-threshold-ms= | =500= | number | **命令外停转**的 drift 档阈值（毫秒，v3 新增）：超过即累加到 =hourly_drift= 小时聚合（只记次数 / 累计 / 最坏，**不记明细、不发提示**）；超过 =el-chronos-block-threshold-ms= 则记 block 档（两档互斥）。**语义限定「命令之外」**：命令内停转由 =commands= 的 =duration_ms= 负责，两表**不可相加**。**硬约束**：必须大于 =el-chronos-heartbeat-seconds= × 1000。真实频率未知（batch 只能注入人造延迟），建议上线观察一周后调档。 |
 | =el-chronos-slow-command-threshold-ms= | =200= | number | 慢命令阈值（毫秒）。 |
 | =el-chronos-db-path= | =<user-emacs-directory>/.local/state/chronos/chronos.sqlite= | file | 唯一的落库文件（I3）。 |
 | =el-chronos-retention-days= | =30= | integer | 明细表（=commands= / =slow_events=）保留天数。 |
@@ -106,11 +107,12 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 | =el-chronos-store-record-stacks= | =(HOUR-TS STACKS)= | 无 | 累加小时栈样本；=STACKS= 为 =((STACK-JSON . SAMPLES) ...)=。 |
 | =el-chronos-store-record-gc= | =(HOUR-TS GC-COUNT GC-MS HEAP-BYTES)= | 无 | 累加小时 GC 统计（v2）。=HEAP-BYTES= 为 nil 表示本窗口无堆样本 → 该行 =heap_bytes= **保持上一次观测值**（=COALESCE=，last-observation-carried-forward）；只有非 nil 才覆盖。 |
 | =el-chronos-store-record-health= | =(HOUR-TS KEY VALUE)= | 无 | 累加采集器自监控计数（v2）。=KEY= 为固定枚举：=dropped-commands= / =dropped-events= / =flush-failures= / =flush-count= / =flush-ms= / =sample-misses=。库里是 **eventual** 值（flush 失败时无法写库，下一次成功 flush 补写）。 |
+| =el-chronos-store-record-drift= | =(HOUR-TS GAP-MS)= | 无 | 累加「命令外停转」小时聚合（v3）：=count= +1、=total_ms= 累加、=max_ms= 取较大值。=GAP-MS= 是**浮点毫秒**（当前时刻与 =--last-heartbeat= 之差 × 1000，含 ∈[0, 心跳间隔] 的偏移，故为**高估值**）。整体 =condition-case= 包裹；会话未知时**跳过并每进程告警一次**（=hourly_drift= 无外键，孤儿行 purge 删不掉）。 |
 | =el-chronos-store-record-startup-phase= | =(SESSION-ID PHASE MS)= | 无 | 记录启动阶段耗时（v2）。=PHASE= 取 =mode-start= / =after-init= / =startup= / =first-idle=，包加载明细用 ="load:<library>"=；同 =(SESSION-ID, PHASE)= 重复打点**覆盖**。 |
 | =el-chronos-store-record-session-meta= | =(SESSION-ID KEY VALUE)= | 无 | 写会话级元数据（v2，=git-head= / =config-sig=）。**直接 =sqlite-execute= 写入、不走缓冲**（每会话一次的冷路径，立即可见、不占缓冲、失败可独立告警）；=VALUE= 为 nil 时**不写行**。 |
 | =el-chronos-store-note-startup-ms= | =(MS)= | 无 | 登记待补写的 =sessions.startup_ms=，落库并入**下一次 flush 的既有事务**。**纯内存、零 IO**：不碰 sqlite、不告警、不登记 timer（见「内部函数约定」）。 |
 | =el-chronos-store-flush= | =()= | 无 | 全部缓冲单事务写库（含 v2 四表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。 |
-| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含五张 =hourly_*= 与两张会话级表）：**共 10 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 10 表删除顺序」）。=BEFORE= 为 nil 时清空全部 10 张表。与自动 retention 的区别是连聚合一起删。 |
+| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含六张 =hourly_*= 与两张会话级表）：**共 11 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 11 表删除顺序」）。=BEFORE= 为 nil 时清空全部 11 张表。与自动 retention 的区别是连聚合一起删。 |
 | =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
 
 #+BEGIN_SRC elisp
@@ -133,7 +135,7 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 一般**不直接调用**：由 =el-chronos-mode= 编排（=--start= / =--stop=）。单独加载 collect 时对
 store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
-* 分析模块（=el-chronos-analysis.el=，17 个查询）
+* 分析模块（=el-chronos-analysis.el=，18 个查询）
 
 =RANGE= 取 ='1d= / ='7d= / ='30d=（按当前时刻倒推，上界含当前毫秒 +1 毫秒避免漏行），
 或显式半开区间 ='(START . END)=（epoch 毫秒）。全部只读，返回 plist 或 list of plist；
@@ -154,6 +156,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 | =el-chronos-analysis-health= | =(RANGE)= | plist | **采集器自监控（v2）**。=:dropped-commands= =:dropped-events= =:flush-failures= =:flush-count= =:flush-ms= =:flush-avg-ms= =:sample-misses= =:ok-p= =:rows=。关键约定：=:ok-p= 只看四个「坏消息」键（=dropped-commands= / =dropped-events= / =flush-failures= / =sample-misses=）是否全 0；**=:rows= 是区分「本期无异常」与「本期无数据」的唯一依据**——一条 health 行都没有时 =:ok-p= 同样为 t，只看 =:ok-p= 会把「没采集」读成「一切正常」（报告与 Web 都按 =:rows= 先行分支）。计数是 **eventual** 值（flush 失败要等下一次成功 flush 才可见）。 |
 | =el-chronos-analysis-config-history= | =(RANGE)= | plist | **配置变更时间线（v2）**。=:sessions= 元素 =(:id :started-at :git-head :config-sig :changed)=（按 =started_at= 升序）；=:changes= 为 =:changed= 为 t 的会话数。关键约定：=:changed= 表示**与前一个会话相比** =(git-head, config-sig)= 有变化，**=nil= 有两种含义且本层不区分**——① 首会话（没有「前一个」，无从比较）；② 与前一会话相比标记无差异；调用方若需区分请**自行判断会话序号**（=:sessions= 的首个元素即第一个会话）；引入三态（=:n/a= / nil / t）属行为变更、未实施，见技术债 TD-20；两个键都为 nil 的相邻会话视为没变化（无法断言配置变了，谎报比漏报更糟）。=git-head= / =config-sig= 为 nil 表示**未取到**（store 层取不到就不写行），不是「取了但为空」。空库返回 =(:sessions nil :changes 0)=。 |
 | =el-chronos-analysis-blocking-events= | =(RANGE &optional LIMIT)= | list of plist | 命令外阻塞事件，按耗时降序；=(:id :ts :duration-ms :kind :command :mode :project)= |
+| =el-chronos-analysis-drift-trend= | =(RANGE &optional BUCKETS)= | plist | **命令外停转（drift）趋势（v3）**。=:range= =:bucket-span= =:buckets= =:drift-total= =:ms-total= =:slowest-ms=；=:buckets= 元素 =(:bucket :count :total-ms :max-ms)=（桶内求和 + 取最大）。三条约定：① **语义是「命令之外」的停转** —— 命令内的停转由 =commands= 的 =duration-ms= 覆盖、经 =slow-events(kind="command")= 呈现，两表**不可相加**（不相交集合）；② =:ms-total= / =:slowest-ms= 是**高估值**，每次最多多算一个心跳间隔（默认 250ms），减掉至多一个间隔才是真实下界；③ =hourly-drift= 属**永久保留**的聚合表（不受 =el-chronos-retention-days= 约束），需手动 purge。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**，避免调用方判空分支分叉。 |
 | =el-chronos-analysis-event= | =(ID)= | plist 或 =nil= | 单条慢事件完整详情；=:stack= 为帧名 list、=:context= 为 plist |
 | =el-chronos-analysis-regressions= | =(RANGE &optional LIMIT)= | list of plist | 回归列表，按增长率降序；=(:function :current-ms :previous-ms :growth :current-samples :previous-samples)=。**窗口由 =el-chronos-regression-window-days= 决定，RANGE 参数被忽略** |
 | =el-chronos-analysis-names= | =()= | 字符串 list 或 =nil= | 库中出现过的命令名（升序去重），供补全。 |
@@ -192,7 +195,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 | =el-chronos-web-stop= | =()=，interactive | =t=（确有关闭）/ =nil= | 关闭 server 并释放端口。 |
 | =el-chronos-web-running-p= | =()= | boolean | server 是否在运行。 |
 
-17 条只读 GET 路由（1 条 HTML + 15 条 JSON + 1 条 CSV）见 [[file:ui.org][docs/ui.org]]「浏览器 Web dashboard」节。
+18 条只读 GET 路由（1 条 HTML + 16 条 JSON + 1 条 CSV）见 [[file:ui.org][docs/ui.org]]「浏览器 Web dashboard」节。
 
 #+BEGIN_SRC elisp
 (el-chronos-web-start)        ; → http://127.0.0.1:8787/
@@ -211,7 +214,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
   self / total（判据 =(and X (symbolp X))=，因 =(symbolp nil)= 为 =t=）；栈序列化前经
   =el-chronos-collect--trim-trailing-nils= 裁掉尾部 nil，全 nil 栈不写 =hourly_stacks=。
   归因侧的对应处置是 =el-chronos-attrib--builtin-primitive-p=（符号分支前置短路 → =built-in=）。
-- **两条与内部实现强耦合的约定**（v2，2026-10-25）：
+- **三条与内部实现强耦合的约定**（v2 / v3，2026-10-25）：
   - =el-chronos-store-note-startup-ms= 虽是**对外符号**（无 =--=），但**只能从采集侧的
     =after-init-hook= 回调调用**，且调用方必须保证「启动期零 IO」：它不碰 sqlite、不告警、
     不登记 timer，只把毫秒值放进一个 defvar；落库由下一次 =el-chronos-store-flush= 在既有事务内
@@ -223,6 +226,15 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
     时全局句柄可能尚未赋值，purge 重建会话走的也是调用方持有的句柄。=VALUE= 为 nil 或任一 id
     为 nil 时**直接返回 nil、不写行**（KV 空值无信息量，且会让「取不到」与「取了但为空」不可区分）；
     对外入口 =el-chronos-store-record-session-meta= 只补一次「全局句柄是否可用」的门。
+  - =el-chronos-collect--heartbeat-check (&optional NOW)= 是「命令外停转」的**单一判定入口**
+    （v3）：**三处调用、两种职责，不许统一**。① 心跳 timer（=--heartbeat= 是只调它的薄壳）→
+    判定 + 重置；② =--pre-command=（每条命令开始前）→ 补判 + 重置（命令外时间的最后一个可观测
+    时机）；③ =--finish=（命令结算）→ **只做纯 =(setq --last-heartbeat (float-time))=，绝不调本
+    函数** —— 那里调它会让 =gap= 恰等于刚执行完的命令时长，命令时长被记成 block / drift，
+    双记（TD-11 ③）立刻复活。判定链是「无条件推进基线 → 抑制门（=--suppress-block-p=）→
+    兜底门（=--pending-p=）→ block / drift 分档」，两档共用同一对门。=condition-case= **必须在
+    本函数内部**：=--pre-command= 自身没有它，异常逃出去会经 =pre-command-hook= 中断用户正在
+    执行的命令。三处调用形态由用例 =heartbeat-check-is-single-source-of-truth= 守门。
 - 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
   继续，不向宿主抛错（I6）。
 

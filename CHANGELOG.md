@@ -9,6 +9,8 @@
 
 ### 修复
 
+- **修复迁移链缺陷**：`--migrate` 原为互斥分支（`cond` 里逐版本 `return`），v1 老库升级后会停在 v2 且缺 `hourly_drift` 表、写入静默失败；改为版本变量逐级推进（v1→v2→v3 顺序执行）。
+- **消除命令内停转的双记**：`--finish` 结算后重置心跳基线，block / drift 只覆盖命令外停转，命令内停转由 `commands.duration_ms` 独占（两表不相交、不可相加，结构性消除而非判据近似）。
 - **「采集健康」不再把「没采集」显示成「一切正常」（I11）**：`hourly_health` 一行都没有时
   `el-chronos-analysis-health` 各项为 0 且 `:ok-p` 为 t，报告层原先直接走 `:ok-p` 分支，用户看到
   「本期无采集异常（本期无 flush 记录）」——真实含义是采集器根本没上报。修法：报告层先判 `:rows`，
@@ -55,6 +57,8 @@
 
 ### 变更
 
+- 心跳间隔 1000ms → **250ms**（把停转时长的高估上界从 1s 压到 250ms；实测开销 +0.0357%，距 0.5% 预算余 14 倍）。
+- 判定逻辑抽成 `el-chronos-collect--heartbeat-check`，timer / `--pre-command` / `--finish` 三处调用（前两处判定、`--finish` 只重置基线）。
 - **文档与计划归档**：`docs/schema.org` / `api.org` / `architecture.org` / `ui.org` / `operations.org` 全部同步到 schema v2 与新增观测面（10 表 / 17 路由 / 14 报告节 / 20 defcustom）；`AGENTS.md` 基线与已知边界回填（199 用例）；新增技术债 TD-15～TD-19；计划 `expand-observation-surface.md` 由 `openspec/active/` 归档至 `openspec/completed/`（含「实现期勘误」）。
 - `/api/config-history` 返回最近 50 个会话并附 `total-sessions` / `truncated` 标示；CSV 导出不截断（镜像 org 报告的完整序列）。
 - `/api/health` 的 `ok-p` 显式归一为 JSON 布尔值，避免 `nil` 被序列化成 `null` 而与「未知」混淆。
@@ -85,6 +89,9 @@
 
 ### 新增
 
+- **亚秒级卡顿可见（S2）**：新增两档阈值——block（2000ms）保持 `slow_events` 明细，drift（500ms）写入新增的 `hourly_drift` 小时聚合表（count / total_ms / max_ms）；新增 `el-chronos-analysis-drift-trend` 查询、报告「阻塞事件」节内的一行 drift 摘要、`/api/drift` 路由与 dashboard 小节。
+- **schema v3**：新增 `hourly_drift` 表；`el-chronos-purge` 扩到 11 表。
+- 新增 defcustom `el-chronos-drift-threshold-ms`（默认 500）。
 - **采集开销实测结论**：S1 新增采集的常驻开销实测为 0.0000177%（GC 采集）与 2.18 ms 一次性（启动打点，日常为 0）；心跳降至 250ms 实测 +0.0357%（距 0.5% 预算余 14 倍），为亚秒级阻塞捕获（TD-11 建议①）在开销维度扫清障碍。同时记录 5 条方法论教训（字节编译断言、GC 污染轮丢弃、timer 唤醒的 regime 差异等）。
 - **Web dashboard 接入观测面扩展数据**：新增 4 条只读路由 `/api/gc`、`/api/startup`、`/api/health`、`/api/config-history`（路由总数 13 → 17），以及对应的 GC 与内存、启动分解、采集健康、配置变更四个面板（沿用 30 秒轮询）。
 - **CSV 导出同步覆盖**：Web 侧 CSV 区块 8 → 11，新增 startup / health / config-history 三块，字段与 org 报告侧逐列对齐。
@@ -135,4 +142,4 @@
 - 分析层：13 个聚合查询（top 函数、慢命令、阻塞事件、包归因、趋势、热力、栈样本、会话、回归判定等），返回 plist 供两种可视化形态共用（`el-chronos-analysis.el`，T6）。
 - 报告层：org 报告（1/7/30 天）、周报、CSV/JSON 导出、单事件详情（`el-chronos-report.el`，T7）。
 - 入口模块：`el-chronos-mode`（global minor mode）、defcustom 全套、启停编排幂等与 SQLite 不可用降级（`el-chronos.el`，T2）。
-- 用例总数 **199 → 200**（新增 `el-chronos-report-test-csv-sections-match-web`，锁住 web 与 report 两侧 CSV 区块对齐）。
+- 用例总数 **200 → 233**（上一档 199 → 200 由 `el-chronos-report-test-csv-sections-match-web` 带来，锁住 web 与 report 两侧 CSV 区块对齐；本档 200 → 233 为 S2 drift 两档阈值：collect 65 / store 60 / report 33 / analysis 29 / attrib 28 / web 18）。

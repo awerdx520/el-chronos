@@ -21,12 +21,12 @@ GNU Emacs 31.1）。本文件描述分层、**六条采集路径**、可视化�
 
 | 层              | 模块                     | 输入                         | 输出                                   | 副作用                            |
 |-----------------+-------------------------+-----------------------------+---------------------------------------+----------------------------------|
-| 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调、=after-load-functions=、=gcs-done= / =gc-elapsed= / =garbage-collect-heapsize= | 内存中的事件与小时聚合桶（含 GC / 健康计数 / 启动阶段与 load 明细） | 只读环境、写内存                    |
+| 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调、=after-load-functions=、=gcs-done= / =gc-elapsed= / =garbage-collect-heapsize= | 内存中的事件与小时聚合桶（含 GC / 健康计数 / 启动阶段与 load 明细 / **命令外停转 drift 判定**） | 只读环境、写内存                    |
 | 归因 attrib      | =el-chronos-attrib.el=    | 符号名、buffer               | file / package / mode / project 字符串 | 无（缓存 hash table）              |
-| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v2 共 10 表：新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=） | 唯一允许写盘的一层（I3）             |
-| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（17 个查询）               | 只读数据库                         |
+| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v3 共 11 表：v2 新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=，v3 新增 =hourly_drift=） | 唯一允许写盘的一层（I3）             |
+| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（18 个查询）               | 只读数据库                         |
 | 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（14 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
-| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（17 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
+| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（18 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
 
 数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / web（两种呈现形态，共享同一 analysis 查询层）= 。
 =attrib= 是被动依赖（collect 调它补上下文），不被 store 反向调用。
@@ -50,18 +50,61 @@ GNU Emacs 31.1）。本文件描述分层、**六条采集路径**、可视化�
      符号取符号名、键盘宏字符串原样、其他非 nil 对象按类型名）、 =t_start= 、
      =gcs-done= / =gc-elapsed= 基线；
    - **命令名两个都取不到（nil）时不开始计时**（旧实现落 =unknown= 无主行）；
+   - **命令开始前补判一次心跳**（=--heartbeat-check=，见路径 3）：结清「命令外时间」。落点在
+     =(--finish 'aborted)= **之后**（否则 =--pending-p= 仍为 t，兜底门会跳过判定）、=--command-start=
+     赋值**之前**（它度量的是「命令开始之前」）；放在 D1 双跑守卫之外，保持「每条真实命令
+     开始前都结清一次」的简单不变式；
 2. 命令执行（本观测器不参与，无 advice）；
 3. =post-command-hook= ：算 =duration_ms= 、 =gc_ms= 、 =outcome= ；命令名一律用步骤 1
    存下的值（此阶段 =this-command= 已是**上一条**命令，见实测结论 12）；
 4. =attrib-context= 补 =mode= / =project= ；用法三维计数自增；
 5. 超 =el-chronos-slow-command-threshold-ms= → 追加 =slow_events= 行（含当时栈快照）。
 
-** 路径 3：心跳（每 =el-chronos-heartbeat-seconds=，默认 1s）
+** 路径 3：心跳（每 =el-chronos-heartbeat-seconds=，默认 0.25s）——「命令外停转」的唯一来源
 
-1. timer 回调取 =float-time= ，与上次 tick 比较；
-2. 漂移 > =el-chronos-block-threshold-ms= （默认 2000ms）→ 记一条 =block= 型 =slow_events= ；
-3. 阻塞期间 Lisp 未被调度，因此**栈证据只能来自路径 4 的 SIGPROF 样本**（I2），事后回溯；
-4. 更新上次 tick，重新挂 timer。
+1. timer 回调 =--heartbeat= 是**薄壳**，只调 =el-chronos-collect--heartbeat-check (&optional NOW)=
+   （=NOW= 省略时取 =(float-time)=，仅供测试注入确定性时刻）；
+2. **无条件推进基线** =--last-heartbeat= 到 =NOW= —— 抑制期间、兜底门跳过判定时也必须推进，
+   否则解除抑制后会把整段抑制耗时算成一次 gap；
+3. 第一道门（**抑制门**）：=el-chronos-collect--suppress-block-p= 非 nil（报告 / Web 自观测抑制）
+   → 只推进基线、**不判定**；
+4. 第二道门（**兜底门**）：=el-chronos-collect--pending-p= 非 nil（命令中途让出主线程时心跳真的
+   跑了起来，此后命令内若再停转，gap 会跨过命令边界）→ **跳过判定**、只推进基线。
+   它是**兜底而非主判据** —— 主判据是 =--finish= 里的基线重置（命令时间根本不进 gap）；
+5. 门内按 gap（毫秒）分档，**两档互斥**（一次 gap 只进一档）：
+   - gap > =el-chronos-block-threshold-ms=（默认 2000）→ 记一条 =block= 型 =slow_events= 明细
+     （=duration_ms= = gap、=command= **恒 nil** —— 只记命令外停转，没有命令可归因）；
+   - **否则** gap > =el-chronos-drift-threshold-ms=（默认 500）→ =el-chronos-store-record-drift=
+     累加到 =hourly_drift= 小时桶，**不写明细、不发提示**；
+   - 都不满足 → 什么都不做；
+6. 阻塞期间 Lisp 未被调度，因此**栈证据只能来自路径 4 的 SIGPROF 样本**（I2），事后回溯；
+7. 判定整段包在 =condition-case= 内（I6），失败只限流告警、不向宿主抛错。
+
+**三处调用点，职责各不相同（不许「统一一下」）**：
+
+| 调用点 | 调用形态 | 行为 | 为什么必须是这种形态 |
+|---|---|---|---|
+| 心跳 timer（每 250ms） | =--heartbeat-check= | 判定 + 重置 | 覆盖「两条命令之间**迟迟没有下一条命令**」的停转 —— 此时没有 =pre-command-hook= 可挂钩 |
+| =--pre-command=（每条命令开始前） | =--heartbeat-check= | **补判** + 重置 | 命令开始前是「命令外时间」的**最后一个可观测时机**。卡顿结束后用户立刻按键时，Emacs 先执行命令（输入优先于 timer），随后的 =--finish= 重置会把整段停转吞掉 —— 只有 pre 能把它结清 |
+| =--finish=（命令结算） | **纯 =(setq --last-heartbeat (float-time))=** | **只重置，绝不判定** | 此处若调 check，=gap= 恰等于**刚执行完的命令时长** → 命令时长被记成 block / drift，双记立刻复活。这是本设计**唯一的硬禁令** |
+
+**三处共享一个基线不会重复记录**：=--last-heartbeat= 只有一个，谁先跑谁推进。命令间隙内主线程
+空闲时 timer 每 250ms 推进一次 → =--pre-command= 看到的 gap ≤250ms，不记；只有间隙内主线程
+真被占住（timer 跑不了）时，pre 才看到大 gap 并记一条。互斥由「共享基线 + 单一判定函数」天然
+保证，不需要额外去重逻辑。
+
+**重置基线的落点**：=--finish= 的第 491 行，在 =(let ((start …) (name …) (gc-start …)))= 之后、
+清状态 =setq= 块**之前**。三条理由：① 紧贴命令真实结束时刻（越往后放，结算自身的归因 / 取栈 /
+写库开销越会被悄悄切到基线之外）；② 早于状态清空 —— 结算过程中若心跳被触发，=--pending-p=
+仍为 t，兜底门会跳过判定，而基线已是 now，不会把结算耗时算成 gap；③ 在
+=(when (and (numberp start) name) …)= **之外**，故 =aborted= 与无主命令路径同样重置基线
+（否则 aborted 会把「上一条命令 + 命令间隙」整段留给下一次心跳）。
+
+**阈值与偏移的合成结果**（不要把 500ms 读成精确下界）：偏移 = 阻塞开始时刻 − 上次心跳或命令
+结算中较晚的那个 ∈ [0, 250ms]。block 的真实检出下界是 2000 − 偏移 ∈ **[1750, 2000]ms**，
+drift 是 500 − 偏移 ∈ **[250, 500]ms**；两档的记录值高估上界都是 **250ms**（原 1s）。边界因此
+是**相位相关**的：同一段 1.9s 停转，偏移 100ms 时记 drift、偏移 150ms 时记 block —— 不要跨档
+比较次数，也不要假设「block ⇒ 真实 ≥2s」。
 
 ** 路径 4：采样 tick（每 =el-chronos-sample-window-seconds=，默认 10s）
 
@@ -274,17 +317,23 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 ** 9. 自观测抑制（report / Web）：三层防护 + 心跳侧感知
 （本节原名「报告自观测抑制」，更名以纳入 Web 请求处理侧；旧引用按原名检索本文件仍可命中。）
 
-需求：报告生成（首次加载 org + 14 个 analysis 查询）与 Web 请求处理（查询 + 序列化 + 发送，
-主线程同步）都不能被自己的 1s 心跳判为阻塞——那是观测者在观测自己，属假阳性。两个入口各有
+需求：报告生成（首次加载 org + 15 个 analysis 查询）与 Web 请求处理（查询 + 序列化 + 发送，
+主线程同步）都不能被自己的 250ms 心跳判为阻塞——那是观测者在观测自己，属假阳性。两个入口各有
 一个同款宏：=el-chronos-report--without-block-events=（报告）与
-=el-chronos-web--without-block-events=（Web 请求），都用三层：
+=el-chronos-web--without-block-events=（Web 请求），都用三层。**block 与 drift 两档都靠第 1 层
+的抑制门兜住**（drift 判定写在 =--heartbeat-check= 里同一个抑制门之内）；第 2 层抬高
+=el-chronos-block-threshold-ms= 只对 block 档生效，对 drift 无效：
 
-1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧 =el-chronos-collect--heartbeat=
-   用 =bound-and-true-p= 读取：**非 =nil= 时推进 =--last-heartbeat= 基线并跳过阻塞判定**
-   （跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 与 web 侧各自先 =defvar= 声明同名变量）；
+1. 绑定 =el-chronos-collect--suppress-block-p= 为 =t=，collect 侧 =--heartbeat-check= 用
+   =bound-and-true-p= 读取：**非 =nil= 时推进 =--last-heartbeat= 基线并跳过判定**（block 与
+   drift 两档共用这个门；跨模块 =let= 绑定未声明变量会 =void-variable=，故 report 与 web 侧
+   各自先 =defvar= 声明同名变量）；
 2. 把 =el-chronos-block-threshold-ms= 临时抬到 60s（=--suppress-block-threshold-ms=），
    兜住抑制变量尚未生效的过渡期，以及 BODY 内部偶发让出主线程时的心跳；
 3. **收尾在 =unwind-protect= 清理段把 =el-chronos-collect--last-heartbeat= 重设为当前时刻**。
+   **v3 新增的 =--finish= 重置替代不了这一层**：渲染 / 请求处理期间不会有命令结算，若删掉第 3 层，
+   一次几秒的报告生成就会变成一条巨型 block/drift 事件。两个重置点触发条件互斥（一个在 BODY
+   收尾、一个在命令结算），语义幂等、互不冲突。
 
 三层各自负责什么：**BODY 执行期间心跳 timer 基本不运行**（主线程被占），结束后才补跑一次；
 那次补跑发生在 BODY 返回、=let= 绑定**已解除之后**，此刻抑制变量已是 =nil=，所以判定照跑——
@@ -545,6 +594,9 @@ daemon 的真实主循环**：batch 下唤醒路径更短（无 redisplay、无�
 | =heap_bytes= 仅 Emacs 31.1+ 有值 | 更低版本该列**恒 NULL**，=gc-trend= 的 =:heap-bytes= 也就恒为 nil | 采集层用 =(fboundp 'garbage-collect-heapsize)= 守卫，函数不存在就不采、不报错（I6）。**不是数据丢失**；跨版本混图时曲线出现的是**空洞**（部分会话有堆值），应按 =sessions.emacs_version= 分组阅读，不要读成「内存没长」 |
 | 启动分解覆盖范围受加载时机限制 | 只有 mode 在 =after-init-hook= **之前**启用才记包加载明细；在启动结束之后启用（例如 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=）时，=startup_phases= **只有 =mode-start= 一个锚点** | 事实依据：=startup.el= 第 1707 行先 =(setq after-init-time (current-time))=、第 1708 行才 =(run-hooks 'after-init-hook)=，两行都在 init 文件加载**之后** → =collect-start= 时启动已结束，于是**一个启动钩子都不挂**（否则后续交互触发的 load 会被记成「启动期 load」）。观测器无法观测自己被加载之前的事，见 [[file:operations.org][docs/operations.org]]「启动分解的物理边界」 |
 | 首个采样窗口只建基线 | 会话第一个采样 tick 只记录 =gcs-done= / =gc-elapsed= 基线、按 0 差值入库，因此最多丢 ≤1 个窗口的 GC 增量 | 计数器是单调全局量，没有上一次基线就没有差值可比。表现为可能出现 =gc-count= / =gc-ms= 全 0 的桶（**基线桶**，不等于「没有发生 GC」）；同源说明见 =el-chronos-analysis-gc-trend= 的 docstring |
+| **命令内时间被 =--finish= 的重置切掉** | =block= 与 =drift= **只覆盖命令之外**的停转：命令执行期间的时间根本不进入心跳 =gap=（基线在结算时被推到当前时刻）。因此命令内的 0.5–2s 停转既不进 =hourly_drift= 也不进 =slow_events(kind='block')= | 这是**有意为之的结构性取舍**（ADR-0005 D4/D7）：命令内停转由 =commands= 的 =duration_ms= 独占（≥200ms 另进 =slow_events(kind='command')=），**双记（TD-11 ③）由此结构性消除**。**代价是跨版本不可直接比较**：v3 之前的 =slow_events(kind='block')= 含命令内停转（与 =kind='command'= 双记），v3 之后只有命令外 —— 做趋势对比必须按时间点切开，否则会误读成「阻塞变少了」。同理 =block= / =drift= 的时长与 =commands= 的耗时**不可相加** |
+| **连续命令流中的累计卡顿不可见** | 卡顿分散在几十条 20–50ms 的连续命令里（总 1.5s、**单条都不慢**）时：每条命令都进不了 =slow_events=（<200ms 阈值）、命令时间又被基线重置切掉 → block / drift 与 =slow_events= **都看不到** | 方案 B（重置换判据）的**结构性能力损失**：判据方案至少能在命令内记 block，重置方案不能。这类卡顿只能查 =commands= 的**时间戳密度**（按小时聚合已有，但需人工解读时间戳聚类）。登记 tech-debt；不要把它当成「采集器坏了」 |
+| **=--pre-command= 补判的边界** | 补判只覆盖「**命令开始前**」这一时机：停转后立刻按键 → 由它捕获；若停转后主线程恢复执行的**不是命令**（如另一个 timer 回调、进程过滤器），补判不会发生 | 设计边界，非缺陷：这类情形由 timer 心跳在其后捕获（间隙内主线程空闲时 timer 每 250ms 一直在跑）。补判的作用只是「补上 timer 被饿死的那一类」，不是万能兜底；另一残余是 D1 双跑守卫命中时 pre 直接返回（同一命令双跑、无真实间隙，无害） |
 
 * 待补（Phase 4 之后）
 
