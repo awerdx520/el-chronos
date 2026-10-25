@@ -219,7 +219,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 |---|---|---|---|
 | =make check-parens= | L1 | 逐 =.el= 文件括号平衡检查 | exit 0，逐个文件打印 =check-parens: <file>= |
 | =make lint= | L1 补充 | 字节编译告警检查（输出到临时目录，不污染仓库） | exit 0；有告警即失败 |
-| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 233 tests, 233 results as expected, 0 unexpected= |
+| =make test= | L2 | 自动发现并加载 =test/*-test.el=，跑全部 ERT | =Ran 234 tests, 234 results as expected, 0 unexpected= |
 | =make full-check= | L1 + L2 | =check-parens= + =test= | 两段都通过 |
 
 ** 手动 smoke（端到端，5 分钟）

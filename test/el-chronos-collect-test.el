@@ -419,6 +419,19 @@ drift <= 心跳间隔 → 每次心跳都记一条 drift。两者都是「数据
                 (el-chronos-heartbeat-seconds 0.25))
             (should (eq t (el-chronos--start)))
             (should-not warnings))
+        (setq el-chronos--running-p nil))
+      ;; ④ drift 绑 nil（用户清空 custom）：必须显式告警。
+      ;; 否则 numberp 守卫让上面两条都不触发，而心跳里 `(> gap-ms nil)' 抛错又被
+      ;; condition-case 吞掉 → drift 永不记录且无任何提示（数据悄悄错）。
+      (setq warnings nil)
+      (unwind-protect
+          (let ((el-chronos-drift-threshold-ms nil)
+                (el-chronos-block-threshold-ms 2000)
+                (el-chronos-heartbeat-seconds 0.25))
+            (should (eq t (el-chronos--start)))
+            (should (= 1 (length warnings)))
+            (should (eq 'el-chronos (caar warnings)))
+            (should (string-match-p "不是数字" (cadar warnings))))
         (setq el-chronos--running-p nil)))))
 
 ;;; D1 双跑（局部 hook 值带 t）+ D2 帧名归一

@@ -152,12 +152,12 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 233 用例，0 skipped）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 234 用例，0 skipped）
 make full-check     # check-parens + test
 #+END_SRC
 
 测试文件固定命名 =test/*-test.el=（Makefile 用 =$(wildcard test/*-test.el)= 自动发现，
-新增测试无需改 Makefile）。233 用例分布：=collect= 65 / =store= 60 / =report= 33 / =attrib= 28 /
+新增测试无需改 Makefile）。234 用例分布：=collect= 66 / =store= 60 / =report= 33 / =attrib= 28 /
 =analysis= 29 / =web= 18。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
 =M-x el-chronos-report=；详细清单见 [[file:docs/operations.org][docs/operations.org]]「验证步骤」。
 
@@ -167,7 +167,7 @@ make full-check     # check-parens + test
   **11 表 + 3 索引**（schema v3 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）+ =hourly_drift=（v3））、
   六条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick / 启动打点 / GC 与自监控）、归因、
   **18 个**只读聚合查询、org 报告（**14 节**）、Web dashboard（**18 条只读路由**）、单命令剖析、
-  ERT **233** 用例、文档全集。
+  ERT **234** 用例、文档全集。
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]（核心，2026-10-24 归档）、
   [[file:openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]（观测面扩展 S1 已完成，T1–T10，2026-10-25 归档）
 - 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]

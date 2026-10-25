@@ -17,7 +17,7 @@
 
 **非目标**：自动调优/自动禁用功能、跨机器数据汇聚、源码行级采样、记录按键序列与文件内容。
 
-当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **233** 用例全绿、0 skipped，`make lint` 零告警）。
+当前状态：**Phase 4（Review & Document）已完成并归档**（Emacs 31.1，`make full-check` 全绿，`make test` **234** 用例全绿、0 skipped，`make lint` 零告警）。
 观测面已从「时间」扩展到「时间 + 内存/GC + 启动 + 配置变更」（ADR-0004）：schema v2 增 4 表、
 GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-sig` 变更标记、采集器自监控（`hourly_health`）。
 **S2（亚秒级「命令外停转」可见）已实现**（ADR-0005）：schema **v3 增 `hourly_drift`（共 11 表）**、
@@ -34,17 +34,17 @@ drift 两档阈值计划见 `openspec/completed/add-drift-detection.md`（T1–T
 
 | 路径 | 用途 | 行数 / 状态 |
 |---|---|---|
-| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 372 行 / 19 defcustom（项目合计 21） |
+| `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 389 行 / 19 defcustom（项目合计 21） |
 | `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、启动打点、自监控计数 | 1327 行 |
 | `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 342 行 |
 | `el-chronos-store.el` | SQLite schema（v3，11 表 + 3 索引）、批量 flush、drift 小时聚合、保留策略、top-N 淘汰、purge 11 表 | 1477 行 |
 | `el-chronos-analysis.el` | 18 个只读聚合查询（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/会话/回归/GC/启动/健康/配置变更） | 822 行 |
-| `el-chronos-report.el` | org 报告（14 节，含「阻塞事件」节内的 drift 汇总行）、周报、CSV/JSON 导出（9 个区块）、按需高精度剖析、报告期间自观测抑制 | 1147 行 |
-| `el-chronos-web.el` | 最小 HTTP server（18 条路由 = 1 页 + 16 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1089 行 |
+| `el-chronos-report.el` | org 报告（14 节，含「阻塞事件」节内的 drift 汇总行）、周报、CSV/JSON 导出（9 个区块）、按需高精度剖析、报告期间自观测抑制 | 1151 行 |
+| `el-chronos-web.el` | 最小 HTTP server（18 条路由 = 1 页 + 16 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1093 行 |
 | `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 198 行 |
 | `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史 / drift 趋势） | 709 行 / 29 用例 |
 | `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 371 行 / 28 用例 |
-| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控 | 1562 行 / 65 用例 |
+| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控 | 1619 行 / 66 用例 |
 | `test/el-chronos-report-test.el` | org 报告 14 节、阻塞事件节内的 drift 汇总行、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 759 行 / 33 用例 |
 | `test/el-chronos-store-test.el` | schema/迁移（v0→v3、v1→v3、v2→v3 三条守门与回滚）/批量写入/drift 聚合/保留策略/top-N 淘汰/purge 11 表/`note-startup-ms` 补写 | 1654 行 / 60 用例 |
 | `test/el-chronos-web-test.el` | 内嵌 Web server（启停/路由/边界/loopback/自观测抑制/四个 v2 端点 + `/api/drift`） | 484 行 / 18 用例 |
@@ -146,10 +146,10 @@ make full-check     # check-parens + test
 
 全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。
 
-**当前基线**（实测 2026-10-25，本次基线回填时重测）：`make test` = **233 用例**（`Ran 233 tests, 233 results as expected, 0 unexpected`，约 10.6 秒，**0 skipped**）；
-分布：collect 65 / store 60 / report 33 / analysis 29 / attrib 28 / web 18 用例；
-行数：collect 1327 / store 1477 / report 1147 / web 1089 / analysis 822 / attrib 342 / 入口 372（源码 7 模块 **6576 行**）；
-测试：store 1654 / collect 1562 / report 759 / analysis 709 / web 484 / attrib 371 / helper 198（测试 7 文件 **5737 行**）；源码 + 测试合计 **12313 行**。
+**当前基线**（实测 2026-10-25，本次基线回填时重测）：`make test` = **234 用例**（`Ran 234 tests, 234 results as expected, 0 unexpected`，约 10.6 秒，**0 skipped**）；
+分布：collect 66 / store 60 / report 33 / analysis 29 / attrib 28 / web 18 用例；
+行数：collect 1327 / store 1477 / report 1151 / web 1093 / analysis 822 / attrib 342 / 入口 389（源码 7 模块 **6601 行**）；
+测试：store 1654 / collect 1619 / report 759 / analysis 709 / web 484 / attrib 371 / helper 198（测试 7 文件 **5794 行**）；源码 + 测试合计 **12395 行**。
 `make lint` **零告警**（14 个文件逐个字节编译）。新增或修改行为时基线只准上升，改测试要说明原因。
 
 **测试文件命名**：测试文件必须命名为 `test/*-test.el`；`make test` 通过 `$(sort $(wildcard test/*-test.el))` 自动发现该模式并按排序全部加载（无匹配时输出 `no test files` 并成功退出），禁止在 Makefile 里硬编码单个文件名（否则拆分测试后会静默漏跑）。
