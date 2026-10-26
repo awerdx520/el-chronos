@@ -48,6 +48,35 @@
   "「GC 与内存」节的降级说明。
 I11：无数据时**不省略整节**（与其它节的 `（无数据）' 占位等价，但更具体 —— 用户需要
 知道「没数据」的可能原因是 Emacs 版本低于 31.1、堆大小无从采集）。")
+(defconst el-chronos-report--resource-rows 10
+  "「资源（CPU / 内存 / 负载）」最多展示的桶数（取最近若干桶）。
+与 `el-chronos-report--gc-rows' 同为「取最近若干桶」的展示上限，但更短：资源节回答
+「本机资源画像」，十个桶足够看出趋势，完整桶序列走 CSV 导出
+（`el-chronos-report--csv-resources' 不截断）。")
+(defconst el-chronos-report--resource-degrade
+  "本期无进程资源数据（`hourly_resources' 为空；`el-chronos-resource-sampling' 关闭时不采集）。"
+  "「资源（CPU / 内存 / 负载）」节无数据时的降级说明。
+I11：无数据时**不省略整节**，并给出两个真实成因 —— 窗口内没有 `hourly_resources' 行
+（采集器尚未写入），或用户关掉了 `el-chronos-resource-sampling'（资源采样**默认开启**，
+`el-chronos-resource-sampling' 为 `t`，用户可自行关闭）。
+注意文案刻意不写裸 `nil'：报告正文出现 `nil' 字面量会与「无 nil 泄漏」的守门用例冲突，
+且对读者毫无信息量。")
+(defconst el-chronos-report--resource-caveats
+  (concat
+   "- 口径 ①：CPU% 是「窗口内 CPU 时间增量 / 墙钟增量」，不是瞬时利用率。\n"
+   "- 口径 ②：RSS 均值的分母是 `load_n'（成功取到负载的窗口数）；负载采集失败的桶\n"
+   "  均值显示 \"-\" —— 不得用峰值或 0 冒充（0 的含义是「观测到了，值为 0」）。\n"
+   "- 口径 ③：首窗口只建基线，会话启动后的第一个桶可能缺失，不等于「那一刻 CPU 为 0」。\n")
+  "「资源」节必须原样写出的三条口径（分析层 docstring 已声明的诚实性约束）。
+报告侧同样要可见：把 `-\" 当 0' 或把「窗口占比」当「瞬时利用率」是这类指标最常见的两种误读。")
+(defconst el-chronos-report--inclusive-rows 15
+  "「栈包含占比 TOP」最多展示的函数数。
+「热点函数 TOP」展示 20 条 self 榜；包含榜是补充视角（找调度者），15 条足够，
+再长只会把「差异最大的那几条」埋进噪声里。")
+(defconst el-chronos-report--inclusive-degrade
+  "本期无栈包含数据（`hourly_stacks' 为空）"
+  "「栈包含占比 TOP」子小节无数据时的降级说明。
+I11：无数据时不能静默省略整个子小节 —— 读者必须能区分「没有包含数据」与「这个功能不存在」。")
 (defconst el-chronos-report--empty "（无数据）" "空数据占位文本。")
 (defconst el-chronos-report--startup-load-rows 10
   "「启动分解」里包加载 TOP 最多展示的库数。
@@ -148,6 +177,19 @@ I11：无数据时**不省略整节**，且说明为什么可能没数据 ——
 (defun el-chronos-report--num (value)
   "把数字 VALUE 格式化为整数文本；非数字返回 \"-\"。"
   (if (numberp value) (format "%d" (round value)) "-"))
+(defun el-chronos-report--kb->human (kb)
+  "把千字节数 KB 格式化为 KB / MB / GB；非数字返回 \"-\"。
+与 `el-chronos-report--bytes->human' 分开是有意的：RSS 落库单位就是 KB（I4 只管时间，
+不把内存「统一成毫秒/字节」），换算成字节再格式化会在 1024 边界上引入半位误差。"
+  (cond ((not (numberp kb)) "-")
+        ((< (float kb) 1024.0) (format "%.0f KB" (float kb)))
+        ((< (float kb) 1048576.0) (format "%.1f MB" (/ (float kb) 1024.0)))
+        (t (format "%.2f GB" (/ (float kb) 1048576.0)))))
+(defun el-chronos-report--load (value)
+  "把系统负载值 VALUE 格式化为两位小数；非数字返回 \"-\"。
+非数字（该桶负载采集全失败、`load_n' 为 0）必须是 \"-\" 而不是 0 —— 0 的语义是
+「观测到了，值为 0」，用它冒充「没取到」会让「系统空闲」与「采集失败」无法区分。"
+  (if (numberp value) (format "%.2f" (float value)) "-"))
 (defun el-chronos-report--str (value)
   "把 VALUE 转成展示用字符串；nil 或空串返回 \"-\"。"
   (let ((text (and value (format "%s" value))))
@@ -187,13 +229,15 @@ I11：无数据时**不省略整节**，且说明为什么可能没数据 ——
                      (el-chronos-report--str value)))))
 
 (defun el-chronos-report--cell (row key kind)
-  "取 ROW 的 KEY 值并按 KIND 格式化：`str' `num' `ms' `pct' `time' `stack' `bytes' `raw'。"
+  "取 ROW 的 KEY 值并按 KIND 格式化。
+KIND 取 `str' `num' `ms' `pct' `time' `stack' `bytes' `kb' `load' `raw'。"
   (let ((value (plist-get row key)))
     (pcase kind
       ('str (el-chronos-report--str value)) ('num (el-chronos-report--num value))
       ('ms (el-chronos-report--ms->human value)) ('pct (el-chronos-report--pct value))
       ('time (el-chronos-report--time value)) ('stack (el-chronos-report--stack-text value))
-      ('bytes (el-chronos-report--bytes->human value)) (_ value))))
+      ('bytes (el-chronos-report--bytes->human value)) ('kb (el-chronos-report--kb->human value))
+      ('load (el-chronos-report--load value)) (_ value))))
 
 (defun el-chronos-report--rows (rows keys kinds)
   "把 ROWS（plist 列表）按 KEYS 与 KINDS 逐列格式化；ROWS 为 nil 时返回 nil。"
@@ -277,6 +321,110 @@ I11：无数据时**不省略整节**，且说明为什么可能没数据 ——
       (el-chronos-report--table-section
        "GC 与内存" '("时间" "GC 次数" "GC 耗时" "内存") rows)
     (concat "* GC 与内存\n" el-chronos-report--gc-degrade "\n\n")))
+
+(defun el-chronos-report--inclusive-rows (items)
+  "把 `el-chronos-analysis-inclusive-functions' 的结果 ITEMS 转成栈包含表行。
+取**前** `el-chronos-report--inclusive-rows' 条（该查询按包含样本数降序，与
+`el-chronos-report--gc-rows' 那种「取最近若干桶」的方向相反，因此用 `cl-subseq' 而非
+`last'）。每行 `函数 / 包或模块 / 包含% / 样本 / 栈数'。
+
+包或模块列就地走 `el-chronos-attrib-package' 归因：inclusive 查询只返回函数名，
+不带 `:package'（它的候选集来自 `hourly_functions' 的全部函数，含 `samples' 恒为 0 的
+中间帧，没有可直接沿用的归因列）。归因失败或符号已不存在时渲染 \"unknown\" ——
+这与采集层 `hourly_functions.package'（采集当时的归因）可能略有差异，属预期：
+报告展示的是「此刻还能反查到哪个包」，反查不到就诚实地说不知道。"
+  (cl-loop for item in (cl-subseq items 0 (min el-chronos-report--inclusive-rows
+                                               (length items)))
+           collect (list
+                    (el-chronos-report--str (plist-get item :function))
+                    (el-chronos-report--str
+                     (el-chronos-attrib-package
+                      (intern-soft (format "%s" (plist-get item :function)))))
+                    (el-chronos-report--pct (plist-get item :pct))
+                    (el-chronos-report--num (plist-get item :samples))
+                    (el-chronos-report--num (plist-get item :stacks)))))
+
+(defun el-chronos-report--inclusive-subsection (items)
+  "渲染 `** 栈包含占比 TOP' 子小节（嵌在「热点函数 TOP」`*' 节内，**不新增节**）。
+ITEMS 为 `el-chronos-analysis-inclusive-functions' 的结果或 nil。
+
+为什么是子小节而不是新节：self 排名与包含排名的**差异本身就是结论** —— 两块表必须并排
+才能读出「谁在算、谁在调度」，拆成两个 `*' 节会让它们看起来互不相干，还会把报告节数
+从 15 抬到 16（项目既有品味：不轻易加节，见「阻塞事件」节内的 drift 汇总行）。
+
+无数据时输出 `el-chronos-report--inclusive-degrade' 而不是静默省略（I11），且刻意不用
+`el-chronos-report--table' 的空分支 —— 那里的 `（无数据）' 通用占位说不出「为什么没有」。"
+  (let ((rows (and items (el-chronos-report--inclusive-rows items))))
+    (concat
+     "** 栈包含占比 TOP\n"
+     "按「该函数出现在多少比例的采样栈里」排序（分母是窗口内全部栈样本数）：\n"
+     "self 口径只数 leaf 样本，会低估「自己不吃 CPU、却驱动大量下游工作」的函数（典型例子：\n"
+     "把成本记在被调用 built-in 帧上的渲染回调）；栈包含口径给出真实影响面。两个数字差得远时，\n"
+     "该函数是调度者而非计算者。\n"
+     "\n"
+     (if rows
+         (el-chronos-report--table '("函数" "包/模块" "包含%" "样本" "栈数") rows)
+       (concat el-chronos-report--inclusive-degrade "\n"))
+     "\n")))
+
+(defun el-chronos-report--resource-rows (trend)
+  "把 `el-chronos-analysis-resource-trend' 的结果 TREND 转成「资源」节表格行。
+取最近 `el-chronos-report--resource-rows' 个桶（趋势按桶起点升序，故取 `last'）；
+TREND 为 nil 或无桶时返回 nil，由 `el-chronos-report--section-resources' 渲染降级说明。
+
+列与单位（I4 只管时间，后三列**不得**统一成毫秒）：`时间' / `CPU%'（窗口占比）/
+`RSS 峰值' / `RSS 均值'（均以 KB 为源值，展示时换 KB/MB/GB）/ `线程'（计数）/
+`负载 1m'（系统负载值）。`RSS 均值' / `负载 1m' 为 nil（该桶负载采集全失败）时渲染
+\"-\" —— 不得用 0 或峰值冒充。"
+  (let ((items (and trend (plist-get trend :buckets))))
+    (when items
+      (el-chronos-report--rows
+       (last items (min el-chronos-report--resource-rows (length items)))
+       '(:bucket :cpu-pct :rss-kb-max :rss-kb-avg :threads-max :load1-avg)
+       '(time pct kb kb num load)))))
+
+(defun el-chronos-report--resource-summary-line (summary)
+  "把 `el-chronos-analysis-resource-summary' 的结果 SUMMARY 渲染成一行窗口汇总。
+形如 `CPU 占用 X%（cpu N ms / 墙钟 M ms）· RSS 峰值 A · 线程峰值 T · 负载 1m/5m/15m = a/b/c'。
+CPU 时间与墙钟时间都按人类可读毫秒渲染（I4：毫秒是一切时间字段的存储单位，
+展示层才换算成 s）；负载取不到时对应位置是 \"-\"，不写 0。"
+  (format (concat "- CPU 占用 %s（cpu %s / 墙钟 %s）· RSS 峰值 %s · 线程峰值 %s"
+                  " · 负载 1m/5m/15m = %s/%s/%s\n")
+          (el-chronos-report--pct (plist-get summary :cpu-pct))
+          (el-chronos-report--ms->human (plist-get summary :cpu-ms))
+          (el-chronos-report--ms->human (plist-get summary :wall-ms))
+          (el-chronos-report--kb->human (plist-get summary :rss-kb-max))
+          (el-chronos-report--num (plist-get summary :threads-max))
+          (el-chronos-report--load (plist-get summary :load1-avg))
+          (el-chronos-report--load (plist-get summary :load5-avg))
+          (el-chronos-report--load (plist-get summary :load15-avg))))
+
+(defun el-chronos-report--section-resources (trend summary)
+  "渲染「资源（CPU / 内存 / 负载）」节。
+TREND 为 `el-chronos-analysis-resource-trend' 的结果、SUMMARY 为
+`el-chronos-analysis-resource-summary' 的结果，两者都可能为 nil（同一窗口、同源表，
+正常情况下同空同有）。
+
+位置：紧接「GC 与内存」之后、启动分解之前 —— 三者同属「本机资源画像」，相邻读起来最顺
+（GC 看堆、资源看 CPU/RSS/负载、启动看冷启动耗时）。
+
+正文三段：① 窗口汇总一行；② 最近若干桶的表格；③ `el-chronos-report--resource-caveats'
+三条口径（分析层 docstring 已声明，报告侧同样必须可见，否则读者会把窗口占比当瞬时利用率、
+把 \"-\" 当 0）。
+
+无数据时走 `el-chronos-report--resource-degrade' 可见降级（I11：不省略整节）。"
+  (if-let* ((info summary)
+            (rows (el-chronos-report--resource-rows trend)))
+      (concat
+       "* 资源（CPU / 内存 / 负载）\n"
+       (el-chronos-report--resource-summary-line info)
+       (format "\n最近 %d 个桶：\n" (length rows))
+       (el-chronos-report--table
+        '("时间" "CPU%" "RSS 峰值" "RSS 均值" "线程" "负载 1m") rows)
+       "\n"
+       el-chronos-report--resource-caveats
+       "\n")
+    (concat "* 资源（CPU / 内存 / 负载）\n" el-chronos-report--resource-degrade "\n\n")))
 
 (defun el-chronos-report--section-startup (breakdown)
   "渲染「启动分解」节；BREAKDOWN 为 `el-chronos-analysis-startup-breakdown' 的结果或 nil。
@@ -440,7 +588,10 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
          ;; 与趋势族相邻的理由：它们回答的是「这台机器这个时期的状态如何」，而不是单点明细。
          (startup (el-chronos-analysis-startup-breakdown nil))
          (health (el-chronos-analysis-health range))
-         (config-history (el-chronos-analysis-config-history range)))
+         (config-history (el-chronos-analysis-config-history range))
+         ;; 进程资源（CPU / RSS / 线程 / 负载）：与 gc-trend 同源窗口，紧随「GC 与内存」成节
+         (resource-trend (el-chronos-analysis-resource-trend range))
+         (resource-summary (el-chronos-analysis-resource-summary range)))
     (concat
      (format "#+TITLE: el-chronos 报告（近 %d 天）\n" (el-chronos-report--days range))
      (format "#+DATE: %s\n" (format-time-string "%Y-%m-%dT%H:%M:%S%z"))
@@ -454,6 +605,10 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
       "热点函数 TOP" '("函数" "包" "self" "样本" "占比")
       (el-chronos-report--rows (el-chronos-analysis-top-functions range 20)
        '(:function :package :self-ms :samples :pct) '(str str ms num pct)))
+     ;; 栈包含占比作为「热点函数 TOP」的 `**' 子小节嵌在同一节内（**不新增 `*' 节**）：
+     ;; self 榜与包含榜的差异本身就是结论（谁在算 vs 谁在调度），两块表必须并排读。
+     (el-chronos-report--inclusive-subsection
+      (el-chronos-analysis-inclusive-functions range el-chronos-report--inclusive-rows))
      (el-chronos-report--table-section
       "包归因" '("包" "self" "占比")
       (el-chronos-report--rows (el-chronos-analysis-package-breakdown range nil)
@@ -464,13 +619,15 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
        '(:bucket :samples :slow-commands :blocked) '(time num num num)))
      ;; 紧随「趋势」：同属时间桶视角，用户从「慢/阻塞」往下看自然想知道「是不是内存涨了」
      (el-chronos-report--section-gc gc-trend)
+     ;; 资源节紧接 GC：GC 看堆、资源看 CPU/RSS/负载，两者同属「本机资源画像」
+     (el-chronos-report--section-resources resource-trend resource-summary)
      ;; 启动分解 → 采集健康 → 配置变更：三节都是「本期健康 / 环境」类视角，紧随趋势族
      (el-chronos-report--section-startup startup)
      (el-chronos-report--section-health health)
      (el-chronos-report--section-config config-history)
      ;; 「阻塞事件」节内先给一行「命令外停转」汇总，再列 block 明细：两者同属「命令之外的
      ;; 停转」，只有放在一起读者才看得到完整图景（drift 覆盖 [500ms, 2000ms) 区间，block
-     ;; 覆盖 ≥2000ms）。**刻意不新增节**：报告已有 14 节，再拆一节只增加阅读负担，还会连带
+     ;; 覆盖 ≥2000ms）。**刻意不新增节**：报告已有 15 节，再拆一节只增加阅读负担，还会连带
      ;; 改一堆按节数断言的老用例。drift 摘要是独立信息 —— 即使下面的表格因无数据降级为
      ;; `（无数据）'，这一行也必须出现（I11：可见降级）。
      (concat
@@ -579,7 +736,10 @@ ROWS 输出原始值（不做人类可读格式化），便于下游解析。"
      el-chronos-analysis-trend nil (:bucket :samples :slow-commands :blocked))
     ("blocking-events" ("id" "ts_ms" "duration_ms" "kind" "command" "mode" "project")
      el-chronos-analysis-blocking-events 100 (:id :ts :duration-ms :kind :command :mode :project)))
-  "CSV 导出的 5 个区块：(区块名 表头 查询函数 LIMIT 字段)。")
+  "CSV 导出里**前** 5 个通用区块：(区块名 表头 查询函数 LIMIT 字段)。
+本常量只描述能用「查询 → 行 → 列」一条规格表达的区块，数量（5）不随新增手写区块变化；
+CSV 全文共 10 个区块，另外 5 个（startup / health / config-history / drift / resources）
+结构不齐整，由各自的 `--csv-*' 函数手写生成（见 `el-chronos-report--csv-string'）。")
 
 (defun el-chronos-report--csv-startup (breakdown)
   "生成「启动分解」CSV 区块（`# section: startup'）：阶段锚点与包加载 TOP 合成一张表。
@@ -647,13 +807,43 @@ DRIFT 为 nil 或无桶时**只输出表头**（I11：无数据不省略区块�
    (el-chronos-report--rows (plist-get drift :buckets)
                             '(:bucket :count :total-ms :max-ms) '(raw raw raw raw))))
 
+(defun el-chronos-report--csv-resources (trend)
+  "生成「进程资源」CSV 区块（`# section: resources'）。
+列：`bucket_ms' / `cpu_ms' / `wall_ms' / `cpu_pct' / `rss_kb_max' / `rss_kb_avg' /
+`threads_max' / `load1_avg' / `load5_avg' / `load15_avg' / `samples'；
+行取自 analysis 资源趋势的桶列表，**不截断**（org 报告只展示最近若干个桶，
+导出件要给下游完整序列）。
+
+单位（I4 只约束时间）：`bucket_ms' / `cpu_ms' / `wall_ms' 是毫秒；`rss_kb_*' 是 KB、
+`threads_max' 是计数、`load*-avg' 是系统负载值 —— 后三者**不要**顺手统一成毫秒。
+可空列（`rss_kb_avg' / `load*-avg' 在 `load_n' 为 0 的桶里是 nil）输出**空串**：
+空串表达「没观测到」，与「观测到 0」严格区分（不得写 0）。
+TREND 为 nil 或无桶时**只输出表头**（I11：无数据不省略区块）。
+
+区块位置固定在 CSV 末尾（drift 之后）：report 与 web 两处内联实现的区块名与顺序必须一致，
+`el-chronos-report-test-csv-sections-match-web' 会逐项比对。"
+  (el-chronos-report--csv-block
+   "resources"
+   '("bucket_ms" "cpu_ms" "wall_ms" "cpu_pct" "rss_kb_max" "rss_kb_avg"
+     "threads_max" "load1_avg" "load5_avg" "load15_avg" "samples")
+   (el-chronos-report--rows
+    (plist-get trend :buckets)
+    '(:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max
+      :load1-avg :load5-avg :load15-avg :samples)
+    '(raw raw raw raw raw raw raw raw raw raw raw))))
+
 (defun el-chronos-report--csv-string (range)
-  "生成 RANGE 的 CSV 全文：9 个区块用 `# section:' 注释行分隔；字段保持原始值。
+  "生成 RANGE 的 CSV 全文：10 个区块用 `# section:' 注释行分隔；字段保持原始值。
 前 5 个区块由 `el-chronos-report--csv-sections' 的通用规格生成（查询 → 行 → 列）；
-后 4 个（startup / health / config-history / drift）返回结构不齐整 —— 启动分解是两段嵌套
-列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 的桶在 `:buckets' 键下，
-且启动分解不吃 RANGE —— 各自手写区块生成函数，而不是硬塞进通用规格。
-drift 放在末尾：它与 web 侧的同名区块必须**位置一致**（顺序也是被断言的不变量）。"
+后 5 个（startup / health / config-history / drift / resources）返回结构不齐整 ——
+启动分解是两段嵌套列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 与
+resources 的桶都在 `:buckets' 键下，且启动分解不吃 RANGE —— 各自手写区块生成函数，
+而不是硬塞进通用规格。
+
+末尾两块的位置（drift 然后 resources）是**被断言的不变量**：它与 web 侧同名区块必须
+逐字、逐序一致（`el-chronos-report-test-csv-sections-match-web'）。resources 放最后
+而不是紧邻 trend：它是「进程资源」的完整序列，与前九块（计数 / 耗时 / 停转）不属于
+同一类读数，放末尾便于下游按区块名取用、也避免与前九块的顺序语义混淆。"
   (concat
    (mapconcat
     (lambda (spec)
@@ -667,7 +857,9 @@ drift 放在末尾：它与 web 侧的同名区块必须**位置一致**（顺�
    (el-chronos-report--csv-health (el-chronos-analysis-health range))
    (el-chronos-report--csv-config-history (el-chronos-analysis-config-history range))
    ;; 命令外停转（drift）：与 org 报告「阻塞事件」节内的那一行汇总同源
-   (el-chronos-report--csv-drift (el-chronos-analysis-drift-trend range))))
+   (el-chronos-report--csv-drift (el-chronos-analysis-drift-trend range))
+   ;; 进程资源：与 web 侧同名区块逐字对齐（位置也在最末）
+   (el-chronos-report--csv-resources (el-chronos-analysis-resource-trend range))))
 
 (defun el-chronos-report--json-value (value)
   "把 VALUE 递归转成 `json-serialize' 友好形态。

@@ -4,13 +4,15 @@
 #+OPTIONS: toc:3 num:nil
 
 #+BEGIN_QUOTE
-状态：**Phase 4（Review & Document）已完成；观测面扩展（schema v2）已实现并实测**（2026-10-25，
-GNU Emacs 31.1）。本文件描述分层、**六条采集路径**、可视化数据流、**实测结论**与**已知偏差**；
-不变量与字段定义以
+状态：**Phase 4（Review & Document）已完成；观测面扩展（schema v2 / v3 / v4）已实现并实测**
+（2026-10-26，GNU Emacs 31.1）。本文件描述分层、**七条采集路径**、可视化数据流、**实测结论**与
+**已知偏差**；不变量与字段定义以
 [[file:../openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]] 为准
 （v2 扩展的设计与决策见
 [[file:../openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]
-与 [[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]），
+与 [[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]；
+v3 见 [[file:adr/0005-two-tier-block-detection.md][docs/adr/0005-two-tier-block-detection.md]]；
+v4 见 [[file:adr/0006-resource-observation.md][docs/adr/0006-resource-observation.md]]），
 对外接口见 [[file:api.org][docs/api.org]]，界面与路由见 [[file:ui.org][docs/ui.org]]。
 尚未实测的项集中在文末「待补」清单，与 [[file:../openspec/tech-debt.md][openspec/tech-debt.md]] 的 TD 编号对应。
 #+END_QUOTE
@@ -23,15 +25,18 @@ GNU Emacs 31.1）。本文件描述分层、**六条采集路径**、可视化�
 |-----------------+-------------------------+-----------------------------+---------------------------------------+----------------------------------|
 | 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调、=after-load-functions=、=gcs-done= / =gc-elapsed= / =garbage-collect-heapsize= | 内存中的事件与小时聚合桶（含 GC / 健康计数 / 启动阶段与 load 明细 / **命令外停转 drift 判定**） | 只读环境、写内存                    |
 | 归因 attrib      | =el-chronos-attrib.el=    | 符号名、buffer               | file / package / mode / project 字符串 | 无（缓存 hash table）              |
-| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v3 共 11 表：v2 新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=，v3 新增 =hourly_drift=） | 唯一允许写盘的一层（I3）             |
-| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（18 个查询）               | 只读数据库                         |
-| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（14 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
-| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（18 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
+| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v4 共 12 表：v2 新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=，v3 新增 =hourly_drift=，v4 新增 =hourly_resources=） | 唯一允许写盘的一层（I3）             |
+| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（21 个查询）               | 只读数据库                         |
+| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（15 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
+| 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（19 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
+| 启动探针 probe   | =el-chronos-startup-probe.el= | =after-load-functions= / 三个启动钩子 | 内存中的锚点与按库累计耗时（不开库、不写库） | **零依赖**：不 require 任何 el-chronos 模块，也不 require =cl-lib= / =subr-x= |
 
 数据流： =collect → attrib（补元数据）→ store（小时聚合落库）→ analysis（查询）→ report / web（两种呈现形态，共享同一 analysis 查询层）= 。
+此外有一条**旁路**：=startup-probe=（由用户在 =early-init.el= 里加载）→ 内存数据 → =collect= 主动
+=take= → =store=。探针不在 =el-chronos-mode= 生命周期内（I5 例外，见 ADR-0006 D1）。
 =attrib= 是被动依赖（collect 调它补上下文），不被 store 反向调用。
 
-* 采集时序：六条路径
+* 采集时序：七条路径
 
 ** 路径 1：启动（每会话一次）
 
@@ -117,6 +122,9 @@ drift 是 500 − 偏移 ∈ **[250, 500]ms**；两档的记录值高估上界�
 
 ** 路径 5：启动打点（每次启动一次，与路径 1 同源）
 
+**装了 =early-init= 探针时，本节描述的采集侧钩子一个都不挂**（探针的覆盖范围更大），
+见下方「启动探针（early-init 路径）」节；本节描述的是**探针缺失时**的现状路径。
+
 1. **前置判定（最关键的一条）**：=collect-start= 执行时若 =after-init-time= 已非 nil，说明启动基本
    结束（=startup.el= 先 =setq after-init-time=、紧接着跑 =after-init-hook=，两行都在 init 文件加载
    之后）→ **一个启动钩子都不挂**，只记 =mode-start= 锚点。否则那 30 秒兜底窗口里用户
@@ -157,6 +165,108 @@ after a full GC cycle」——即它**只读、不做**。**禁止调 =garbage-c
 等于观测器替用户改变运行时行为，还污染自己刚记录的数据），**禁止用 =memory-info=**（那是**系统
 内存** =TOTAL-RAM FREE-RAM TOTAL-SWAP FREE-SWAP=，不是 Emacs 堆；remote =default-directory= 下
 还有触发 TRAMP 远端查询的风险）。
+
+** 路径 7：进程资源采集（每个采样 tick，与路径 4 / 6 同一回调，但独立于 =sampling-p=）
+
+1. **触发点：复用既有的 10 秒采样 timer，不新增 timer**。调用点在 =--sample-tick= 里与
+   =--collect-gc= 并列，**同样在其 =(when el-chronos-collect--sampling-p …)= 之外**
+   —— 理由与路径 6 一字不差（profiler 启动失败时资源趋势不该跟着陪葬）。
+   为什么不新增 timer：实测结论 13 第 4 条 —— 成本集中在**事件循环唤醒**（87 µs / 次），
+   回调本身只占 0.42 µs，要加采集就合并到同一个 timer，而不是另起一个。
+2. **取数只用两个内置函数，零副作用、只查自己**：
+   - =(process-attributes (emacs-pid))= → =time=（累计 CPU 时间 cons）、=rss=（KB）、
+     =thcount=（线程数）；**只查自己**，绝不遍历全系统进程、不读命令行、不读 buffer；
+   - =(load-average t)= → 1 / 5 / 15 分钟负载。
+3. **TRAMP 守卫（必须有，不是防御性设计）**：整段取数包在
+   =(let ((default-directory temporary-file-directory)) …)= 里。=process-attributes= 的
+   docstring 明确「=default-directory= 指向远端时 PID 被当作**远端主机**上的进程」，
+   而 =--sample-tick= 的 timer 捕获的是**创建时**的 =default-directory= ——
+   用户在 TRAMP buffer 里启用模式就会把它带进来。不守的后果是去查远端同号进程
+   （取到别人的数）或直接卡在 TRAMP 上。
+4. **逐字段判空**：任一项取不到（平台不支持 / 读失败）时该字段传 =nil= = 「本窗口没采到」，
+   由 store 落 NULL 并用 =COALESCE= 保住上一次观测值 —— **绝不用 0 冒充**（0 会把峰值与
+   均值拉偏）。=load-average= 可能抛错（部分平台未实现）→ 吞掉，本窗口三个负载字段不参与。
+5. **首窗口只建基线、不写库**：=time= 是启动至今的累计值，直接当增量会把开机以来的 CPU
+   全算进一个窗口（与 =--collect-gc= 同一口径）。
+6. **=cpu_ms= / =wall_ms= 求比率的做法**：两者都是本窗口的**增量**（毫秒），
+   =cpu_ms = Δtime × 1000=、=wall_ms = Δ墙钟 × 1000=，比值即该小时的进程 CPU 占用率。
+   **存两个原始增量、比值在查询层算**（SQL：=SUM(cpu_ms) / SUM(wall_ms)=）：
+   各桶的窗口总时长不同，先算单窗比率再平均是错的（见 [[file:schema.org][docs/schema.org]]「查询 4」）。
+7. **为什么不用 =pcpu=**：=pcpu= 与 =time= 同出于 =process-attributes=，但 =pcpu= 是
+   「进程**启动至今**的累计百分比」。本表的值要按小时桶累积、跨小时与跨天对比，
+   累计百分比会把**早期的高 CPU 永久摊进后续每一个窗口** —— 一次启动期编译之后，
+   整天的曲线都抬不起来。增量差分（=time=）没有这种记忆效应，且除以 =wall_ms= 后
+   在诊断上等价。
+8. 自身 =condition-case=（I6）：失败只限流告警，不向宿主抛错，也不终止 timer。
+
+** 启动探针（early-init 路径）—— 路径 5 的可选前置
+
+探针是**可选**的侧文件（=el-chronos-startup-probe.el=，零依赖），由用户在 =early-init.el= 里
+一行 =(load … t t t)= 加载。它在 =early-init= 期就上岗，因此能测到 init 主体（路径 5 观测不到）。
+
+**1. 为什么必须在 =early-init=（而不是 mode 启用时）**
+
+=startup.el= 先 =(setq after-init-time (current-time))=、紧接着跑 =after-init-hook=，
+两行都在 init 文件加载**之后**。用户（含本机配置）常用 =(add-hook 'emacs-startup-hook
+#'el-chronos-mode)= 启动 mode —— 那时 =after-init-time= 已非 nil，路径 5 的采集侧**一个
+启动钩子都不挂**（否则日常加载会被记成「启动期 load」），=startup_phases= 里只剩一个
+=mode-start= 锚点。
+
+**本机实测证据（2026-10-26，=~/.local/state/chronos/chronos.sqlite=，schema v3）**：
+=startup_phases= 共 **20 个会话、20 行**，=phase= 分布只有 =mode-start | 20=，
+=load:*= 行 **0 条**，且「只有 =mode-start= 一个锚点」的会话 = **20/20**。
+即：不装探针时启动分解在本机**完全不可用**（不是「数据少」，是一条都没有）。
+
+**2. 职责切分（谁负责什么）**
+
+| 职责 | 探针 | collect |
+|---|---|---|
+| early-init 起的加载打点 | ✅ =after-load-functions= | ❌ 观测不到自己被加载之前的事 |
+| 三个锚点 =early-init= / =after-init= / =startup= | ✅ | 只有 =mode-start= 与（可选）=first-idle= |
+| 会话 / 数据库 | ❌ **不开库、不建库、不写库** | ✅ 唯一写盘的一层（I3） |
+| 截断到 top-N、upsert 落库 | ❌ | ✅ =--startup-take-probe= |
+| 生命周期收尾 | ✅ 三条自证路径 + =--finish= | ❌ 探针不在 =el-chronos-mode= 生命周期内（I5 例外） |
+
+**3. =take= 的增量语义（与 =data= 的只读语义相对）**
+
+- =el-chronos-startup-probe-data=：**纯只读**，不清空不重置，可反复调用拿同一份数据（排障 / 断言用）。
+- =el-chronos-startup-probe-take=：
+  - =:anchors= —— **只读不重置**：重复 take 返回同一份锚点；写库侧靠 =startup_phases= 的
+    主键 =(session_id, phase)= upsert 吸收幂等（清空反而会丢「首次到达时刻」）；
+  - =:loads= —— **取走即清空**（=clrhash=）：支持多次增量 take，第二次 take 的 =:loads= 为空；
+  - =:captured-p= —— 与是否清空无关（在清空前算好）。
+
+**4. 三条收尾路径（都汇到 =--finish=）**
+
+| 路径 | 触发 | 兜住的情形 |
+|---|---|---|
+| ① 正常 | =emacs-startup-hook= 回调 → 自摘 =emacs-startup-hook= / =after-init-hook=、记 =startup= 锚点、登记 **0 秒 timer** 调 =--finish= | 常规启动 |
+| ② =load-count= 达 **800** | =after-load-functions= 回调内计数 | 「=emacs-startup-hook= 永不触发」的病态情形。**不是业务阈值，不可配置** |
+| ③ =after-init-hook= 里登记的 **30 秒兜底 timer** | init 报错时 =emacs-startup-hook= 不会跑 | 启动中断 |
+
+=--finish= **幂等**：摘 =after-load-functions=、=cancel-timer= **两个** timer
+（=--finish-timer= 与 =--fallback-timer=，漏一个就是探针侧遗留 timer）、置 =--done-p=。
+
+**5. =--finish= 软调用 collect 补写增量**
+
+=--finish= 末尾用 =(when (fboundp 'el-chronos-collect--startup-take-probe) …)= **软调用**
+collect（探针**不 require** 任何 el-chronos 模块，early-init 期 =straight/build-*= 还没建立）：
+把「首次 take 之后到本次收尾之间」又加载的包补写掉 —— 那批加载没有人拉取，只能由探针交棒。
+collect 未加载（用户压根没启用 mode）则什么都不做，数据留内存等后续 take。
+
+**6. 覆盖终点是「最后一次 take 时刻」，不是「启动结束」**
+
+探针的自摘发生在 =startup= 锚点之后 **0 秒 timer** 里，因此 =load:*= 明细只覆盖到
+**最后一次 =take= 的时刻**；=startup= 锚点之后到事件循环之间的少量加载
+（如用户 =emacs-startup-hook= 里的惰性 require）可能缺失。这是「探针提前到 early-init
+也不覆盖最后一毫秒」的残留边界，**不是 bug**（TD-16）。
+
+**7. 硬编码路径的静默降级点**
+
+=thomas-emacs/early-init.el= 里写死本仓库的**绝对路径**；仓库改名 / 搬迁后
+=(load … t t t)= 按 NOERROR 语义**静默失败**，表现为 =load:*= 明细又变回 0 条，
+而其余观测照常工作。排障口诀：**=load:*= 为 0 → 先确认 =early-init.el= 里那条路径存在**、
+且 =THOMAS_EMACS_INSTANCE= 守卫没跳过它（见 [[file:operations.org][docs/operations.org]]「启动探针的安装」）。
 
 ** 采样归因口径（nil 帧 / C 原语 / 闭包叶子）
 
@@ -378,12 +488,18 @@ web 侧是**内联重复实现**而非复用 report 的宏；任何一处改动�
 **误差模型**（用 B / G 的「预测值 vs 实测值」对齐验证，误差 ≤0.2ms）：
 记录值 = 真实停转 + 偏移，偏移 = 阻塞开始时刻 − **上一次成功心跳**时刻，取值 [0, 1 心跳间隔 + 抖动]。
 因此：
-1. 记录值**系统性高估**，上界 ≈ 一个心跳间隔（默认 1s）；最短可高估 61%（G：1.6s → 2.58s）；
-2. 检出下界 = 阈值 − 偏移：最差相位（阻塞紧接一次心跳之后开始）需真实停转 > 2s，最好相位约 0.95s；
+1. 记录值**系统性高估**，上界 ≈ 一个心跳间隔（v3 起心跳间隔为 250ms，故当前上界 ≈ 250ms）。
+   本段与下条里的实测数字——G 的 973.9ms 偏移、A3 / B / B3 / D 的高估量、下面的 61%——全部取自
+   1s 心跳时代；切到 250ms 之后未重测，只按「上界 ∝ 心跳间隔」推算。
+   1s 心跳下最短可高估 61%（G：1.6s → 2.58s）；
+2. 检出下界 = 阈值 − 偏移：最差相位（阻塞紧接一次心跳之后开始）需真实停转 > 2s，最好相位约 0.95s
+   （实测同为 1s 心跳下；按 250ms 心跳推算，最佳相位的检出下界升到 2s − 250ms = 1.75s，
+   即短停转更难被 block 抓到——未重测）；
 3. 心跳只能证明「主线程停了 N 秒」：事件里 =command= 与 =stack_json= 恒为 NULL，
    定位靠同一时间窗的 =hourly_functions= / =hourly_stacks= 采样（见实测结论 1 与 F 场景）。
 
-**双记**：命令内停转 ≥ 2s 时既记 =kind='command'=（精确）又记 =kind='block'=（高估 ≤1s）。
+**双记**：命令内停转 ≥ 2s 时既记 =kind='command'=（精确）又记 =kind='block'=（高估 ≤ 一个心跳间隔：
+1s 心跳时代实测 ≤1s，250ms 心跳下 ≤250ms）。
 两者是不同口径（「这条命令慢」vs「主线程停转」），单看一类不算错；但**把两列相加**当总卡顿时长会重复计数。
 
 **覆盖不到的三类**：
@@ -577,6 +693,47 @@ daemon 的真实主循环**：batch 下唤醒路径更短（无 redisplay、无�
 - =--startup-library= 对**已经去掉目录**的 basename 又做两次扩展名剥除 + 一次正则匹配，属
   纯冗余。同上：等真有「启动耗时」预算压力再动。
 
+** 14. =process-attributes= 在本机实际返回哪些 key（2026-10-26 实测）
+
+路径 7 的取数依赖 =(process-attributes (emacs-pid))= 的返回键名，而不同平台 / Emacs 版本
+返回的键集**不完全一致**（docstring 也按平台条件描述）。因此先实测本机实际键集，再按实测值
+决定用哪几个、以及 `--collect-resources` 的逐字段判空是否必要。
+
+实测命令（=emacs -Q --batch=，GNU Emacs 31.1，WSL2 / Linux）：
+
+#+BEGIN_SRC sh
+emacs -Q --batch --eval '(prin1 (mapcar (lambda (c) (car c)) (process-attributes (emacs-pid))))'
+#+END_SRC
+
+原文返回（共 **31** 个 key，顺序即返回顺序）：
+
+#+BEGIN_SRC text
+(args pmem rss vsize thcount nice pri pcpu etime start ctime cstime cutime time
+ stime utime cmajflt cminflt majflt minflt tpgid ttname sess pgrp ppid state
+ comm group egid user euid)
+#+END_SRC
+
+| key | 本机是否出现 | 本项目的用法 |
+|---|---|---|
+| =time= | ✅ 出现（**cons**，=(HIGH LOW USEC)=） | **采用**：累计 CPU 时间，差分得 =cpu_ms=（路径 7 第 6 条）。cons 型必须 =(time-subtract)=，不能当数字 |
+| =rss= | ✅ 出现（整数，**单位 KB**） | **采用**：=rss_kb_max= / =rss_kb_sum=。单位是 KB 而非字节，前端不能套字节换算 |
+| =thcount= | ✅ 出现（整数） | **采用**：=threads_max= |
+| =pcpu= | ✅ 出现 | **不用**：进程启动至今的**累计**百分比，有记忆效应（路径 7 第 7 条） |
+| =pmem= | ✅ 出现 | **不用**：系统内存占比，正是「不采系统内存」要避开的口径 |
+| =vsize= | ✅ 出现 | **不用**：虚拟地址空间，对「越用越胖」的判断不如 RSS 直接 |
+| =etime= / =start= / =ctime= / =stime= / =utime= / =cutime= / =cstime= | ✅ 出现 | **不用**：与 =time= 信息重叠，本项目只需要一个单调累计量做差分 |
+| =args= / =comm= / =user= / =euid= / =egid= / =group= / =sess= / =pgrp= / =ppid= / =state= / =nice= / =pri= / =ttname= / =tpgid= / =sess= / =*flt= / =minflt= / =majflt= | ✅ 出现 | **不用**：涉及进程身份 / 调度 / 缺页统计，与本项目观测目标无关，且 =args= / =user= 属隐私面（I7）—— 即便取到也不落库 |
+| 系统负载 1 / 5 / 15 | —— 不在本接口 | 由 =(load-average t)= 单独取（返回 =(1m 5m 15m)= 三个浮点） |
+
+两条可复用结论：
+
+1. **键集必须实测，不能凭 docstring 假设**：本机确实同时给了 =rss= / =thcount= / =time= /
+   =pcpu=，但「某个键一定在」不能当作前提 —— =--collect-resources= 因此对每个字段
+   单独 =(cdr (assq 'KEY attrs))= 取并判 =numberp=，缺字段/类型异常只传 =nil=
+   （store 落 NULL、=COALESCE= 保旧值），**不用 0 冒充**。
+2. **=time= 是 cons 不是数字**（=(HIGH LOW USEC)=）：早期若按数字相减会直接报类型错误，
+   实际实现走 =(time-subtract= new old)= 再 ×1000 得毫秒；首次调用只建基线（路径 7 第 5 条）。
+
 * 已知偏差（有意为之，不是 bug）
 
 | 偏差 | 具体表现 | 原因 / 处置 |
@@ -584,6 +741,7 @@ daemon 的真实主循环**：batch 下唤醒路径更短（无 redisplay、无�
 | =total_ms= ≠ =profiler-report= 的 total 列 | 本模块 total 按**栈内去重**（同一函数在一条栈里出现多次只算一次），内置报告按每帧累加 | TD-10。去重口径才符合「经过该函数的样本数」语义，避免深递归函数的 total 被重复帧放大。**不打算对齐**；跨工具对比时以 self 为准 |
 | =samples= 是 self 口径 | =samples= = 该函数作为 **leaf** 被采样的次数；只作中间帧出现的函数 =samples= 恒为 0 而 =total_ms= > 0 | 有意如此：占比与回归判定都按 self 口径，避免「出现得多但自己不耗时」的函数虚高。恒有 =self_ms = samples × 采样间隔=，全表 =samples= 求和 = 窗口内真实样本总数（可直接作分母） |
 | 阻塞事件没有栈、也没有命令 | =slow_events(kind='block')= 的 =stack_json= 与 =command= 一律为 NULL，只有 =context_json= 里的 mode / project | I2 的必然结果（停转期间没有可靠 Lisp 回调）。心跳只能证明「停了 N 秒」；定位要靠同一时间窗的 =hourly_functions= / =hourly_stacks= 采样。覆盖率与误差已实测（TD-2，见实测结论 10） |
+| **命令型慢事件的 =stack_json= 恒 NULL（v4 起，对外可见）** | =slow_events(kind='command')= 的 =stack_json= 现在**一律写 NULL**：结算时刻命令帧已弹出，原记录的全是采集器自身帧（=--post-command → --finish → --safe-apply → --current-stack → backtrace-frames=） | 命令执行期的栈**无法在结算时刻事后取得**，该字段对 command 类事件不携带信息。实测旧数据 **522/522** 行（本机库，2026-10-26）全是自身帧。命令归属改查 =hourly_stacks= 的同时段样本（按命令窗口切分采样见 tech-debt）。**消费该字段的外部脚本会看到差异**；=kind='block'= 本来就恒 NULL（上一行） |
 | 剖析期间会取走一个采集窗口的样本 | =el-chronos-profile-command= 在观测器运行时复用共享 profiler：先取走当前窗口（该窗口样本归剖析），跑完命令再取差分 | 共享模式下不能重入 =profiler-cpu-start=（见实测结论 2）。代价是剖析期间的那一个采集窗口在 =hourly_functions= 上偏少甚至为空；单命令剖析是低频手动操作，接受此偏差 |
 | 回归判定窗口与显示范围无关 | =el-chronos-analysis-regressions= 忽略 =RANGE=，窗口由 =el-chronos-regression-window-days= 决定 | 报告节标题动态标注真实天数（=回归（近 N 天）=），避免误读 |
 | =db-size= 只看主文件 | 不含 =-wal= / =-shm=，WAL 未 checkpoint 时主文件偏小 | 见 [[file:operations.org][docs/operations.org]]「排障」；要收敛体积跑 =el-chronos-store-vacuum= |
@@ -592,7 +750,9 @@ daemon 的真实主循环**：batch 下唤醒路径更短（无 redisplay、无�
 | =redisplay_internal (C function)= 进入回归判定 | 该符号归 =built-in= 后不再被 =regressions= 的 SQL 排除（SQL 仅排除 =Automatic GC=）；其 self 波动超阈值会出现「回归」 | 这是正确行为——redisplay 确实是耗时大户；看回归列表时需知道 built-in 项可能命中的是 Emacs 自身而非用户配置。口径见本节「采样归因口径」 |
 | **启动分解的包加载耗时是近似归因** | =startup_phases= 里 =load:<library>= 行的耗时，是相邻两次 =after-load-functions= 回调的**时间差** | 差值里含**前一个文件**的收尾逻辑与它触发的钩子执行，不是精确的单文件 load 耗时。用途是定位「哪个包的加载量级最大」，不适合做逐文件预算对齐 |
 | =heap_bytes= 仅 Emacs 31.1+ 有值 | 更低版本该列**恒 NULL**，=gc-trend= 的 =:heap-bytes= 也就恒为 nil | 采集层用 =(fboundp 'garbage-collect-heapsize)= 守卫，函数不存在就不采、不报错（I6）。**不是数据丢失**；跨版本混图时曲线出现的是**空洞**（部分会话有堆值），应按 =sessions.emacs_version= 分组阅读，不要读成「内存没长」 |
-| 启动分解覆盖范围受加载时机限制 | 只有 mode 在 =after-init-hook= **之前**启用才记包加载明细；在启动结束之后启用（例如 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=）时，=startup_phases= **只有 =mode-start= 一个锚点** | 事实依据：=startup.el= 第 1707 行先 =(setq after-init-time (current-time))=、第 1708 行才 =(run-hooks 'after-init-hook)=，两行都在 init 文件加载**之后** → =collect-start= 时启动已结束，于是**一个启动钩子都不挂**（否则后续交互触发的 load 会被记成「启动期 load」）。观测器无法观测自己被加载之前的事，见 [[file:operations.org][docs/operations.org]]「启动分解的物理边界」 |
+| 启动分解覆盖范围受加载时机限制 | 只有 mode 在 =after-init-hook= **之前**启用才记包加载明细；在启动结束之后启用（例如 =(add-hook 'emacs-startup-hook #'el-chronos-mode)=）时，=startup_phases= **只有 =mode-start= 一个锚点** | 事实依据：=startup.el= 第 1707 行先 =(setq after-init-time (current-time))=、第 1708 行才 =(run-hooks 'after-init-hook)=，两行都在 init 文件加载**之后** → =collect-start= 时启动已结束，于是**一个启动钩子都不挂**（否则后续交互触发的 load 会被记成「启动期 load」）。观测器无法观测自己被加载之前的事，见 [[file:operations.org][docs/operations.org]]「启动分解的物理边界」。**本机实测 20/20 会话只有 =mode-start=**（2026-10-26），故推荐装 =early-init= 探针 |
+| **探针路径的覆盖终点不是「启动结束」** | 装了 =early-init= 探针后 =load:*= 明细覆盖 =early-init= 起的完整加载，但**只到「最后一次 take 时刻」**：探针在 =startup= 锚点后 **0 秒 timer** 里自摘，之后的少量加载（如用户 =emacs-startup-hook= 里的惰性 require）可能缺失 | 自摘必须发生在 =startup= 锚点之后（否则锚点本身记不到），而自摘后就再不记新加载。这是「探针提前到 early-init 也不覆盖最后一毫秒」的**残留边界，不是 bug**（TD-16）。排障时不要把「最后几个惰性 require 没进 =startup_phases=」当丢数据 |
+| **资源均值的分母是 =load_n=，不是窗口数** | =hourly_resources= 的 =rss_kb_sum= / =load1_sum= / =load5_sum= / =load15_sum= 一律除以 **=load_n=**（成功取到 =load-average= 的窗口数）；=load_n = 0 时均值是 **NULL 而不是 0**，报告与 Web 渲染 =-= | I11：不做「负载 0」的假象。已知后果：负载采集全部失败的时段，**RSS 均值同样为 NULL**（刻意的诚实降级；独立的 =rss_n= 列见 tech-debt）。同理 CPU% 必须先 =SUM(cpu_ms) / SUM(wall_ms)= 再算比值，不能对单窗比率取平均 |
 | 首个采样窗口只建基线 | 会话第一个采样 tick 只记录 =gcs-done= / =gc-elapsed= 基线、按 0 差值入库，因此最多丢 ≤1 个窗口的 GC 增量 | 计数器是单调全局量，没有上一次基线就没有差值可比。表现为可能出现 =gc-count= / =gc-ms= 全 0 的桶（**基线桶**，不等于「没有发生 GC」）；同源说明见 =el-chronos-analysis-gc-trend= 的 docstring |
 | **命令内时间被 =--finish= 的重置切掉** | =block= 与 =drift= **只覆盖命令之外**的停转：命令执行期间的时间根本不进入心跳 =gap=（基线在结算时被推到当前时刻）。因此命令内的 0.5–2s 停转既不进 =hourly_drift= 也不进 =slow_events(kind='block')= | 这是**有意为之的结构性取舍**（ADR-0005 D4/D7）：命令内停转由 =commands= 的 =duration_ms= 独占（≥200ms 另进 =slow_events(kind='command')=），**双记（TD-11 ③）由此结构性消除**。**代价是跨版本不可直接比较**：v3 之前的 =slow_events(kind='block')= 含命令内停转（与 =kind='command'= 双记），v3 之后只有命令外 —— 做趋势对比必须按时间点切开，否则会误读成「阻塞变少了」。同理 =block= / =drift= 的时长与 =commands= 的耗时**不可相加** |
 | **连续命令流中的累计卡顿不可见** | 卡顿分散在几十条 20–50ms 的连续命令里（总 1.5s、**单条都不慢**）时：每条命令都进不了 =slow_events=（<200ms 阈值）、命令时间又被基线重置切掉 → block / drift 与 =slow_events= **都看不到** | 方案 B（重置换判据）的**结构性能力损失**：判据方案至少能在命令内记 block，重置方案不能。这类卡顿只能查 =commands= 的**时间戳密度**（按小时聚合已有，但需人工解读时间戳聚类）。登记 tech-debt；不要把它当成「采集器坏了」 |

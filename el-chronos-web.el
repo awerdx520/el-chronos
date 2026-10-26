@@ -251,13 +251,14 @@ Web 层只在一个场合写它：请求处理结束后重设基线，避免「�
     ("/api/drift" . el-chronos-web--route-drift)
     ("/api/regressions" . el-chronos-web--route-regressions)
     ("/api/gc" . el-chronos-web--route-gc)
+    ("/api/resources" . el-chronos-web--route-resources)
     ("/api/startup" . el-chronos-web--route-startup)
     ("/api/health" . el-chronos-web--route-health)
     ("/api/config-history" . el-chronos-web--route-config-history)
     ("/api/event" . el-chronos-web--route-event)
     ("/api/export.csv" . el-chronos-web--route-export-csv))
   "路由表：路径 → 处理函数。全部只读，没有任何写入 / 执行入口。
-共 18 条（1 条 HTML + 16 条 JSON + 1 条 CSV）；新增路由必须同步 `docs/ui.org' 的路由表。")
+共 19 条（1 条 HTML + 17 条 JSON + 1 条 CSV）；新增路由必须同步 `docs/ui.org' 的路由表。")
 
 (defun el-chronos-web--dispatch (req)
   "把解析后的请求 REQ 分发到路由，返回响应 plist。
@@ -474,14 +475,41 @@ HISTORY 为 nil 时只输出表头；此处**不做** `/api/config-history' 的 
    (el-chronos-web--csv-rows (plist-get drift :buckets)
                              '(:bucket :count :total-ms :max-ms))))
 
+(defun el-chronos-web--csv-resources (trend)
+  "生成「进程资源」CSV 区块（`# section: resources'）。
+列：`bucket_ms' / `cpu_ms' / `wall_ms' / `cpu_pct' / `rss_kb_max' / `rss_kb_avg' /
+`threads_max' / `load1_avg' / `load5_avg' / `load15_avg' / `samples'；
+行取自 analysis 资源趋势的桶列表，不截断（与 report 侧同）。
+
+与 `el-chronos-report--csv-resources' 是**内联重复实现**（web 刻意不 require report，
+见文件头取舍）：**区块名、表头、列顺序、行生成逻辑必须两处完全相同**，位置也都在
+CSV 末尾（drift 之后）—— 改任何一处都要同步另一处，`el-chronos-report-test-csv-sections-match-web'
+会抓区块名/顺序漂移。
+单位（I4 只约束时间）：`bucket_ms' / `cpu_ms' / `wall_ms' 毫秒，`rss_kb_*' KB、
+`threads_max' 计数、`load*-avg' 负载值。可空列（`load_n' 为 0 的桶）输出空串而非 0；
+TREND 为 nil 或无桶时只输出表头（I11：无数据不省略区块）。"
+  (el-chronos-web--csv-block
+   "resources"
+   '("bucket_ms" "cpu_ms" "wall_ms" "cpu_pct" "rss_kb_max" "rss_kb_avg"
+     "threads_max" "load1_avg" "load5_avg" "load15_avg" "samples")
+   (el-chronos-web--csv-rows
+    (plist-get trend :buckets)
+    '(:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max
+      :load1-avg :load5-avg :load15-avg :samples))))
+
 (defun el-chronos-web--csv-string (range)
-  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块 + 4 个手写区块，共 12 个 `# section:'。
+  "生成 RANGE 的 CSV 全文：overview + 7 个明细区块 + 5 个手写区块，共 13 个 `# section:'。
 字段一律保持原始值（毫秒/计数），便于下游脚本解析。
 前 8 个区块由 `el-chronos-web--csv-sections' 的通用规格生成（查询 → 行 → 列）；
-后 4 个（startup / health / config-history / drift）返回结构不齐整（启动分解是两段嵌套
-列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 的桶在 `:buckets' 键下，
-且启动分解不吃 RANGE），各自手写区块生成函数 —— 与 `el-chronos-report--csv-string' 同款
-取舍，字段口径见那几个函数的 docstring（两处需同步，区块顺序也被用例断言）。"
+后 5 个（startup / health / config-history / drift / resources）返回结构不齐整（启动分解
+是两段嵌套列表、采集健康是扁平 plist、配置变更嵌在 `:sessions' 里、drift 与 resources 的桶
+都在 `:buckets' 键下，且启动分解不吃 RANGE），各自手写区块生成函数 —— 与
+`el-chronos-report--csv-string' 同款取舍，字段口径见那几个函数的 docstring
+（两处需同步，区块顺序也被用例断言）。
+
+末尾 `resources' 的位置与 report 侧一致（drift 之后）：report 侧共 10 块、web 侧多
+overview / sessions / regressions 三块共 13 块，区块名与顺序由
+`el-chronos-report-test-csv-sections-match-web' 逐项比对。"
   (let ((overview (el-chronos-analysis-overview range)))
     (concat
      (el-chronos-web--csv-block
@@ -500,7 +528,9 @@ HISTORY 为 nil 时只输出表头；此处**不做** `/api/config-history' 的 
      (el-chronos-web--csv-health (el-chronos-analysis-health range))
      (el-chronos-web--csv-config-history (el-chronos-analysis-config-history range))
      ;; 命令外停转（drift）：位置与 report 侧一致（末尾），区块名/表头逐字对齐
-     (el-chronos-web--csv-drift (el-chronos-analysis-drift-trend range)))))
+     (el-chronos-web--csv-drift (el-chronos-analysis-drift-trend range))
+     ;; 进程资源：与 report 侧同名区块逐字对齐，位置也在最末
+     (el-chronos-web--csv-resources (el-chronos-analysis-resource-trend range)))))
 
 ;;; 路由处理函数
 
@@ -623,6 +653,54 @@ analysis 返回 nil（库打不开 / 查询失败）时降级为空结构（`:it
            :heap-latest (plist-get trend :heap-latest)
            :items (plist-get trend :buckets)))))
 
+(defun el-chronos-web--route-resources (params)
+  "GET /api/resources：窗口内按桶聚合的**进程资源**趋势（CPU / RSS / 线程数 / 系统负载）。
+查询参数 `range'（1d / 7d / 30d）与 `buckets'（正整数；省略时由 analysis 按窗口长度选择，
+1d / 7d / 30d 分别对应 24 / 168 / 720，并受整小时倍数合并约束，与 `/api/gc' 同一套）。
+
+响应键：`:range' 归一化范围字符串、`:bucket-count' 请求的桶数（省略时为 null）、
+`:bucket-span' 桶宽（毫秒）、窗口汇总 `:cpu-ms-total' `:wall-ms-total' `:cpu-pct-avg'
+`:rss-kb-max' `:rss-kb-avg' `:threads-max' `:load1-avg' `:load5-avg'
+`:load15-avg' `:samples'，以及 `:buckets' 桶列表
+`[{:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max
+:load1-avg :load5-avg :load15-avg :samples}]'。
+
+**单位（I4 只约束时间，别顺手「统一成毫秒」）**：`:cpu-ms' / `:wall-ms' 是毫秒；
+`:rss-kb-*' 是 **KB**、`:threads-max' 是线程计数、`:load*-avg' 是系统负载值 ——
+页面因此用专门的 `kb()' 换算，不能复用按**字节**起步的 `bytes()'（会差 1024 倍）。
+
+**null 与 0 严格区分（诚实性）**：`:rss-kb-avg' 与 `:load*-avg' 的分母是 `load_n'
+（成功取到 `load-average' 的窗口数），`load_n' 为 0 时这些均值是 **JSON null，不是 0** ——
+0 的含义是「观测到了，值为 0」，用 0 顶替会把「负载采集全失败」显示成「系统空闲」。
+同桶的 `:rss-kb-max' / `:threads-max' 不依赖 `load_n'，仍可能有值。`:cpu-pct-avg' 走
+`el-chronos-analysis--pct'（分母为 0 时给 0.0），因此无样本时它是 0.0 而非 null。
+
+**口径必须随响应一起传达**（页面已标注）：`:cpu-pct' 是「窗口内 CPU 时间增量 / 墙钟增量」，
+不是瞬时利用率；首窗口只建 CPU / 墙钟基线、不写库，故会话启动后的第一个桶可能缺失
+（不等于「那一刻 CPU 为 0」）。
+`:buckets' 的键名不做改名（analysis 原样回传）：页面按 `buckets' 读取，与 `/api/gc' 的
+`:items' 命名差异是有意保留的（本端点键集合由 analysis 定义，改名会再多一处同步负担）。
+analysis 返回 nil（库打不开 / 查询失败）时降级为空结构（`:buckets' 为 null），仍返回 200。"
+  (let* ((range (el-chronos-web--range-param params))
+         (buckets (el-chronos-web--int-param params "buckets" nil))
+         (trend (el-chronos-analysis-resource-trend range buckets)))
+    (el-chronos-web--json-response
+     (list :range (format "%s" range)
+           :bucket-count buckets
+           :bucket-span (plist-get trend :bucket-span)
+           :cpu-ms-total (or (plist-get trend :cpu-ms-total) 0.0)
+           :wall-ms-total (or (plist-get trend :wall-ms-total) 0.0)
+           ;; 均值 / 峰值类一律原样下发：nil → JSON null（不补 0，见 docstring）
+           :cpu-pct-avg (plist-get trend :cpu-pct-avg)
+           :rss-kb-max (plist-get trend :rss-kb-max)
+           :rss-kb-avg (plist-get trend :rss-kb-avg)
+           :threads-max (plist-get trend :threads-max)
+           :load1-avg (plist-get trend :load1-avg)
+           :load5-avg (plist-get trend :load5-avg)
+           :load15-avg (plist-get trend :load15-avg)
+           :samples (plist-get trend :samples)
+           :buckets (plist-get trend :buckets)))))
+
 (defun el-chronos-web--route-startup (params)
   "GET /api/startup[?session=N]：单会话的启动耗时分解。
 `session' 省略、非数字或非正数时取**最近一次有启动数据**的会话（判据见
@@ -713,6 +791,18 @@ analysis 返回 nil（查询失败）时降级为 `:sessions' 为 null、计数�
      (format "Content-Disposition: attachment; filename=\"el-chronos-%s.csv\"\r\n" range))))
 ;;; 启停
 
+(defun el-chronos-web--url (&optional proc)
+  "返回 Web dashboard 的访问 URL，形如 `http://127.0.0.1:PORT/'。
+PORT 优先取 PROC 的实际绑定端口（`process-contact' 的 `:service'）：PORT 入参为 0 时
+由内核分配，此时显示入参 0 毫无意义，故以实际绑定为准。
+PROC 为 nil 或取不到 `:service'（已关闭的进程）时回落 `el-chronos-web-port'。
+之所以收敛成一个 helper：启动 message、交互式打开浏览器、`el-chronos-web-browse'
+三处都要同一个 URL，拼接散落多份迟早写出不一致的 host / 斜杠。"
+  (format "http://%s:%s/" el-chronos-web--host
+          (or (and (processp proc)
+                   (ignore-errors (process-contact proc :service)))
+              el-chronos-web-port)))
+
 (defun el-chronos-web-running-p ()
   "Web server 是否正在运行；严格返回 `t' 或 nil。
 `process-live-p' 的状态是关键字（`listen' / `connect' / `stop' 等），直接返回会把状态
@@ -729,7 +819,14 @@ analysis 返回 nil（查询失败）时降级为 `:sessions' 为 null、计数�
 
 message 与返回值都反映**实际绑定**的端口：PORT 为 0 时由内核分配，此时显示的仍是
 入参 0 就毫无意义，故统一取 `process-contact' 的 `:service'（取不到才回落 PORT）。
-调用方可用 `(process-contact (el-chronos-web-start))' 核验绑定地址。"
+调用方可用 `(process-contact (el-chronos-web-start))' 核验绑定地址。
+
+**交互式调用**时若 `el-chronos-web-open-browser' 为真，启动后用 `browse-url' 打开
+页面（尊重用户的 `browse-url-browser-function' 等设置）；打开失败只 `message' 提示
+并给出 URL，不影响已启动的 server（I11：可见降级，不变成错误）。
+程序化调用（例如 `el-chronos-web-auto-start' 在启用观测时顺带起 server）**不**弹
+浏览器：两个判据必须同时成立（开关为真 **且** `called-interactively-p' 为真），
+否则每次启动 Emacs 都会弹出一个窗口。"
   (interactive)
   (when (el-chronos-web-running-p)
     (el-chronos-web-stop))
@@ -747,11 +844,38 @@ message 与返回值都反映**实际绑定**的端口：PORT 为 0 时由内核
                  (error
                   (user-error "Web dashboard 启动失败（%s:%s 可能已被占用，不会自动换端口）：%s"
                               el-chronos-web--host port
-                              (error-message-string err))))))
+                              (error-message-string err)))))
+         (url nil))
     (setq el-chronos-web--process proc)
-    (message "el-chronos Web dashboard：http://%s:%s/" el-chronos-web--host
-             (or (process-contact proc :service) port))
+    (setq url (el-chronos-web--url proc))
+    (message "el-chronos Web dashboard：%s" url)
+    ;; 两条判据缺一不可：开关为真 + 交互式调用（程序化启动绝不弹窗）
+    (when (and el-chronos-web-open-browser
+               (called-interactively-p 'interactive))
+      (condition-case err
+          (browse-url url)
+        (error (message "el-chronos：打开浏览器失败（%s），请手动访问 %s"
+                        (error-message-string err) url))))
     proc))
+
+;;;###autoload
+(defun el-chronos-web-browse ()
+  "用浏览器打开 Web dashboard 页面；server 未运行时先启动。
+命令自身的打开动作**不看** `el-chronos-web-open-browser'：这是用户显式要求打开页面，
+与开关无关。未启动时先 `el-chronos-web-start'——那是非交互调用，天然不弹浏览器，
+随后由本命令打开一次，因此不会双弹。
+与 `el-chronos-web-start' 交互路径的区别：后者只在「刚启动那一次」按开关决定是否
+打开，server 已运行时不再打开；本命令每次调用都打开当前页面（server 已运行则直接打开）。
+打开失败只 `message' 提示并给出 URL，不 `user-error'：server 已成功启动，缺一个浏览器
+不该变成错误（I11：可见降级，不静默、不中断）。"
+  (interactive)
+  (unless (el-chronos-web-running-p)
+    (el-chronos-web-start))
+  (let ((url (el-chronos-web--url el-chronos-web--process)))
+    (condition-case err
+        (browse-url url)
+      (error (message "el-chronos：打开浏览器失败（%s），请手动访问 %s"
+                      (error-message-string err) url)))))
 
 ;;;###autoload
 (defun el-chronos-web-stop ()
@@ -816,6 +940,7 @@ tbody tr:hover{background:#1c212b;cursor:pointer}tfoot td{border:0;color:var(--m
 <section><h2>概览</h2><div class='cards' id='ov'></div></section>
 <section><h2>趋势</h2><svg id='trend' viewBox='0 0 800 200' preserveAspectRatio='none' style='width:100%;height:200px'></svg><div class='legend' id='trend-legend'></div></section>
 <section><h2>GC 与内存</h2><table id='t-gc'></table><div class='legend' id='gc-legend'></div></section>
+<section><h2>资源（CPU / 内存 / 负载）</h2><div id='res'></div></section>
 <section><h2>启动分解</h2><div id='startup'></div></section>
 <section><h2>包 / 模块占比</h2><div style='display:flex;gap:16px;flex-wrap:wrap;align-items:center'><svg id='donut' viewBox='0 0 120 120' style='width:120px;height:120px'></svg><div class='legend' id='donut-legend' style='flex-direction:column;gap:4px'></div></div></section>
 <section><h2>用法热力</h2><div class='hm' id='heat'></div></section>
@@ -830,9 +955,9 @@ tbody tr:hover{background:#1c212b;cursor:pointer}tfoot td{border:0;color:var(--m
 </main>
 <aside id='panel'><button id='panel-close'>关闭</button><div id='panel-body'></div></aside>
 "
-  "内嵌页面结构（顶栏 → 概览 → 趋势 → GC 与内存 → 启动分解 → 占比 → 热力 → 慢命令 →
-热点函数 → 阻塞事件（含「命令外停转」汇总与明细）→ 回归 → 采集健康 → 配置变更 → 会话 →
-火焰图 + 下钻侧栏）。")
+  "内嵌页面结构（顶栏 → 概览 → 趋势 → GC 与内存 → 资源（CPU / 内存 / 负载）→ 启动分解 →
+占比 → 热力 → 慢命令 → 热点函数 → 阻塞事件（含「命令外停转」汇总与明细）→ 回归 →
+采集健康 → 配置变更 → 会话 → 火焰图 + 下钻侧栏）。")
 
 (defconst el-chronos-web--script
   "
@@ -848,6 +973,9 @@ const esc=v=>{const s=String(v==null?'':v);return s.split('&').join('&amp;').spl
 const nf=v=>Number(v||0).toLocaleString();
 const ms=v=>{v=Number(v||0);if(v>=1000)return (v/1000).toFixed(2)+'s';return v>=1?v.toFixed(1)+'ms':Math.round(v*1000)+'us';};
 const bytes=v=>{v=Number(v||0);const u=['B','KB','MB','GB'];let i=0;while(v>=1024&&i<3){v=v/1024;i++;}return v.toFixed(i?1:0)+u[i];};
+// 资源数据（hourly_resources.rss_kb_*）的单位是 **KB**，不能套 bytes()（那里起点是字节，
+// 会把 204800 KB 显示成 200 B，差 1024 倍）。kb() 的起点就是 KB。
+const kb=v=>{v=Number(v||0);const u=['KB','MB','GB'];let i=0;while(v>=1024&&i<2){v=v/1024;i++;}return v.toFixed(i?1:0)+u[i];};
 const ts=v=>new Date(Number(v||0)).toLocaleString(),pct=v=>Number(v||0).toFixed(1)+'%';
 const COLORS=['#4f9cf9','#f0b429','#3fb950','#ef5b5b','#a371f7','#79c0ff','#d29922','#8b949e'];
 const COLS={
@@ -866,10 +994,16 @@ async function getJSON(path,extra){
 function ranges(){
   $('ranges').innerHTML=RANGES.map(r=>`<button data-r='${r}'${r===S.range?\" class='on'\":''}>${r}</button>`).join('');
   $('csv').setAttribute('href','/api/export.csv?range='+S.range);}
-function cards(o){
+function cards(o,res){
+  // RES 来自 /api/resources（另一个请求，可能尚未加载 / 为 null）：缺失时资源三卡一律显示 '-',
+  // 不用 0 顶替 —— 0 的含义是「观测到了，值为 0」，与「没有样本」是两件事。
+  const r=res||{};
   const it=[['命令数',nf(o.commands)],['慢命令',nf(o['slow-commands'])],['阻塞总时长',ms(o['blocked-ms'])],
     ['采样点数',nf(o.samples)],['启动中位',o['startup-ms']==null?'-':ms(o['startup-ms'])],
-    ['会话数',nf(o.sessions)],['数据库',bytes(o['db-size'])]];
+    ['会话数',nf(o.sessions)],['数据库',bytes(o['db-size'])],
+    ['CPU 均值',r['cpu-pct-avg']==null?'-':pct(r['cpu-pct-avg'])],
+    ['RSS 峰值',r['rss-kb-max']==null?'-':kb(r['rss-kb-max'])],
+    ['负载 1m',r['load1-avg']==null?'-':Number(r['load1-avg']).toFixed(2)]];
   $('ov').innerHTML=it.map(x=>`<div class='card'><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');}
 function trend(items){
   const W=800,H=200,P=18;
@@ -970,6 +1104,44 @@ function startupPanel(d){
     +'<h3>包加载 TOP（前 10）</h3>'
     +miniTable(['包','耗时'],loads.map(p=>[esc(p[0]),ms(p[1])]),
       '（无包加载明细：mode 启动时启动已结束，不记录 after-load-functions）');}
+function resChart(items,key,fmt,title,color){
+  // 单指标折线（CPU% / RSS 各一张）：只用 viewBox + path + 少量文字，不引图表库与 CDN（I10）。
+  // null 值跳过（既不画点也不计入 max）——「没样本」不能画成 0（那是「观测到 0」）。
+  const W=800,H=140,P=18,list=items||[],step=list.length>1?(W-2*P)/(list.length-1):0;
+  const pts=[];
+  list.forEach((d,i)=>{if(d[key]==null)return;pts.push([P+i*step,Number(d[key])]);});
+  const head=`<h3>${esc(title)}</h3>`;
+  if(!pts.length)return head+`<p class='mut'>${esc('（该指标本期无样本，显示 - 而非 0）')}</p>`;
+  const max=Math.max(1,...pts.map(p=>p[1]));
+  const ys=pts.map(p=>[p[0].toFixed(1),(H-P-(p[1]/max)*(H-2*P)).toFixed(1)]);
+  const line=ys.map((p,i)=>(i?'L':'M')+p[0]+' '+p[1]).join(' ');
+  const dots=ys.map(p=>`<circle cx='${p[0]}' cy='${p[1]}' r='1.5' fill='${color}'/>`).join('');
+  return head
+    +`<svg viewBox='0 0 ${W} ${H}' preserveAspectRatio='none' style='width:100%;height:140px'>`
+    +`<path d='${line}' fill='none' stroke='${color}' stroke-width='1.6'/>${dots}`
+    +`<text x='${P}' y='11' fill='#9aa3b2' font-size='10'>${esc('max '+fmt(max))}</text></svg>`
+    +`<p class='mut'>${esc(list.length+' 桶 · '+pts.length+' 个有效点 · 峰值 '+fmt(max))}</p>`;}
+function resPanel(d){
+  // 「资源（CPU / 内存 / 负载）」面板：顶部一行窗口汇总 → CPU% / RSS 两张折线 →
+  // 一行负载图例 → 三条口径说明。无数据分支必须可见（I11），措辞与 report 侧
+  // `el-chronos-report--resource-degrade' 同义。
+  const el=$('res'),items=(d&&Array.isArray(d.buckets))?d.buckets:[];
+  if(!items.length){
+    el.innerHTML=`<p class='mut'>${esc('本期无进程资源数据（hourly_resources 为空；资源采样默认关闭）')}</p>`;
+    return;}
+  const v=(x,f)=>x==null?'-':f(x),num=x=>Number(x).toFixed(2);
+  el.innerHTML=`<p class='ok'>${esc('CPU 占用 '+v(d['cpu-pct-avg'],pct)
+      +'（cpu '+v(d['cpu-ms-total'],ms)+' / 墙钟 '+v(d['wall-ms-total'],ms)+'）· RSS 峰值 '
+      +v(d['rss-kb-max'],kb)+' · 线程峰值 '+v(d['threads-max'],nf))}</p>`
+    +resChart(items,'cpu-pct',pct,'CPU 占用率（窗口内 CPU 时间 / 墙钟）','#4f9cf9')
+    +resChart(items,'rss-kb-max',kb,'RSS 峰值','#3fb950')
+    +`<div class='legend'><span><i></i>${esc('负载 1m '+v(d['load1-avg'],num))}</span>`
+    +`<span><i class='b'></i>${esc('负载 5m '+v(d['load5-avg'],num))}</span>`
+    +`<span><i class='c'></i>${esc('负载 15m '+v(d['load15-avg'],num))}</span>`
+    +`<span class='mut'>${esc(items.length+' 桶 · '+nf(d.samples||0)+' 个负载样本')}</span></div>`
+    +`<p class='mut'>${esc('口径 ①：CPU% 是「窗口内 CPU 时间增量 / 墙钟增量」，不是瞬时利用率')}</p>`
+    +`<p class='mut'>${esc('口径 ②：RSS 均值与三档负载的分母是 load_n（成功取到负载的窗口数）；采集失败时均值为 null，显示 - 而非 0')}</p>`
+    +`<p class='mut'>${esc('口径 ③：首窗口只建基线，会话启动后的第一个桶可能缺失，不等于「那一刻 CPU 为 0」')}</p>`;}
 function healthPanel(h){
   const el=$('health');
   // 四个分支与 report 侧 `--section-health' 同序：无数据 / 没采集 / 没异常 / 完整表。
@@ -1037,17 +1209,17 @@ async function openEvent(id){
 async function load(){
   $('status').textContent='加载中…';
   try{
-    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg,gcD,suD,heD,cfD,drD]=await Promise.all([
+    const [sum,func,slow,pkg,tr,hm,st,sess,block,reg,gcD,suD,heD,cfD,drD,rsD]=await Promise.all([
       getJSON('/api/summary'),getJSON('/api/top-functions',{limit:50}),getJSON('/api/slow-commands',{limit:50}),
       getJSON('/api/packages'),getJSON('/api/trend'),getJSON('/api/heatmap',{limit:12}),
       getJSON('/api/stacks',{limit:40}),getJSON('/api/sessions'),getJSON('/api/blocking',{limit:30}),
       getJSON('/api/regressions',{limit:30}),
       getJSON('/api/gc'),getJSON('/api/startup'),getJSON('/api/health'),getJSON('/api/config-history'),
-      getJSON('/api/drift')]);
+      getJSON('/api/drift'),getJSON('/api/resources')]);
     S.data={sum:sum,func:func,slow:slow,pkg:pkg,trend:tr,heat:hm,stacks:st,sess:sess,block:block,reg:reg,
-      gc:gcD,startup:suD,health:heD,conf:cfD,drift:drD};
-    cards(sum.overview||{});trend(tr.items||[]);donut(pkg.items||[]);heat(hm.items||[]);flame(st.items||[]);
-    gcLegend(gcD.items||[]);startupPanel(suD);healthPanel(heD);confPanel(cfD);driftPanel(drD);
+      gc:gcD,startup:suD,health:heD,conf:cfD,drift:drD,res:rsD};
+    cards(sum.overview||{},rsD);trend(tr.items||[]);donut(pkg.items||[]);heat(hm.items||[]);flame(st.items||[]);
+    gcLegend(gcD.items||[]);resPanel(rsD);startupPanel(suD);healthPanel(heD);confPanel(cfD);driftPanel(drD);
     ['slow','func','block','reg','sess','gc'].forEach(table);
     $('status').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){$('status').textContent='加载失败：'+e.message;}}

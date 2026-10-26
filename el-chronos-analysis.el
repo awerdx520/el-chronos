@@ -21,8 +21,9 @@
 ;; 单位（I4）：时间戳、耗时、桶起点一律毫秒；`sessions.startup_ms' 由 store 层按「秒差 × 1000」
 ;; 写入，落库即毫秒，本层读出直接使用，不再二次乘 1000。
 ;;
-;; 百分比口径：`top-functions' / `stacks' 用样本数做分母，`package-breakdown' 用 self_ms 总和
-;; 做分母；分母都取窗口内全部行，不受 LIMIT 截断影响。
+;; 百分比口径：`top-functions' / `stacks' / `inclusive-functions' 用样本数做分母
+;; （前两者的样本是 self / 栈样本口径，`inclusive-functions' 是「栈包含」口径），
+;; `package-breakdown' 用 self_ms 总和做分母；分母都取窗口内全部行，不受 LIMIT 截断影响。
 ;;
 ;; GC 处理：函数热点默认排除 "Automatic GC"（profiler 伪函数，不是用户代码），需要时传
 ;; INCLUDE-GC；包占比里 GC 恒单独成条（名 "GC"），与归因失败的 `unknown' 一起排在末尾。
@@ -68,14 +69,23 @@ END 恒为「上界 + 1 毫秒」：下游 SQL 一律用 `ts < END'，END 加 1 
     (cons (car bounds) (1+ (cdr bounds)))))
 
 (defun el-chronos-analysis--range-buckets (start end)
-  "按窗口长度选择默认趋势桶数：≤1 天 24、≤8 天 168、更长 720。"
-  (let ((days (/ (float (max 0 (- end start))) (float el-chronos-analysis--ms-per-day))))
+  "按窗口长度选择默认趋势桶数：≤1 天 24、≤8 天 168、更长 720。
+跨度按 `(- end start 1)' 而非 `(- end start)' 计算：`el-chronos-analysis--range' 返回的
+END 是「真实上界 + 1 毫秒」（下游 SQL 一律 `ts < END'，加 1 才能包含与上界同毫秒的行），
+那 1 毫秒会把整 1 天算成 1.00000001 天，越过 `(<= days 1.0)' 分支落进 168 档 —— `1d' 于是
+拿到 168 桶而不是 24。这里必须先把这 1 毫秒减掉，还原真实跨度；**不要「优化」掉这个 -1**。"
+  (let ((days (/ (float (max 0 (- end start 1))) (float el-chronos-analysis--ms-per-day))))
     (cond ((<= days 1.0) 24) ((<= days 8.0) 168) (t 720))))
 
 (defun el-chronos-analysis--bucket-span (start end buckets)
-  "计算趋势桶宽（毫秒）：至少 1 小时且桶数不超过 BUCKETS（超出时按整小时倍数合并）。"
+  "计算趋势桶宽（毫秒）：至少 1 小时且桶数不超过 BUCKETS（超出时按整小时倍数合并）。
+小时数与上一条同样按 `(- end start 1)' 计算：END 含 `el-chronos-analysis--range' 加的
+1 毫秒，不减掉会把 720 小时抬成 720.0000003 小时、`ceiling' 得 721，再按 720 桶求整小时
+倍数即合并成 **2 小时**（30d / 7d 的桶宽都因此翻倍；7d 的 168 小时被抬成 169 后合并成
+2 小时、只剩 84 桶）。这 1 毫秒只为 SQL 右开区间而加，与桶宽计算无关，
+**不要「优化」掉这个 -1**。"
   (let* ((buckets (max 1 (or buckets 1)))
-         (hours (max 1 (ceiling (/ (float (max 0 (- end start)))
+         (hours (max 1 (ceiling (/ (float (max 0 (- end start 1)))
                                    (float el-chronos-analysis--ms-per-hour)))))
          (per (max 1 (ceiling (/ (float hours) (float buckets))))))
     (* per el-chronos-analysis--ms-per-hour)))
@@ -371,6 +381,188 @@ NULL 值**（代表该时段末的 Emacs 堆大小；桶内全为 NULL 时 nil�
                                                             (plist-get i :heap-bytes))
                                                           items))))))))))
 
+;;; 进程资源趋势
+(defun el-chronos-analysis--avg (total n)
+  "TOTAL 除以 N 的均值；N 非正或非数字时返回 nil。
+除数为 0 时返回 nil 而不用 0 冒充：「没有样本」与「样本值全为 0」是两件事，
+用 0 顶替会让「负载采集全失败」看起来像「系统空闲」。"
+  (when (and (numberp total) (numberp n) (> n 0))
+    (/ (float total) (float n))))
+
+(defun el-chronos-analysis-resource-trend (range &optional buckets)
+  "窗口 RANGE 内按桶聚合的**进程资源**趋势（CPU 占用率 / RSS / 线程数 / 系统负载）。
+返回 plist：`:range' 是归一化后的半开区间 (START . END)（毫秒）、`:bucket-span' 是桶宽
+（毫秒）、`:buckets' 是按桶起点升序的桶列表；窗口级汇总键 `:cpu-ms-total' /
+`:wall-ms-total' / `:cpu-pct-avg' / `:rss-kb-max' / `:rss-kb-avg' /
+`:threads-max' / `:load1-avg' / `:load5-avg' / `:load15-avg' / `:samples'
+与桶内字段口径一致（`:cpu-pct-avg' 对应桶内的 `:cpu-pct'）。
+
+`:buckets' 的元素是 `(:bucket START-MS :cpu-ms X :wall-ms X :cpu-pct P
+:rss-kb-max N :rss-kb-avg X :threads-max N :load1-avg X :load5-avg X
+:load15-avg X :samples N)'。
+
+单位（I4 只约束时间）：`:cpu-ms' / `:wall-ms' 为毫秒；`:rss-kb-*' 为 KB（**不是时间**）、
+`:threads-max' 为线程计数、`:load*-avg' 为系统负载值（1/5/15 分钟平均）—— 后三者不受
+I4 约束，改动时不要顺手「统一成毫秒」。
+
+计算口径：桶起点取 `(- hour_ts (% hour_ts span))'，SPAN 来自
+`el-chronos-analysis--bucket-span'（与 `el-chronos-analysis-trend' 同一套默认桶数与
+整小时倍数合并，BUCKETS 省略时同样按 `el-chronos-analysis--range-buckets' 取默认值）。
+同一桶可能有多个 session 行（`hourly_resources' 主键是 (hour_ts, session_id)）：
+`:cpu-ms' / `:wall-ms' / `:samples' 跨行求和，`:rss-kb-max' / `:threads-max' 跨行取大，
+`:rss-kb-avg' 的分子（各行 `rss_kb_sum'）跨行求和。SQL 只做窗口过滤与排序
+（`ORDER BY hour_ts, session_id`）、不做聚合，聚合在 Elisp 层完成（与
+`el-chronos-analysis-gc-trend' 同款取舍）。空桶不返回；无数据时 `:buckets' 为 nil 而
+整体仍返回 plist（不返回 nil：调用方按同一套键读取，不必为「空」再分叉一条分支）。
+
+三点口径必须知晓，否则会把有意为之当 bug 修：
+① **`:rss-kb-avg' / `:load*-avg' 的分母是 `load_n'，不是采样窗口数**：`load_n' 只在
+   「本窗口成功取到 `load-average'' 时 +1。若某桶内负载采集全部失败（`load-average'
+   抛错或平台不支持），`load_n' 为 0 → 均值返回 **nil**，而同一行的 `:rss-kb-max' /
+   `:threads-max' 仍有值（它们不依赖 `load_n'）。这是能力边界的诚实表达：不得用
+   `:rss-kb-max' 冒充均值，也不得用 0 冒充（0 的含义是「观测到了，值为 0」）；
+② **`:cpu-pct' 是窗口内 CPU 时间占比，不是瞬时利用率**：它等于「本窗口进程 CPU 时间
+   增量 / 墙钟增量 × 100」。多个窗口累加后仍是同一比率，因此跨桶、跨会话先求和再相除是
+   安全的（与「对百分比取算术平均」不同，后者会因各桶分母不同而失真）；
+③ **首窗口无数据**：采集侧首个采样窗口只建立 CPU / 墙钟基线、不写库（与 `hourly_gc'
+   同口径），所以会话启动后的第一个桶可能缺失 —— 不等于「那一刻 CPU 为 0」。"
+  (el-chronos-analysis--guard 'resource-trend
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((buckets (max 1 (or buckets (el-chronos-analysis--range-buckets start end))))
+             (span (el-chronos-analysis--bucket-span start end buckets))
+             ;; 每个桶一个向量：[cpu-ms wall-ms rss-max rss-sum threads-max
+             ;;                  load1-sum load5-sum load15-sum load-n]
+             (table (make-hash-table :test #'equal)))
+        (dolist (row (el-chronos-analysis--select
+                      db
+                      (concat "SELECT hour_ts, cpu_ms, wall_ms, rss_kb_max, rss_kb_sum,"
+                              " threads_max, load1_sum, load5_sum, load15_sum, load_n"
+                              " FROM hourly_resources"
+                              " WHERE hour_ts >= ? AND hour_ts < ?"
+                              " ORDER BY hour_ts, session_id")
+                      (list start end)))
+          (cl-destructuring-bind (ts cpu wall rss-max rss-sum threads
+                                     load1 load5 load15 load-n)
+              row
+            (let* ((bucket (- ts (% ts span)))
+                   (cell (or (gethash bucket table)
+                             (puthash bucket
+                                      (vector 0.0 0.0 nil 0 nil 0.0 0.0 0.0 0)
+                                      table))))
+              (aset cell 0 (+ (aref cell 0) (float (or cpu 0))))
+              (aset cell 1 (+ (aref cell 1) (float (or wall 0))))
+              ;; 峰值类列：NULL 表示「从未观测到」，因此不参与取大，也不落成 0
+              (when (numberp rss-max)
+                (aset cell 2 (if (numberp (aref cell 2))
+                                 (max (aref cell 2) rss-max)
+                               rss-max)))
+              (when (numberp rss-sum) (aset cell 3 (+ (aref cell 3) rss-sum)))
+              (when (numberp threads)
+                (aset cell 4 (if (numberp (aref cell 4))
+                                 (max (aref cell 4) threads)
+                               threads)))
+              (when (numberp load1) (aset cell 5 (+ (aref cell 5) (float load1))))
+              (when (numberp load5) (aset cell 6 (+ (aref cell 6) (float load5))))
+              (when (numberp load15) (aset cell 7 (+ (aref cell 7) (float load15))))
+              (aset cell 8 (+ (aref cell 8) (or load-n 0))))))
+        (let ((items (cl-sort
+                      (cl-loop for bucket being the hash-keys of table
+                               using (hash-values cell)
+                               collect (list :bucket bucket
+                                             :cpu-ms (aref cell 0)
+                                             :wall-ms (aref cell 1)
+                                             :cpu-pct (el-chronos-analysis--pct
+                                                       (aref cell 0) (aref cell 1))
+                                             :rss-kb-max (aref cell 2)
+                                             :rss-kb-avg (el-chronos-analysis--avg
+                                                          (aref cell 3) (aref cell 8))
+                                             :threads-max (aref cell 4)
+                                             :load1-avg (el-chronos-analysis--avg
+                                                         (aref cell 5) (aref cell 8))
+                                             :load5-avg (el-chronos-analysis--avg
+                                                         (aref cell 6) (aref cell 8))
+                                             :load15-avg (el-chronos-analysis--avg
+                                                          (aref cell 7) (aref cell 8))
+                                             :samples (aref cell 8)))
+                      #'< :key (lambda (i) (plist-get i :bucket))))
+              (cpu-total 0.0) (wall-total 0.0) (rss-sum-total 0)
+              (load1-total 0.0) (load5-total 0.0) (load15-total 0.0) (samples-total 0)
+              (rss-max nil) (threads-max nil))
+          ;; 窗口汇总取自桶单元（求和与取大与顺序无关，故 hash 遍历顺序无影响）
+          (cl-loop for cell being the hash-values of table
+                   do (setq cpu-total (+ cpu-total (aref cell 0))
+                            wall-total (+ wall-total (aref cell 1))
+                            rss-sum-total (+ rss-sum-total (aref cell 3))
+                            load1-total (+ load1-total (aref cell 5))
+                            load5-total (+ load5-total (aref cell 6))
+                            load15-total (+ load15-total (aref cell 7))
+                            samples-total (+ samples-total (aref cell 8)))
+                   when (numberp (aref cell 2))
+                   do (setq rss-max (if (numberp rss-max)
+                                        (max rss-max (aref cell 2))
+                                      (aref cell 2)))
+                   when (numberp (aref cell 4))
+                   do (setq threads-max (if (numberp threads-max)
+                                            (max threads-max (aref cell 4))
+                                          (aref cell 4))))
+          (list :range (cons start end)
+                :bucket-span span
+                :buckets items
+                :cpu-ms-total cpu-total
+                :wall-ms-total wall-total
+                :cpu-pct-avg (el-chronos-analysis--pct cpu-total wall-total)
+                :rss-kb-max rss-max
+                :rss-kb-avg (el-chronos-analysis--avg rss-sum-total samples-total)
+                :threads-max threads-max
+                :load1-avg (el-chronos-analysis--avg load1-total samples-total)
+                :load5-avg (el-chronos-analysis--avg load5-total samples-total)
+                :load15-avg (el-chronos-analysis--avg load15-total samples-total)
+                :samples samples-total))))))
+
+(defun el-chronos-analysis-resource-summary (range)
+  "窗口 RANGE 内的**进程资源**汇总 plist（供概览卡片，避免前端加载全部桶）。
+返回 `(:cpu-pct P :cpu-ms X :wall-ms X :rss-kb-max N :rss-kb-avg X
+:threads-max N :load1-avg X :load5-avg X :load15-avg X :samples N)'；
+各键口径与 `el-chronos-analysis-resource-trend' 的窗口级汇总字段**完全一致**
+（同一套口径两处实现，改动时须同步，否则报告与 Web 会给出两个数）。
+
+与 trend 的差别只有一个：**无数据时返回 nil**（与 `el-chronos-analysis-overview' 等
+「窗口汇总类」查询一致）—— 概览卡片需要区分「无数据」与「有数据但全 0」，而趋势需要
+稳定键集合以便绘图。实现上走一条 SQL 聚合（而非复用 trend 再取汇总键），以减少把窗口内
+全部行搬进 Elisp 的开销；NULL 处理与 trend 同款：`MAX(rss_kb_max)' / `MAX(threads_max)'
+跳过 NULL（全 NULL 时得 nil），均值分母用 `SUM(load_n)' 且为 0 时结果为 nil。
+峰值 / 均值类字段的单位不是时间：`:rss-kb-*' 是 KB、`:threads-max' 是计数、
+`:load*-avg' 是负载值；`:cpu-ms' / `:wall-ms' 才是毫秒。"
+  (el-chronos-analysis--guard 'resource-summary
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let ((row (car (el-chronos-analysis--select
+                       db
+                       (concat "SELECT count(*), coalesce(sum(cpu_ms), 0),"
+                               " coalesce(sum(wall_ms), 0), max(rss_kb_max),"
+                               " sum(rss_kb_sum), max(threads_max),"
+                               " sum(load1_sum), sum(load5_sum), sum(load15_sum),"
+                               " coalesce(sum(load_n), 0)"
+                               " FROM hourly_resources"
+                               " WHERE hour_ts >= ? AND hour_ts < ?")
+                       (list start end)))))
+        ;; count = 0 时其余列全是 NULL / 0，必须返回 nil 而不是「全 0 的 plist」
+        (when (and row (> (or (nth 0 row) 0) 0))
+          (cl-destructuring-bind (_count cpu wall rss-max rss-sum threads
+                                         load1 load5 load15 load-n)
+              row
+            (list :cpu-pct (el-chronos-analysis--pct cpu wall)
+                  :cpu-ms (float (or cpu 0))
+                  :wall-ms (float (or wall 0))
+                  :rss-kb-max rss-max
+                  :rss-kb-avg (el-chronos-analysis--avg rss-sum load-n)
+                  :threads-max threads
+                  :load1-avg (el-chronos-analysis--avg load1 load-n)
+                  :load5-avg (el-chronos-analysis--avg load5 load-n)
+                  :load15-avg (el-chronos-analysis--avg load15 load-n)
+                  :samples (or load-n 0))))))))
+
 ;;; 用法热力图
 (defun el-chronos-analysis-heatmap (range &optional limit)
   "窗口 RANGE 内的命令用法热力图。
@@ -419,6 +611,104 @@ LIMIT 限制参与的命令条数（按窗口内总次数取前 N，默认 20）
                  when stack
                  collect (list :stack stack :samples (or samples 0)
                                :pct (el-chronos-analysis--pct samples total)))))))
+
+(defun el-chronos-analysis-inclusive-functions (range &optional limit)
+  "窗口 RANGE 内按「栈包含样本数」降序的函数列表。
+元素 `(:function NAME :samples N :pct P :stacks K)'：`:samples' 是该函数出现在其中的
+栈样本数之和（包含口径，不是 leaf / self 口径），`:stacks' 是涉及的不同栈条数，
+`:pct' 是 `:samples' 占**窗口内全部栈样本数**的百分比（分母取自截断前，不受 LIMIT
+影响）。LIMIT 默认 100。
+
+与 `el-chronos-analysis-top-functions' 的差别：后者是 self 口径（`samples' 只数 leaf），
+成本记在被调用的 built-in 帧上时会把调用者严重低估；本函数按「出现在多少比例采样栈里」
+计，故只作为**中间帧**出现的函数（`hourly_functions.samples' 恒为 0、`total_ms' > 0）
+同样能被找出。
+
+候选集取自窗口内 `hourly_functions' 的**全部**函数，SQL 侧按 `sum(total_ms)' 降序只为
+输出确定性：**不**加 `samples > 0' 过滤，也不按候选数截断——中间帧的 `samples' 恒为 0、
+`self_ms' 也恒为 0，任何 self 口径的过滤/排序都会把它们整批丢掉；而本实现的匹配成本与
+候选数无关（候选只进哈希表），截断只会引入静默漏计。
+
+匹配口径：把 `hourly_stacks.stack_json' 文本按双引号切分、取其中的字符串字段，与候选名
+**整名相等**才算命中——等价于 SQL 的 `instr(stack_json, '\"' || function || '\"') > 0'，
+故 `foo' 不会误命中 `foo-bar'。
+
+实现路径与实测（真实库 1 天窗口：1721 条不同栈 / 约 47 万栈样本 / 3897 个候选）：
+单条 JOIN 的 SQL 版（`instr' 边界匹配 + 候选子查询）**24500 ms**；改为一次取出栈文本、
+在 Lisp 里单遍扫描后，纯匹配部分 **17–25 ms**，**整函数 29 ms（字节编译）/ 60 ms
+（解释执行）**。中途试过的两个变体（逐候选 `string-search' 268 ms、逐候选
+`string-match-p' + `regexp-quote' 737 ms）也都能用，但比单遍扫描慢一个数量级。
+
+已知边界：
+1. 函数名自身含 `\"` 或 `\\` 时 JSON 会转义，切出的字段与原名不再相等 → 这类函数
+   **静默漏计**（含 `\"` 时理论上还可能切出伪字段，实际概率极低）。
+2. 候选集来自 `hourly_functions'，该表按 top-N 淘汰：只出现在 `hourly_stacks'、
+   已被淘汰的函数帧不会出现在结果里。
+3. 不排除 \"Automatic GC\"（它是真实的采样帧，包含法下代表 GC 期间的整段栈）。"
+  (el-chronos-analysis--guard 'inclusive-functions
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((window (list start end))
+             (total (or (caar (el-chronos-analysis--select
+                               db
+                               "SELECT coalesce(sum(samples), 0) FROM hourly_stacks\
+ WHERE hour_ts >= ? AND hour_ts < ?"
+                               window))
+                        0))
+             ;; 栈先按文本去重再累加：同一栈在窗口内可能跨小时 / 跨会话出现多次
+             (stacks (el-chronos-analysis--select
+                      db
+                      "SELECT stack_json, sum(samples) FROM hourly_stacks\
+ WHERE hour_ts >= ? AND hour_ts < ? GROUP BY stack_json"
+                      window))
+             (candidates (el-chronos-analysis--select
+                          db
+                          "SELECT function FROM hourly_functions\
+ WHERE hour_ts >= ? AND hour_ts < ? GROUP BY function ORDER BY sum(total_ms) DESC"
+                          window))
+             (samples (make-hash-table :test #'equal :size (max 64 (length candidates))))
+             (stack-count (make-hash-table :test #'equal :size (max 64 (length candidates)))))
+        ;; 候选集必须先落表：「是否候选」用 `gethash' 判存在性，值为 0 也算命中
+        (dolist (row candidates)
+          (puthash (car row) 0 samples)
+          (puthash (car row) 0 stack-count))
+        (dolist (row stacks)
+          (let ((json (nth 0 row))
+                (n (or (nth 1 row) 0))
+                (index 0)
+                (hits nil))
+            ;; `json-serialize' 产出的栈是紧凑数组 `[\"a\",\"b\"]'：按 `\"' 切分后
+            ;; 第 0/2/4… 段是 `[' / `,' / `]' 等结构，第 1/3/5… 段才是帧名
+            (dolist (token (split-string json "\"" nil))
+              (when (and (= 1 (logand index 1))
+                         (gethash token samples))
+                (push token hits))
+              (setq index (1+ index)))
+            ;; 同一栈里同名帧可能出现多次（递归 / advice 链 / 同名闭包归一）：必须先
+            ;; 按栈去重再累加，否则该栈的样本数被重复计入，`:pct' 甚至可能超过 100
+            (dolist (token (delete-dups hits))
+              (puthash token (+ (gethash token samples) n) samples)
+              (puthash token (1+ (gethash token stack-count)) stack-count))))
+        (let ((rows (cl-loop for name being the hash-keys of samples
+                             using (hash-values n)
+                             when (> (gethash name stack-count) 0)
+                             collect (list :function name
+                                           :samples n
+                                           :pct (el-chronos-analysis--pct n total)
+                                           :stacks (gethash name stack-count)))))
+          ;; 同 `:samples' 时按 `:stacks' 降序、再按名字升序，保证输出可复现
+          ;; （哈希表遍历顺序不确定，不定序会让同分条目的名次随机漂移）
+          (el-chronos-analysis--take
+           (cl-sort rows
+                    (lambda (a b)
+                      (let ((sa (plist-get a :samples))
+                            (sb (plist-get b :samples)))
+                        (cond ((/= sa sb) (> sa sb))
+                              ((/= (plist-get a :stacks) (plist-get b :stacks))
+                               (> (plist-get a :stacks) (plist-get b :stacks)))
+                              (t (string< (plist-get a :function)
+                                          (plist-get b :function)))))))
+           (or limit 100)))))))
 
 ;;; 会话
 (defun el-chronos-analysis-sessions (range)

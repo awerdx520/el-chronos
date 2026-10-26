@@ -37,9 +37,9 @@ CREATE TABLE IF NOT EXISTS hourly_stacks (hour_ts INTEGER NOT NULL, session_id I
 
 (defconst el-chronos-store-test--all-tables
   '("commands" "hourly_drift" "hourly_functions" "hourly_gc" "hourly_health"
-    "hourly_stacks" "hourly_usage" "session_meta" "sessions" "slow_events"
-    "startup_phases")
-  "schema v3 的全部 11 张用户表（升序，与 `el-chronos-store-test--tables' 的排序一致）。")
+    "hourly_resources" "hourly_stacks" "hourly_usage" "session_meta" "sessions"
+    "slow_events" "startup_phases")
+  "schema v4 的全部 12 张用户表（升序，与 `el-chronos-store-test--tables' 的排序一致）。")
 
 (defun el-chronos-store-test--tables (db)
   "返回 DB 中 sqlite_master 记录的用户表名（升序）。
@@ -115,6 +115,48 @@ commands，旧时间戳会让「迁移不丢数据」的断言假红。"
              (list (* 3600000 (floor (/ (float now) 3600))) session 2 1.0 2048))))
       (sqlite-close db))))
 
+;;; fixture：schema v3 旧库
+
+(defconst el-chronos-store-test--v3-ddl
+  (concat el-chronos-store-test--v2-ddl "
+CREATE TABLE IF NOT EXISTS hourly_drift (hour_ts INTEGER NOT NULL, session_id INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0, total_ms REAL NOT NULL DEFAULT 0, max_ms REAL NOT NULL DEFAULT 0, PRIMARY KEY (hour_ts, session_id));")
+  "schema v3 的 DDL（11 表 + 3 索引），专用于构造「v3 → v4」的旧库 fixture。
+同前两份 fixture：`hourly_drift' 写成字面量而非引用 store 常量，否则 store 改常量
+本 fixture 跟着变，「v3 库升到 v4」的用例就再也看不到真实的旧库形状。")
+
+(defun el-chronos-store-test--make-v3-db (path)
+  "在 PATH 造一个 schema v3 的库并关闭句柄（不经过 store 的 open）。
+内容：11 表 + 3 索引、`user_version'=3、1 行 sessions、2 行 commands、
+1 行 hourly_gc、1 行 hourly_drift —— 供「v3 库升到 v4 后既有 11 表数据一行不丢」断言使用。
+时间戳取当前时刻：open 之后 `--prune' 会按 `el-chronos-retention-days' 删掉早于 30 天的
+commands，旧时间戳会让「迁移不丢数据」的断言假红。"
+  (let ((db (sqlite-open path))
+        (now (truncate (* 1000 (float-time)))))
+    (unwind-protect
+        (progn
+          (sqlite-execute-batch db el-chronos-store-test--v3-ddl)
+          (sqlite-pragma db "user_version=3")
+          (sqlite-execute
+           db "INSERT INTO sessions (started_at, emacs_version, host, startup_ms,\
+ gc_threshold) VALUES (?, ?, ?, ?, ?)"
+           (list now "31.1" "v3-host" 222.0 (float gc-cons-threshold)))
+          (let ((session (caar (sqlite-select db "SELECT last_insert_rowid()"))))
+            (dotimes (i 2)
+              (sqlite-execute
+               db "INSERT INTO commands (ts, session_id, name, duration_ms, gc_ms, mode,\
+ project, outcome, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+               (list (- now (* (1+ i) 1000)) session (format "v3-cmd-%d" i)
+                     (float (1+ i)) nil "emacs-lisp-mode" "v3-proj" "ok" "interactive")))
+            (sqlite-execute
+             db "INSERT INTO hourly_gc (hour_ts, session_id, gc_count, gc_ms, heap_bytes)\
+ VALUES (?, ?, ?, ?, ?)"
+             (list (* 3600000 (floor (/ (float now) 3600))) session 2 1.0 2048))
+            (sqlite-execute
+             db "INSERT INTO hourly_drift (hour_ts, session_id, count, total_ms, max_ms)\
+ VALUES (?, ?, ?, ?, ?)"
+             (list (* 3600000 (floor (/ (float now) 3600))) session 3 2400.0 900.0))))
+      (sqlite-close db))))
+
 ;;; fixture：与真实运行环境隔离的库
 
 (defvar el-chronos-store-test--hermetic-dir nil
@@ -150,9 +192,9 @@ commands，旧时间戳会让「迁移不丢数据」的断言假红。"
       (should (integerp el-chronos--session-id)))))
 
 (ert-deftest el-chronos-store-test-user-version-migration ()
-  "新库迁移到当前 schema 版本，十一张表齐备；重开不重复迁移。"
+  "新库迁移到当前 schema 版本，十二张表齐备；重开不重复迁移。"
   (el-chronos-test-with-db
-    (should (= 3 el-chronos-store--schema-version))
+    (should (= 4 el-chronos-store--schema-version))
     (should (= el-chronos-store--schema-version
                (el-chronos-test--scalar "PRAGMA user_version")))
     (should (equal el-chronos-store-test--all-tables
@@ -162,11 +204,11 @@ commands，旧时间戳会让「迁移不丢数据」的断言假红。"
     (should (= el-chronos-store--schema-version
                (el-chronos-test--scalar "PRAGMA user_version")))))
 
-(ert-deftest el-chronos-store-test-migrate-v0-to-v3 ()
-  "全新空库（`user_version'=0）一次打开就到 v3：11 表齐备、版本为 3，
-且**不重跑** v2 / v3 增量脚本（`--ensure-schema' 已建全表并置版本）。
+(ert-deftest el-chronos-store-test-migrate-v0-to-v4 ()
+  "全新空库（`user_version'=0）一次打开就到 v4：12 表齐备、版本为 4，
+且**不重跑** v2 / v3 / v4 增量脚本（`--ensure-schema' 已建全表并置版本）。
 锁住的是 `--migrate' 里「`--ensure-schema' 之后把局部版本同步为当前常量」这一步：
-若同步成 0 或 1，末尾 pragma 会写出错误版本、或让两条幂等脚本各多跑一遍，本用例即红。"
+若同步成 0 或 1，末尾 pragma 会写出错误版本、或让三条幂等脚本各多跑一遍，本用例即红。"
   (el-chronos-test-with-tmp-dir dir
     (let* ((path (expand-file-name "v0.sqlite" dir))
            (user-emacs-directory (file-name-as-directory dir))
@@ -179,20 +221,20 @@ commands，旧时间戳会让「迁移不丢数据」的断言假红。"
         (should (el-chronos-store-open path)))
       (unwind-protect
           (progn
-            (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
             (should (equal el-chronos-store-test--all-tables
                            (el-chronos-store-test--tables el-chronos-store--db)))
-            ;; `--ensure-schema' 执行的是全量 DDL；两条增量脚本都不该出现
+            ;; `--ensure-schema' 执行的是全量 DDL；三条增量脚本都不该出现
             (should (member el-chronos-store--schema-ddl batches))
             (should-not (member el-chronos-store--sql-migrate-v2 batches))
-            (should-not (member el-chronos-store--sql-migrate-v3 batches)))
+            (should-not (member el-chronos-store--sql-migrate-v3 batches))
+            (should-not (member el-chronos-store--sql-migrate-v4 batches)))
         (el-chronos-store-close)))))
-
-(ert-deftest el-chronos-store-test-migrate-v1-to-v3 ()
-  "v1 老库（6 表 + `user_version'=1）打开后**一次**升到 v3：11 表齐备（含
-`hourly_drift'）、既有 commands / sessions 一行不丢。
+(ert-deftest el-chronos-store-test-migrate-v1-to-v4 ()
+  "v1 老库（6 表 + `user_version'=1）打开后**一次**升到 v4：12 表齐备（含
+`hourly_drift' / `hourly_resources'）、既有 commands / sessions 一行不丢。
 这是迁移链的守门用例：若 `--migrate' 写成 `(= from-version 2)' 的互斥分支，
-v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
+v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
   (el-chronos-test-with-tmp-dir dir
     (let ((path (expand-file-name "v1.sqlite" dir))
           ;; 绑定假配置目录：`--ensure-session' 会采变更标记，若指向真实
@@ -216,26 +258,26 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
         (should (el-chronos-store-open path)))
       (unwind-protect
           (progn
-            (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
             (should (equal el-chronos-store-test--all-tables
                            (el-chronos-store-test--tables el-chronos-store--db)))
-            ;; 两步增量脚本都必须真的跑过（链式推进，不是只跑到 v2）
+            ;; 三步增量脚本都必须真的跑过（链式推进，不是只跑到 v2 / v3）
             (should (member el-chronos-store--sql-migrate-v2 batches))
             (should (member el-chronos-store--sql-migrate-v3 batches))
+            (should (member el-chronos-store--sql-migrate-v4 batches))
             ;; 既有明细一行不丢
             (should (= 2 (el-chronos-test--scalar
                           "SELECT count(*) FROM commands WHERE name LIKE 'old-cmd-%'")))
             (should (= 1 (el-chronos-test--scalar
                           "SELECT count(*) FROM sessions WHERE host = 'old-host'")))
-            ;; v2 四表 + v3 新表都在，且都为空（写入层由 T2 负责）
+            ;; v2 四表 + v3 / v4 新表都在，且都为空（写入层由别的任务负责）
             (dolist (table '("hourly_gc" "startup_phases" "hourly_health"
-                            "session_meta" "hourly_drift"))
+                            "session_meta" "hourly_drift" "hourly_resources"))
               (should (= 0 (el-chronos-test--count table)))))
         (el-chronos-store-close)))))
-
-(ert-deftest el-chronos-store-test-migrate-v2-to-v3 ()
-  "v2 库（10 表 + `user_version'=2）打开后只补建 `hourly_drift' 并升到 v3：
-11 表齐备、既有 commands / hourly_gc 数据一行不丢、`hourly_drift' 为空，
+(ert-deftest el-chronos-store-test-migrate-v2-to-v4 ()
+  "v2 库（10 表 + `user_version'=2）打开后补建 `hourly_drift' 与 `hourly_resources'
+并升到 v4：12 表齐备、既有 commands / hourly_gc 数据一行不丢、两张新表为空，
 且 v2 增量脚本**不重跑**（版本已是 2）。"
   (el-chronos-test-with-tmp-dir dir
     (let* ((path (expand-file-name "v2.sqlite" dir))
@@ -257,30 +299,79 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
         (should (el-chronos-store-open path)))
       (unwind-protect
           (progn
-            (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
             (should (equal el-chronos-store-test--all-tables
                            (el-chronos-store-test--tables el-chronos-store--db)))
-            (should (member el-chronos-store--sql-migrate-v3 batches))
+            ;; v3 / v4 脚本跑过，v2 脚本不重跑
             (should-not (member el-chronos-store--sql-migrate-v2 batches))
+            (should (member el-chronos-store--sql-migrate-v3 batches))
+            (should (member el-chronos-store--sql-migrate-v4 batches))
             (should (= 2 (el-chronos-test--scalar
                           "SELECT count(*) FROM commands WHERE name LIKE 'v2-cmd-%'")))
             (should (= 1 (el-chronos-test--count "hourly_gc")))
             (should (= 0 (el-chronos-test--count "hourly_drift")))
+            (should (= 0 (el-chronos-test--count "hourly_resources")))
             (should (= 1 (el-chronos-test--scalar
                           "SELECT count(*) FROM sessions WHERE host = 'v2-host'"))))
         (el-chronos-store-close)))))
+(ert-deftest el-chronos-store-test-migrate-v3-to-v4 ()
+  "v3 库（11 表 + `user_version'=3）打开后**只**补建 `hourly_resources' 并升到 v4：
+12 表齐备、`hourly_resources' 为空，且 v2 / v3 增量脚本不重跑（只跑 v4 一步）。
+「既有 11 表数据不受损」是本用例的核心断言：迁移只加表，不得动既有行
+（`commands' / `sessions' / `hourly_gc' / `hourly_drift' 四条数据逐项比对）。"
+  (el-chronos-test-with-tmp-dir dir
+    (let* ((path (expand-file-name "v3.sqlite" dir))
+           (user-emacs-directory (file-name-as-directory dir))
+           (el-chronos-db-path path)
+           (el-chronos--session-id nil)
+           (batches nil)
+           (orig (symbol-function 'sqlite-execute-batch)))
+      (el-chronos-store-test--make-v3-db path)
+      ;; fixture 自检：确实是 v3 的 11 表库
+      (let ((raw (sqlite-open path)))
+        (unwind-protect
+            (progn
+              (should (= 3 (caar (sqlite-select raw "PRAGMA user_version"))))
+              (should (= 11 (length (el-chronos-store-test--tables raw)))))
+          (sqlite-close raw)))
+      (cl-letf (((symbol-function 'sqlite-execute-batch)
+                 (lambda (db sql) (push sql batches) (funcall orig db sql))))
+        (should (el-chronos-store-open path)))
+      (unwind-protect
+          (progn
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (equal el-chronos-store-test--all-tables
+                           (el-chronos-store-test--tables el-chronos-store--db)))
+            ;; 只跑 v4 一步
+            (should (member el-chronos-store--sql-migrate-v4 batches))
+            (should-not (member el-chronos-store--sql-migrate-v2 batches))
+            (should-not (member el-chronos-store--sql-migrate-v3 batches))
+            ;; 既有 11 表数据一行不丢、一个字段不变
+            (should (= 2 (el-chronos-test--scalar
+                          "SELECT count(*) FROM commands WHERE name LIKE 'v3-cmd-%'")))
+            (should (= 1 (el-chronos-test--scalar
+                          "SELECT count(*) FROM sessions WHERE host = 'v3-host'")))
+            (should (= 2 (el-chronos-test--scalar "SELECT gc_count FROM hourly_gc")))
+            (should (= 2048 (el-chronos-test--scalar
+                             "SELECT heap_bytes FROM hourly_gc")))
+            (should (= 3 (el-chronos-test--scalar "SELECT count FROM hourly_drift")))
+            (should (= 2400.0 (el-chronos-test--scalar
+                               "SELECT total_ms FROM hourly_drift")))
+            (should (= 900.0 (el-chronos-test--scalar "SELECT max_ms FROM hourly_drift")))
+            ;; 新表为空（写入层由 collect 侧调用，本任务只补 schema）
+            (should (= 0 (el-chronos-test--count "hourly_resources"))))
+        (el-chronos-store-close)))))
 
-(ert-deftest el-chronos-store-test-new-db-has-eleven-tables ()
-  "全新空库 open 后直接是 11 表 + `user_version'=3（`--ensure-schema' 必须走全量 DDL）。"
+(ert-deftest el-chronos-store-test-new-db-has-twelve-tables ()
+  "全新空库 open 后直接是 12 表 + `user_version'=4（`--ensure-schema' 必须走全量 DDL）。"
   (el-chronos-store-test--with-hermetic-db
-    (should (= 3 el-chronos-store--schema-version))
-    (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
+    (should (= 4 el-chronos-store--schema-version))
+    (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
     (should (equal el-chronos-store-test--all-tables
                    (el-chronos-store-test--tables el-chronos-store--db)))
     (dolist (table '("hourly_gc" "startup_phases" "hourly_health" "session_meta"
-                     "hourly_drift"))
+                     "hourly_drift" "hourly_resources"))
       (should (= 0 (el-chronos-test--count table))))))
-
 (ert-deftest el-chronos-store-test-migrate-rollback ()
   "v2 迁移脚本报错时整体回滚：open 返回 nil、原库仍是 v1 的 6 表且数据完整、
 留下 .bak；去掉注入后同一个库能正常升级。"
@@ -304,18 +395,18 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
               (should (= 6 (length (el-chronos-store-test--tables raw))))
               (should (= 2 (caar (sqlite-select raw "SELECT count(*) FROM commands")))))
           (sqlite-close raw)))
-      ;; 回滚没有把库弄坏：去掉注入后能正常迁移到 v3
+      ;; 回滚没有把库弄坏：去掉注入后能正常迁移到 v4
       (unwind-protect
           (progn
             (should (el-chronos-store-open path))
-            (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
-            (should (= 11 (length (el-chronos-store-test--tables
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (= 12 (length (el-chronos-store-test--tables
                                    el-chronos-store--db)))))
         (el-chronos-store-close)))))
 
 (ert-deftest el-chronos-store-test-migrate-v3-failure-rolls-back ()
   "v3 迁移脚本报错时整体回滚：open 返回 nil、原库仍是 v2 的 10 表（版本 2）且数据完整、
-留下 .bak；去掉注入后同一个库能正常升到 v3。
+留下 .bak；去掉注入后同一个库能正常升到 v4。
 锁住的是「迁移失败不得留下半成品库」——缺 `hourly_drift' 的库会让 drift 写入静默失败
 （`no such table' → flush 丢本批，只留限流告警），用户不会察觉。"
   (el-chronos-test-with-tmp-dir dir
@@ -342,11 +433,11 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
               (should (= 2 (caar (sqlite-select raw "SELECT count(*) FROM commands"))))
               (should (= 1 (caar (sqlite-select raw "SELECT count(*) FROM hourly_gc")))))
           (sqlite-close raw)))
-      ;; 去掉注入后能正常升到 v3
+      ;; 去掉注入后能正常升到 v4（v3 步骤是链上的一环，跳过它不成立）
       (unwind-protect
           (progn
             (should (el-chronos-store-open path))
-            (should (= 3 (el-chronos-test--scalar "PRAGMA user_version")))
+            (should (= 4 (el-chronos-test--scalar "PRAGMA user_version")))
             (should (equal el-chronos-store-test--all-tables
                            (el-chronos-store-test--tables el-chronos-store--db))))
         (el-chronos-store-close)))))
@@ -580,15 +671,22 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
       (el-chronos-test--exec "INSERT INTO hourly_drift (hour_ts, session_id, count,\
  total_ms, max_ms) VALUES (?, ?, ?, ?, ?)"
                              (list hour session 4 3200.0 900.0))
+      ;; v4 新表（hourly_resources）同样手工 INSERT
+      (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
+ cpu_ms, wall_ms, rss_kb_max, rss_kb_sum, threads_max, load1_sum, load5_sum,\
+ load15_sum, load_n) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                             (list hour session 120.0 500.0 81920 409600 12
+                                   1.5 1.2 0.9 1))
       ;; 让 `--ensure-session' 一定算出非 nil 的 startup_ms（两个 init 时刻差 2 小时），
       ;; 才可能验证 purge 补建后把它置回了 NULL；否则该断言恒真、锁不住行为。
       (let ((before-init-time (time-subtract (current-time) 7200))
             (after-init-time (current-time)))
         (let ((result (el-chronos-purge)))
-          (should (= 11 (length result)))
+          (should (= 12 (length result)))
           (should (equal '("commands" "slow_events" "startup_phases" "session_meta"
                            "hourly_functions" "hourly_usage" "hourly_stacks"
-                           "hourly_gc" "hourly_health" "hourly_drift" "sessions")
+                           "hourly_gc" "hourly_health" "hourly_drift"
+                           "hourly_resources" "sessions")
                          (mapcar #'car result)))))
       (dolist (table (remove "sessions" el-chronos-store-test--all-tables))
         (should (= 0 (el-chronos-test--count table))))
@@ -606,7 +704,7 @@ v1 库走完 v2 就停住，本用例因 `hourly_drift' 缺失而必红。"
       (should (= 1 (el-chronos-test--count "commands"))))))
 
 (ert-deftest el-chronos-store-test-purge-empties-ten-tables ()
-  "`purge' 无参时 11 张表的 1–2 行数据全部清空，只留下重建的当前会话行。
+  "`purge' 无参时 12 张表的 1–2 行数据全部清空，只留下重建的当前会话行。
 fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init 文件），
 保证变更标记即便写入也不会污染 `session_meta'，从而让「必为 0」的断言站得住。"
   (el-chronos-test-with-tmp-dir dir
@@ -638,7 +736,13 @@ fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init �
           (el-chronos-test--exec "INSERT INTO hourly_drift (hour_ts, session_id, count,\
  total_ms, max_ms) VALUES (?, ?, ?, ?, ?)"
                                  (list hour session 3 1800.0 700.0))
-          ;; 11 表都非空（`sessions' 由 open 建好）
+          ;; v4 新表：同上
+          (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
+ cpu_ms, wall_ms, rss_kb_max, rss_kb_sum, threads_max, load1_sum, load5_sum,\
+ load15_sum, load_n) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                 (list hour session 60.0 250.0 65536 204800 10
+                                       1.0 0.8 0.6 1))
+          ;; 12 表都非空（`sessions' 由 open 建好）
           (dolist (table el-chronos-store-test--all-tables)
             (should (>= (el-chronos-test--count table) 1)))
           (el-chronos-purge)
@@ -891,7 +995,7 @@ fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init �
                                    (list old-hour b-id "flush-failures" 2.0)))
           ;; ① 不报错、事务真的提交（外键失败时 purge 返回 nil）
           (let ((result (el-chronos-purge cutoff)))
-            (should (= 11 (length result)))
+            (should (= 12 (length result)))
             ;; 只删掉 B 这一行会话
             (should (= 1 (cdr (assoc "sessions" result)))))
           ;; ② 会话 A 保留；A 的过期命令被删，今天的命令保留
@@ -1488,6 +1592,152 @@ purge 的 `session_id IN (SELECT id FROM sessions ...)' 子查询永远删不掉
       (should (= 0 (hash-table-count el-chronos-store--gc)))
       (should (= 0 (hash-table-count el-chronos-store--health)))
       (should (= 0 (hash-table-count el-chronos-store--startup))))))
+
+;;; 进程资源聚合（v4：hourly_resources）
+
+(ert-deftest el-chronos-store-test-record-resources-accumulates-and-max-wins ()
+  "同键两次 record：`cpu_ms' / `wall_ms' / `load*_sum' 累加，`rss_kb_max' /
+`threads_max' 取大，`rss_kb_sum' 累加，`load_n' 每次有负载样本 +1；
+第二次的可空字段传 nil（模拟「本窗口没采到该指标」）不得把已有值抹成 NULL。
+锁住 `--sql-upsert-resources' 的三组列语义（累加 / 取最值 / 条件累加）与 NULL 保旧值：
+把取最值写成普通覆盖、或把条件累加写成裸加法（任一侧 NULL 即得 NULL），本用例即红。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-store-record-resources
+       hour (list :cpu-ms 120.0 :wall-ms 500.0 :rss-kb-max 81920 :rss-kb-sum 409600
+                  :threads-max 12 :load1-sum 1.5 :load5-sum 1.2 :load15-sum 0.9))
+      (el-chronos-store-record-resources
+       hour (list :cpu-ms 80.0 :wall-ms 300.0))
+      (should (= 1 (hash-table-count el-chronos-store--resources)))
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--count "hourly_resources")))
+      (let ((row (car (sqlite-select
+                       el-chronos-store--db
+                       (concat "SELECT cpu_ms, wall_ms, rss_kb_max, rss_kb_sum,"
+                               " threads_max, load1_sum, load5_sum, load15_sum, load_n"
+                               " FROM hourly_resources")
+                       nil))))
+        (should (= 200.0 (nth 0 row)))    ; cpu 累加
+        (should (= 800.0 (nth 1 row)))    ; wall 累加
+        (should (= 81920 (nth 2 row)))    ; rss 峰值保旧值（第二批传 nil）
+        (should (= 409600 (nth 3 row)))   ; rss 总和保旧值
+        (should (= 12 (nth 4 row)))       ; 线程数峰值保旧值
+        (should (= 1.5 (nth 5 row)))      ; load1 保旧值
+        (should (= 1.2 (nth 6 row)))
+        (should (= 0.9 (nth 7 row)))
+        (should (= 1 (nth 8 row)))))      ; 只有第一批带负载 → load_n = 1
+    ;; 第三批：带**更大**的峰值与一个负载样本 —— 峰值取大、load_n 再 +1（跨批次同一保证）
+    (el-chronos-store-record-resources
+     (el-chronos-test--hour-ts)
+     (list :rss-kb-max 90000 :threads-max 16
+           :load1-sum 0.5 :load5-sum 0.4 :load15-sum 0.3))
+    (should (el-chronos-store-flush))
+    (should (= 2 (el-chronos-test--scalar "SELECT load_n FROM hourly_resources")))
+    (should (= 2.0 (el-chronos-test--scalar "SELECT load1_sum FROM hourly_resources")))
+    (should (= 200.0 (el-chronos-test--scalar "SELECT cpu_ms FROM hourly_resources")))
+    ;; 峰值取大（跨批次）：把 `rss_kb_max' 写成普通覆盖不会红（本批更大），
+    ;; 故上一批已锁住「较小值不覆盖」，两条合起来才完整覆盖「取标量 MAX」。
+    (should (= 90000 (el-chronos-test--scalar "SELECT rss_kb_max FROM hourly_resources")))
+    (should (= 16 (el-chronos-test--scalar "SELECT threads_max FROM hourly_resources")))))
+
+(ert-deftest el-chronos-store-test-record-resources-ignores-empty-plist ()
+  "全部字段为空（或缺省）时不建行、不报错：一行全 0 的资源数据没有信息量，
+还会让「这一小时到底有没有采到资源」在查询层不可区分（I6：不抛错）。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (should-not (el-chronos-store-record-resources hour nil))
+      (should-not (el-chronos-store-record-resources
+                   hour (list :cpu-ms "120" :rss-kb-max 'big)))
+      (should (= 0 (hash-table-count el-chronos-store--resources)))
+      (should-not (el-chronos-store--pending-p))
+      ;; 单个合法字段就能建行（守卫没有误伤正常输入）
+      (should (el-chronos-store-record-resources hour (list :rss-kb-max 4096)))
+      (should (= 1 (hash-table-count el-chronos-store--resources))))))
+
+(ert-deftest el-chronos-store-test-flush-runs-when-only-resources-pending ()
+  "只有资源聚合待写时 flush 也必须执行（锁 `--pending-p' 与 `--aggregates-pending-p'
+里的 `--resources'）。
+漏掉前者 → flush 第一道门 `(and db (--pending-p))' 早退 → 资源数据永不落库且**无任何报错**；
+漏掉后者 → 会话行不存在时既不写行也不告警。资源采样本质稀疏（每 N 秒一条窗口），
+「只有 resources 待写」是常态而非边缘情况。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (should (null el-chronos-store--buffer))
+      (should (null el-chronos-store--slow-events))
+      (should (= 0 (hash-table-count el-chronos-store--usage)))
+      (should (= 0 (hash-table-count el-chronos-store--functions)))
+      (should (= 0 (hash-table-count el-chronos-store--stacks)))
+      (should (= 0 (hash-table-count el-chronos-store--gc)))
+      (should (= 0 (hash-table-count el-chronos-store--health)))
+      (should (= 0 (hash-table-count el-chronos-store--startup)))
+      (should (= 0 (hash-table-count el-chronos-store--drift)))
+      (should-not el-chronos-store--pending-startup-ms)
+      (el-chronos-store-record-resources hour (list :cpu-ms 10.0 :wall-ms 40.0))
+      (should (= 1 (hash-table-count el-chronos-store--resources)))
+      (should (el-chronos-store--pending-p))
+      (should (el-chronos-store--aggregates-pending-p))
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--count "hourly_resources")))
+      (should (= 0 (hash-table-count el-chronos-store--resources)))
+      (should-not (el-chronos-store--pending-p)))))
+
+(ert-deftest el-chronos-store-test-close-clears-resources ()
+  "`close' 之后 `--resources' 不残留（I5 零残留）。
+把 flush 打桩掉，才能区分「close 自己清的」与「close 首行 flush 顺带消费掉的」。"
+  (el-chronos-test-with-db
+    (el-chronos-store-record-resources (el-chronos-test--hour-ts)
+                                       (list :cpu-ms 5.0 :wall-ms 20.0))
+    (should (= 1 (hash-table-count el-chronos-store--resources)))
+    (cl-letf (((symbol-function 'el-chronos-store-flush) #'ignore))
+      (el-chronos-store-close))
+    (should (= 0 (hash-table-count el-chronos-store--resources)))))
+
+(ert-deftest el-chronos-store-test-purge-empties-hourly-resources ()
+  "无参 `purge' 把 `hourly_resources' 清空，且重建的当前会话行不受影响。
+它是**永久保留**类表（`--prune' 不碰），唯一清理入口就是 purge —— 若漏在
+`--purge-targets' 清单里，资源数据会永久残留且不报错，用户以为隐私清理已生效。"
+  (el-chronos-store-test--with-hermetic-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (session el-chronos--session-id))
+      (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
+ cpu_ms, wall_ms, rss_kb_max, rss_kb_sum, threads_max, load1_sum, load5_sum,\
+ load15_sum, load_n) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                             (list hour session 100.0 400.0 40960 204800 8
+                                   1.0 0.9 0.8 1))
+      (should (= 1 (el-chronos-test--count "hourly_resources")))
+      (let ((result (el-chronos-purge)))
+        (should (= 12 (length result)))
+        (should (assoc "hourly_resources" result))
+        (should (= 1 (cdr (assoc "hourly_resources" result)))))
+      (should (= 0 (el-chronos-test--count "hourly_resources")))
+      (should (= 1 (el-chronos-test--count "sessions"))))))
+
+(ert-deftest el-chronos-store-test-hourly-resources-has-no-foreign-key ()
+  "`hourly_resources' 不写外键（与既有 hourly_* 及 v2 / v3 各表一致）。
+加上 `REFERENCES sessions(id)' 会让 purge 删除顺序、级联删除与 `foreign_keys=ON'
+三者耦合 —— 删会话行要么撞外键（整批回滚）要么静默级联删掉聚合数据。
+判据：`PRAGMA foreign_key_list(hourly_resources)' 为空，且直接删会话行不报错。"
+  (el-chronos-store-test--with-hermetic-db
+    (should (null (sqlite-select el-chronos-store--db
+                                 "PRAGMA foreign_key_list(hourly_resources)")))
+    (let ((id (el-chronos-test--insert-session (el-chronos-test--now-ms))))
+      (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
+ cpu_ms, wall_ms) VALUES (?, ?, ?, ?)"
+                             (list (el-chronos-test--hour-ts) id 10.0 20.0))
+      (el-chronos-test--exec "DELETE FROM sessions WHERE id = ?" (list id))
+      (should (= 1 (el-chronos-test--count "hourly_resources"))))))
+
+(ert-deftest el-chronos-store-test-prune-does-not-touch-hourly-resources ()
+  "自动 retention（`--prune'）不碰 `hourly_resources'：即使行的时间戳远早于保留阈值，
+也一行不动（资源聚合永久保留，只由 purge 清理）。"
+  (el-chronos-store-test--with-hermetic-db
+    (let* ((old 1000)                   ; 远早于 30 天保留阈值
+           (old-id (el-chronos-test--insert-session old)))
+      (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
+ cpu_ms, wall_ms, load_n) VALUES (?, ?, ?, ?, ?)"
+                             (list old old-id 50.0 200.0 1))
+      (should (el-chronos-store--prune))
+      (should (= 1 (el-chronos-test--count "hourly_resources"))))))
 
 ;;; 变更标记采集（T3：git-head / config-sig）
 

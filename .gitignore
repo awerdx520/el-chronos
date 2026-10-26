@@ -22,3 +22,10 @@ eln-cache/
 
 # autoloads 生成物（`make autoloads` 产出，按需重建、不入库）
 /el-chronos-autoloads.el
+
+# make test 临时目录（TD-25：部分用例在仓库根建临时目录）
+/chronos-test-*/
+/chr*/
+/el-chronos-web-test-*/
+/org-persist-*/
+/test-nativecomp-cache-*/

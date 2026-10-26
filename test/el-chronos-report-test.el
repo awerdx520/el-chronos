@@ -18,12 +18,14 @@
 ;;      列表 → `apply'（断言实参确实是 3 个，而不是「一个列表」）；单值 → 单个实参。
 ;;   5. 错误与降级：命令抛错只进报告 `* 错误' 节，调用方不崩；`--save' 在零样本时
 ;;      不写库；`el-chronos-profile-save' 为 nil 时根本不调用 `--save'。
-;;   6. 报告结构：14 个 `* 标题' 节、空库 8 处 `（无数据）'、正文不出现 `nil' 字面量；
-;;      新增三节（启动分解 / 采集健康 / 配置变更）各自的有数据与降级渲染，
-;;      其中「采集健康」区分「没采集」（`:rows' 为 0）与「没异常」（`:ok-p' 为 t）。
-;;   9. 导出：CSV 的 9 个 `# section:' 区块（既有 5 + startup / health / config-history /
-;;      drift）与 JSON 的新键；断言覆盖行内容而非只认标题。
-;;      另有一条「阻塞事件」节内的「命令外停转」汇总行（不新增节，故节数仍为 14）。
+;;   6. 报告结构：15 个 `* 标题' 节、空库 8 处 `（无数据）'、正文不出现 `nil' 字面量；
+;;      新增四节（启动分解 / 采集健康 / 配置变更 / 资源）各自的有数据与降级渲染，
+;;      其中「采集健康」区分「没采集」（`:rows' 为 0）与「没异常」（`:ok-p' 为 t）；
+;;      「热点函数 TOP」节内的 `** 栈包含占比 TOP' 子小节同样各有渲染与降级用例
+;;      （它是子小节，**不计入节数** —— 节数由 14 抬到 15 只因新增「资源」节）。
+;;   9. 导出：CSV 的 10 个 `# section:' 区块（既有 5 + startup / health / config-history /
+;;      drift / resources）与 JSON 的新键；断言覆盖行内容而非只认标题。
+;;      另有一条「阻塞事件」节内的「命令外停转」汇总行（不新增节，故节数不含它）。
 ;;   7. 报告期间抑制自观测阻塞：`--without-block-events' 的绑定/恢复 + 关键行为断言
 ;;      （重查询后心跳不新增 `block' 行；对照组直接跑重查询则确实会新增）。
 ;;   8. Web：500 分支不回显内部错误（含绝对路径）、改走 `display-warning'、之后仍可服务；
@@ -280,27 +282,31 @@
 ;;; 报告渲染
 
 (ert-deftest el-chronos-report-test--content-sections ()
-  "fixture 下报告含 14 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。"
+  "fixture 下报告含 15 个 `* 标题' 节、关键数据可见、正文无 `nil' 字面量。
+节数由 14 抬到 15 的原因：新增「资源（CPU / 内存 / 负载）」节（`hourly_resources'）。
+栈包含占比**不**计节数 —— 它是「热点函数 TOP」节内的 `**' 子小节（见
+`inclusive-subsection-renders'）。"
   (el-chronos-test-with-db
     (el-chronos-report-test--seed)
     (let ((content (el-chronos-report--content '7d)))
       (should (stringp content))
       (should (string-match-p "\\`#\\+TITLE: el-chronos 报告" content))
-      (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 15 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (string-match-p "save-buffer" content))
       (should (string-match-p "leaf-fn" content))
       (should (string-match-p "900 ms" content))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
 
 (ert-deftest el-chronos-report-test--content-empty-db ()
-  "空库时报告仍然成型：14 节、8 处 `（无数据）'、无 `nil' 字面量。
-「GC 与内存」节空库走更具体的降级说明（见 `report-gc-section-degrades-visible'），
-「启动分解」/「配置变更」两节同理走各自的降级文案（见各自的 renders-and-degrades 用例），
-「采集健康」空库走「本期无采集数据」（没采集 ≠ 没异常，见
-`health-distinguishes-no-data-from-no-problem'）—— 因此这四节都不计入 `（无数据）' 的 8 处。"
+  "空库时报告仍然成型：15 节、8 处 `（无数据）'、无 `nil' 字面量。
+节数 15 里包含新增的「资源」节：它空库时走 `el-chronos-report--resource-degrade'
+（「本期无进程资源数据…」），因此**不**计入 `（无数据）' 的 8 处 —— 同理「GC 与内存」
+（`report-gc-section-degrades-visible'）、「启动分解」/「配置变更」（各自的
+renders-and-degrades 用例）、「采集健康」（「本期无采集数据」，没采集 ≠ 没异常）这五节
+都用专属降级文案。"
   (el-chronos-test-with-db
     (let ((content (el-chronos-report--content '7d)))
-      (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 15 (el-chronos-report-test--count-matches "^\\* " content)))
       (should (= 8 (el-chronos-report-test--count-matches "（无数据）" content)))
       (should-not (string-match-p "\\_<nil\\_>" content)))))
 
@@ -339,7 +345,7 @@
             (should buffer-read-only)
             (should (eq '1d el-chronos-report--current-range))
             (should (functionp revert-buffer-function))
-            (should (= 14 (el-chronos-report-test--count-matches
+            (should (= 15 (el-chronos-report-test--count-matches
                            "^\\* " (buffer-substring-no-properties
                                     (point-min) (point-max))))))
         (kill-buffer buffer)))))
@@ -350,7 +356,8 @@
 (ert-deftest el-chronos-report-test-report-drift-summary-in-blocking-section ()
   "「阻塞事件」节内出现一行「命令外停转」汇总：有数据时含次数 / 累计 / 最坏与口径标注，
 无数据时给可见降级文案（I11），且该节本身始终存在。
-断言的是**节内一行**而不是新节 —— 报告节数必须保持 14（drift 只加一行，不膨胀结构）。
+断言的是**节内一行**而不是新节 —— drift 只加一行、不膨胀结构；报告节数（15）里
+含新增的「资源」节，但**不含** drift 与栈包含（后两者都是节内的一行 / 子小节）。
 阈值断言用 defcustom 默认值（drift 500 / block 2000）。"
   (el-chronos-test-with-db
     (let ((hour (el-chronos-test--hour-ts))
@@ -362,7 +369,7 @@
                  (concat "^- 命令外停转（500–2000 ms）：本期无记录"
                          "（命令内停转见「慢命令」节；两者不可相加）$")
                  empty))
-        (should (= 14 (el-chronos-report-test--count-matches "^\\* " empty))))
+        (should (= 15 (el-chronos-report-test--count-matches "^\\* " empty))))
       ;; ② 有数据：一行汇总，次数 / 累计 / 最坏都用可读单位
       (el-chronos-test--insert-slow-event now 2500.0 "block")
       (el-chronos-test--exec
@@ -385,7 +392,111 @@
               (table (string-match-p "| 时间 | 时长 | 命令 | mode | project |" content)))
           (should (< title line))
           (should (< line table)))
-        (should (= 14 (el-chronos-report-test--count-matches "^\\* " content)))))))
+        (should (= 15 (el-chronos-report-test--count-matches "^\\* " content)))))))
+
+;;; 资源节（hourly_resources）与栈包含子小节（hourly_stacks 包含口径）
+
+(defun el-chronos-report-test--insert-resource (hour-ts cpu-ms wall-ms rss-max rss-sum
+                                                          threads load1 load5 load15
+                                                          load-n &optional session-id)
+  "插入一条 `hourly_resources' 聚合行（参数顺序同表列，SESSION-ID 默认 0）。
+可空参数传 nil 时落库为 NULL —— 语义是「本行从未观测到该指标」，不是 0。
+（helper 没有资源的 fixture 写入函数，故在此就地定义；与
+`el-chronos-analysis-test--insert-resource' 同款 SQL。）"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_resources (hour_ts, session_id, cpu_ms, wall_ms, rss_kb_max,\
+ rss_kb_sum, threads_max, load1_sum, load5_sum, load15_sum, load_n)\
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+   (list hour-ts (or session-id 0)
+         (float (or cpu-ms 0)) (float (or wall-ms 0))
+         rss-max rss-sum threads
+         (and load1 (float load1)) (and load5 (float load5))
+         (and load15 (float load15)) (or load-n 0))))
+
+(ert-deftest el-chronos-report-test-resource-section-renders ()
+  "有资源数据时「资源（CPU / 内存 / 负载）」节渲染汇总行 + 桶表 + 三条口径。
+单位断言刻意分开（I4 只约束时间）：cpu/wall 走毫秒→人类可读，RSS 走 KB→MB，线程是计数，
+负载是两位小数 —— 任何一列被「统一成毫秒」都会让本用例变红。"
+  (el-chronos-test-with-db
+    (el-chronos-report-test--insert-resource
+     (el-chronos-test--hour-ts) 100.0 1000.0 204800 204800 8 1.5 2.0 3.0 1)
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\* 资源（CPU / 内存 / 负载）$" content))
+      ;; ① 窗口汇总一行：CPU% / cpu+墙钟 / RSS 峰值 / 线程峰值 / 三档负载
+      (should (string-match-p "CPU 占用 10\\.0%" content))
+      (should (string-match-p "cpu 100 ms / 墙钟 1\\.00 s" content))
+      (should (string-match-p "RSS 峰值 200\\.0 MB" content))
+      (should (string-match-p "线程峰值 8" content))
+      (should (string-match-p "负载 1m/5m/15m = 1\\.50/2\\.00/3\\.00" content))
+      ;; ② 桶表：表头与单元格
+      (should (string-match-p "| 时间 | CPU% | RSS 峰值 | RSS 均值 | 线程 | 负载 1m |" content))
+      (should (string-match-p "| 10\\.0% | 200\\.0 MB | 200\\.0 MB | 8 | 1\\.50 |" content))
+      ;; ③ 三条口径必须原样可见（分析层 docstring 的诚实性约束在报告侧也要可见）
+      (should (string-match-p "口径 ①：CPU% 是「窗口内 CPU 时间增量 / 墙钟增量」" content))
+      (should (string-match-p "口径 ②：RSS 均值的分母是 `load_n'" content))
+      (should (string-match-p "口径 ③：首窗口只建基线" content))
+      (should-not (string-match-p "本期无进程资源数据" content)))))
+
+(ert-deftest el-chronos-report-test-resource-section-degrades-visible ()
+  "无资源数据时节标题仍在，正文给可见降级说明（I11：不得静默省略整节）。
+另外两件事必须成立：① 不铺空表头；② 负载采集失败的桶（`load_n' 为 0）均值渲染 \"-\"
+而不是 0 或峰值 —— 这是「没观测到」与「观测到 0」的分界。"
+  (el-chronos-test-with-db
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\* 资源（CPU / 内存 / 负载）$" content))
+      (should (string-match-p "本期无进程资源数据（`hourly_resources' 为空" content))
+      (should-not (string-match-p "| 时间 | CPU% |" content)))
+    ;; 有 CPU / RSS / 线程但负载全失败（load_n = 0）→ 均值列是 "-"，不是 0
+    (el-chronos-test-with-db
+      (el-chronos-report-test--insert-resource
+       (el-chronos-test--hour-ts) 50.0 500.0 102400 102400 4 nil nil nil 0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "^\\* 资源（CPU / 内存 / 负载）$" content))
+        (should (string-match-p "| 10\\.0% | 100\\.0 MB | - | 4 | - |" content))
+        (should (string-match-p "负载 1m/5m/15m = -/-/-" content))))))
+
+(ert-deftest el-chronos-report-test-inclusive-subsection-renders ()
+  "「热点函数 TOP」节内出现 `** 栈包含占比 TOP' 子小节，含口径说明与表格行。
+fixture 的 leaf-fn 同时出现在 `hourly_functions'（候选集）与 `hourly_stacks'
+（[\"leaf-fn\",\"mid-fn\"]，5 样本），故包含口径下它出现在 100% 的栈样本里。"
+  (el-chronos-test-with-db
+    (el-chronos-report-test--seed)
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\*\\* 栈包含占比 TOP$" content))
+      (should (string-match-p
+               "按「该函数出现在多少比例的采样栈里」排序" content))
+      (should (string-match-p "self 口径只数 leaf 样本" content))
+      (should (string-match-p "该函数是调度者而非计算者" content))
+      (should (string-match-p "| 函数 | 包/模块 | 包含% | 样本 | 栈数 |" content))
+      (should (string-match-p "^| leaf-fn | .+ | 100\\.0% | 5 | 1 |$" content))
+      (should-not (string-match-p "本期无栈包含数据" content)))))
+
+(ert-deftest el-chronos-report-test-inclusive-subsection-degrades-visible ()
+  "无栈数据时子小节仍然出现，并给可见说明（I11：不得静默省略整段）。
+断言的重点是「子小节标题还在 + 说明可见 + 没有空表头」，三者缺一都会让读者误判成
+「这个功能压根没实现」。"
+  (el-chronos-test-with-db
+    (let ((content (el-chronos-report--content '7d)))
+      (should (string-match-p "^\\*\\* 栈包含占比 TOP$" content))
+      (should (string-match-p "本期无栈包含数据（`hourly_stacks' 为空）" content))
+      (should-not (string-match-p "| 函数 | 包/模块 | 包含% |" content)))))
+
+(ert-deftest el-chronos-report-test-inclusive-subsection-does-not-add-section ()
+  "栈包含是「热点函数 TOP」节内的子小节：位置在热点表与「包归因」之间，且**不增加节数**。
+这条用例守的是结构品味而不是数据：报告已有 15 节，再加一节只增加阅读负担，还会把
+self 榜与包含榜拆到两处、失去「差异即结论」的对照价值（同 drift 挤进「阻塞事件」节）。"
+  (el-chronos-test-with-db
+    (el-chronos-report-test--seed)
+    (let* ((content (el-chronos-report--content '7d))
+           (hot (string-match-p "^\\* 热点函数 TOP$" content))
+           (sub (string-match-p "^\\*\\* 栈包含占比 TOP$" content))
+           (packages (string-match-p "^\\* 包归因$" content)))
+      (should (< hot sub))
+      (should (< sub packages))
+      ;; 节数仍是 15：子小节用 `**' 开头，不计入 `^\\* ' 的统计
+      (should (= 15 (el-chronos-report-test--count-matches "^\\* " content)))
+      (should (= 1 (el-chronos-report-test--count-matches
+                    "^\\*\\* 栈包含占比 TOP$" content))))))
 
 ;;; 启动分解 / 采集健康 / 配置变更三节
 
@@ -528,6 +639,7 @@ JSON 含 `:startup' / `:health' / `:config_history' 三个新键。
         (should (string-match-p "^# section: startup$" csv))
         (should (string-match-p "^# section: health$" csv))
         (should (string-match-p "^# section: config-history$" csv))
+        (should (string-match-p "^# section: resources$" csv))
         ;; 既有 5 个区块仍在（导出是全量快照，不许因新增而丢旧块）
         (should (string-match-p "^# section: slow-commands$" csv))
         (should (string-match-p "^# section: top-functions$" csv))
@@ -547,7 +659,20 @@ JSON 含 `:startup' / `:health' / `:config_history' 三个新键。
         (should (string-match-p "^session_id,started_at_ms,git_head,config_sig,changed$" csv))
         (should (string-match-p (format "\n%d,%d,aaaaaaaabbbbcccc,111122223333,[01]\n"
                                         id now)
-                                csv)))
+                                csv))
+        ;; resources：表头逐字（列顺序与 web 侧一致），无数据时只有表头（I11）
+        (should (string-match-p
+                 (concat "^bucket_ms,cpu_ms,wall_ms,cpu_pct,rss_kb_max,rss_kb_avg,"
+                         "threads_max,load1_avg,load5_avg,load15_avg,samples$")
+                 csv))
+        ;; 区块顺序：resources 是最后一块（drift 之后，且之后不再有新块）——
+        ;; 顺序也是被 `csv-sections-match-web' 逐项比对的不变量
+        (let* ((drift-at (string-match-p "^# section: drift$" csv))
+               (resources-at (string-match-p "^# section: resources$" csv))
+               (resources-body (string-match-p "\n" csv resources-at)))
+          (should (numberp drift-at))
+          (should (< drift-at resources-at))
+          (should-not (string-match-p "# section: " csv resources-body))))
       (let ((json (json-parse-string (el-chronos-report--json-string '7d)
                                      :object-type 'plist)))
         (should (plist-member json :startup))

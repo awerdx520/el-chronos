@@ -422,6 +422,109 @@ SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键�
         (should (= 25.0 (plist-get (nth 1 items) :pct)))
         (should (= 100.0 (cl-loop for i in items sum (plist-get i :pct))))))))
 
+;;; 栈包含法归因
+
+(ert-deftest el-chronos-analysis-test-inclusive-quote-boundary ()
+  "整名匹配：`foo' 的样本不含只出现在 `foo-bar' 栈里的样本。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-stack hour "[\"foo\",\"helper\"]" 4)
+      (el-chronos-test--insert-stack hour "[\"foo-bar\"]" 6)
+      (el-chronos-test--insert-function hour "foo" "/tmp/a.el" "magit" 4.0 100.0 4)
+      (el-chronos-test--insert-function hour "foo-bar" "/tmp/b.el" "org" 6.0 50.0 6)
+      (let ((items (el-chronos-analysis-inclusive-functions window)))
+        (should (= 4 (plist-get (cl-find "foo" items :key (lambda (i) (plist-get i :function))
+                                         :test #'equal)
+                                :samples)))
+        ;; 反证：`foo-bar' 自己的 6 个样本没被算进 `foo'
+        (should (= 6 (plist-get (cl-find "foo-bar" items
+                                         :key (lambda (i) (plist-get i :function))
+                                         :test #'equal)
+                                :samples)))))))
+
+(ert-deftest el-chronos-analysis-test-inclusive-denominator ()
+  "`:pct' 分母是窗口内全部栈样本数，含未被任何候选命中的栈。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-stack hour "[\"baz\"]" 1)
+      ;; 空库样例：`no-such-fn' 没有 `hourly_functions' 行，不是候选，但它的样本进分母
+      (el-chronos-test--insert-stack hour "[\"no-such-fn\"]" 3)
+      (el-chronos-test--insert-function hour "baz" "/tmp/c.el" "org" 1.0 10.0 1)
+      (let ((items (el-chronos-analysis-inclusive-functions window)))
+        (should (= 1 (length items)))
+        (should (equal "baz" (plist-get (car items) :function)))
+        (should (= 25.0 (plist-get (car items) :pct)))))))
+
+(ert-deftest el-chronos-analysis-test-inclusive-limit-invariant ()
+  "LIMIT 只截断返回条数，不改变 `:pct'（分母取截断前）。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-stack hour "[\"one\",\"two\"]" 3)
+      (el-chronos-test--insert-stack hour "[\"two\"]" 1)
+      (el-chronos-test--insert-function hour "one" "/tmp/a.el" "magit" 3.0 90.0 3)
+      (el-chronos-test--insert-function hour "two" "/tmp/a.el" "magit" 4.0 40.0 4)
+      (let* ((all (el-chronos-analysis-inclusive-functions window 100))
+             (single (el-chronos-analysis-inclusive-functions window 1))
+             (pct-of (lambda (items name)
+                       (plist-get (cl-find name items
+                                           :key (lambda (i) (plist-get i :function))
+                                           :test #'equal)
+                                  :pct))))
+        (should (= 2 (length all)))
+        (should (= 1 (length single)))
+        ;; 截断后留下的确实是样本数最高的那条
+        (should (equal "two" (plist-get (car single) :function)))
+        ;; 同一函数（"two"）在 LIMIT 1 与 LIMIT 100 下 pct 相同
+        (should (= 100.0 (funcall pct-of all "two")))
+        (should (= 100.0 (funcall pct-of single "two")))
+        ;; 被 LIMIT 截掉的那条在完整列表里 pct 仍按全窗口分母算
+        (should (= 75.0 (funcall pct-of all "one")))))))
+
+(ert-deftest el-chronos-analysis-test-inclusive-empty ()
+  "空库（窗口内无栈）返回 nil。"
+  (el-chronos-test-with-db
+    (should-not (el-chronos-analysis-inclusive-functions
+                 (el-chronos-analysis-test--window)))))
+
+(ert-deftest el-chronos-analysis-test-inclusive-middle-frame ()
+  "`samples = 0' 的中间帧必须被计入（本函数的首要守门用例）。
+`middle' 的 `hourly_functions.samples' 为 0（从未作为 leaf），任何 `samples > 0' 过滤
+或 self 口径排序都会把它整批丢掉；这里断言它出现且 `:pct' > 0。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-stack hour "[\"leaf\",\"middle\"]" 5)
+      (el-chronos-test--insert-function hour "leaf" "/tmp/a.el" "magit" 50.0 50.0 5)
+      ;; 中间帧：samples = 0 但 total_ms > 0
+      (el-chronos-test--insert-function hour "middle" "/tmp/a.el" "magit" 0.0 40.0 0)
+      (let* ((items (el-chronos-analysis-inclusive-functions window))
+             (middle (cl-find "middle" items :key (lambda (i) (plist-get i :function))
+                              :test #'equal)))
+        (should middle)
+        (should (= 5 (plist-get middle :samples)))
+        (should (= 1 (plist-get middle :stacks)))
+        (should (= 100.0 (plist-get middle :pct)))
+        (should (> (plist-get middle :pct) 0))))))
+
+(ert-deftest el-chronos-analysis-test-inclusive-frames-deduped ()
+  "同一栈里同名帧重复出现（递归 / advice 链）时该栈只计一次样本。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-stack hour "[\"rec\",\"outer\",\"rec\"]" 3)
+      (el-chronos-test--insert-function hour "rec" "/tmp/a.el" "magit" 3.0 60.0 3)
+      (el-chronos-test--insert-function hour "outer" "/tmp/a.el" "magit" 0.0 30.0 0)
+      (let* ((items (el-chronos-analysis-inclusive-functions window))
+             (rec (cl-find "rec" items :key (lambda (i) (plist-get i :function))
+                           :test #'equal)))
+        ;; 重复帧不得把 3 个样本累加成 6（那会让 pct 超过 100）
+        (should (= 3 (plist-get rec :samples)))
+        (should (= 1 (plist-get rec :stacks)))
+        (should (= 100.0 (plist-get rec :pct)))))))
+
 ;;; 阻塞事件与单条下钻
 
 (ert-deftest el-chronos-analysis-test-blocking-events ()
@@ -703,6 +806,281 @@ SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键�
       (should-not (el-chronos-analysis-regressions '1d))
       (should-not (el-chronos-analysis-names))
       (should-not (el-chronos-analysis-event 1)))))
+
+;;; 进程资源趋势（hourly_resources）
+
+(defun el-chronos-analysis-test--insert-resource (hour-ts cpu-ms wall-ms rss-max
+                                                          rss-sum threads
+                                                          load1 load5 load15
+                                                          load-n &optional session-id)
+  "插入一条 `hourly_resources' 聚合行（参数顺序同表列，SESSION-ID 默认 0）。
+任一可空参数传 nil 时落库为 NULL —— 语义是「本行从未观测到该指标」，不是 0。"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_resources (hour_ts, session_id, cpu_ms, wall_ms, rss_kb_max,\
+ rss_kb_sum, threads_max, load1_sum, load5_sum, load15_sum, load_n)\
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+   (list hour-ts (or session-id 0)
+         (float (or cpu-ms 0)) (float (or wall-ms 0))
+         rss-max rss-sum threads
+         (and load1 (float load1)) (and load5 (float load5))
+         (and load15 (float load15)) (or load-n 0))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-empty ()
+  "空库：trend 返回与有数据同构的 plist（不是 nil），summary 返回 nil。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (empty (el-chronos-analysis-resource-trend window)))
+      (should (listp empty))
+      (should-not (plist-get empty :buckets))
+      (should (= 0.0 (plist-get empty :cpu-ms-total)))
+      (should (= 0.0 (plist-get empty :wall-ms-total)))
+      (should (= 0.0 (plist-get empty :cpu-pct-avg)))
+      (should-not (plist-get empty :rss-kb-max))
+      (should-not (plist-get empty :rss-kb-avg))
+      (should-not (plist-get empty :threads-max))
+      (should-not (plist-get empty :load1-avg))
+      (should (= 0 (plist-get empty :samples)))
+      (should (consp (plist-get empty :range)))
+      (should (integerp (plist-get empty :bucket-span)))
+      ;; 概览类查询必须能区分「无数据」与「有数据但全 0」
+      (should-not (el-chronos-analysis-resource-summary window))
+      (el-chronos-analysis-test--insert-resource (el-chronos-test--hour-ts)
+                                                 1 2 10 10 1 0.5 0.5 0.5 1)
+      (let ((filled (el-chronos-analysis-resource-trend window)))
+        ;; 键集合完全一致：调用方不必为「空」分叉
+        (should (equal (cl-loop for (key _v) on empty by #'cddr collect key)
+                       (cl-loop for (key _v) on filled by #'cddr collect key)))
+        (should (plist-get filled :buckets))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-single-bucket ()
+  "同一小时两个会话行：累加字段跨行求和、峰值字段跨行取大。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 100 1000 100 100 4 1.0 2.0 3.0 1)
+      (el-chronos-analysis-test--insert-resource hour 50 500 200 200 8 2.0 3.0 4.0 1 999)
+      (let* ((trend (el-chronos-analysis-resource-trend window))
+             (items (plist-get trend :buckets))
+             (only (car items)))
+        (should (= 1 (length items)))            ; 空桶不返回
+        (should (= hour (plist-get only :bucket)))
+        (should (= 150.0 (plist-get only :cpu-ms)))     ; 100 + 50
+        (should (= 1500.0 (plist-get only :wall-ms)))   ; 1000 + 500
+        (should (< (abs (- 10.0 (plist-get only :cpu-pct))) 1e-9))  ; 150/1500*100
+        (should (= 200 (plist-get only :rss-kb-max)))   ; max(100, 200)
+        (should (= 8 (plist-get only :threads-max)))    ; max(4, 8)
+        (should (= 150.0 (plist-get only :rss-kb-avg))) ; (100+200)/2
+        (should (= 1.5 (plist-get only :load1-avg)))    ; (1.0+2.0)/2
+        (should (= 2.5 (plist-get only :load5-avg)))    ; (2.0+3.0)/2
+        (should (= 3.5 (plist-get only :load15-avg)))   ; (3.0+4.0)/2
+        (should (= 2 (plist-get only :samples)))        ; load_n 合计
+        ;; 窗口汇总与桶内同名字段口径一致
+        (should (= 150.0 (plist-get trend :cpu-ms-total)))
+        (should (= 1500.0 (plist-get trend :wall-ms-total)))
+        (should (< (abs (- 10.0 (plist-get trend :cpu-pct-avg))) 1e-9))
+        (should (= 200 (plist-get trend :rss-kb-max)))
+        (should (= 8 (plist-get trend :threads-max)))
+        (should (= 150.0 (plist-get trend :rss-kb-avg)))
+        (should (= 2 (plist-get trend :samples)))
+        (should (equal (cons (- hour (* 3600000 23)) (+ hour 3600001))
+                       (plist-get trend :range)))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-buckets-ascending ()
+  "多个小时各自成桶：返回按桶起点升序（乱序插入也必须升序）。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 10 100 10 10 1 0.1 0.1 0.1 1)
+      (el-chronos-analysis-test--insert-resource (- hour (* 2 3600000))
+                                                 30 300 30 30 3 0.3 0.3 0.3 1)
+      (el-chronos-analysis-test--insert-resource (- hour 3600000)
+                                                 20 200 20 20 2 0.2 0.2 0.2 1)
+      (let* ((trend (el-chronos-analysis-resource-trend window))
+             (buckets (mapcar (lambda (i) (plist-get i :bucket))
+                              (plist-get trend :buckets))))
+        (should (= 3 (length buckets)))
+        (should (equal buckets (list (- hour (* 2 3600000))
+                                     (- hour 3600000) hour)))
+        (should (cl-every (lambda (b) (zerop (mod b 3600000))) buckets))
+        (should (= 60.0 (plist-get trend :cpu-ms-total)))
+        (should (= 600.0 (plist-get trend :wall-ms-total)))
+        (should (< (abs (- 10.0 (plist-get trend :cpu-pct-avg))) 1e-9))
+        ;; 传 6 桶：粒度假但合计不变
+        (let ((coarse (el-chronos-analysis-resource-trend window 6)))
+          (should (= 60.0 (plist-get coarse :cpu-ms-total)))
+          (should (= 600.0 (plist-get coarse :wall-ms-total))))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-zero-wall ()
+  "wall_ms 为 0 时 cpu-pct 返回 0.0：不报错、不返回 nil、不返回 NaN。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 5 0 100 100 4 1.0 1.0 1.0 1)
+      (let* ((trend (el-chronos-analysis-resource-trend window))
+             (only (car (plist-get trend :buckets))))
+        (should (= 5.0 (plist-get only :cpu-ms)))
+        (should (= 0.0 (plist-get only :wall-ms)))
+        (should (eql 0.0 (plist-get only :cpu-pct)))
+        (should (eql 0.0 (plist-get trend :cpu-pct-avg)))
+        (should (eql 0.0 (plist-get (el-chronos-analysis-resource-summary window)
+                                    :cpu-pct)))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-load-n-zero ()
+  "load_n 为 0（负载采集全失败）时均值返回 nil，峰值字段仍有值 —— 不得用 0 冒充。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 100 1000 4096 4096 12
+                                                 nil nil nil 0)
+      (let* ((trend (el-chronos-analysis-resource-trend window))
+             (only (car (plist-get trend :buckets))))
+        (should (= 4096 (plist-get only :rss-kb-max)))
+        (should (= 12 (plist-get only :threads-max)))
+        (should (< (abs (- 10.0 (plist-get only :cpu-pct))) 1e-9))
+        (should-not (plist-get only :rss-kb-avg))
+        (should-not (plist-get only :load1-avg))
+        (should-not (plist-get only :load5-avg))
+        (should-not (plist-get only :load15-avg))
+        (should (= 0 (plist-get only :samples)))
+        (should-not (plist-get trend :rss-kb-avg))
+        (should-not (plist-get trend :load1-avg))
+        (should (= 4096 (plist-get trend :rss-kb-max)))
+        ;; summary 与 trend 同款：nil 就是 nil，不退化成 0
+        (let ((summary (el-chronos-analysis-resource-summary window)))
+          (should-not (plist-get summary :rss-kb-avg))
+          (should-not (plist-get summary :load1-avg))
+          (should (= 4096 (plist-get summary :rss-kb-max)))
+          (should (= 12 (plist-get summary :threads-max)))
+          (should (= 0 (plist-get summary :samples))))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-null-columns ()
+  "可空列全 NULL（平台不支持该指标）时 rss-kb-max / threads-max 为 nil，不是 0。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 100 1000 nil nil nil
+                                                 nil nil nil 1)
+      (let* ((trend (el-chronos-analysis-resource-trend window))
+             (only (car (plist-get trend :buckets))))
+        (should-not (plist-get only :rss-kb-max))
+        (should-not (plist-get only :threads-max))
+        (should-not (plist-get trend :rss-kb-max))
+        (should-not (plist-get trend :threads-max))
+        (should (= 1 (plist-get only :samples)))
+        (let ((summary (el-chronos-analysis-resource-summary window)))
+          (should-not (plist-get summary :rss-kb-max))
+          (should-not (plist-get summary :threads-max)))))))
+
+(ert-deftest el-chronos-analysis-test-resource-summary-matches-trend ()
+  "summary 与 trend 的窗口级汇总逐键一致（防止两条实现漂移）。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-resource hour 100 1000 100 100 4 1.0 2.0 3.0 1)
+      (el-chronos-analysis-test--insert-resource hour 50 500 200 200 8 2.0 3.0 4.0 1 999)
+      (el-chronos-analysis-test--insert-resource (- hour 3600000)
+                                                 30 3000 300 300 6 3.0 3.0 3.0 1)
+      (let ((trend (el-chronos-analysis-resource-trend window))
+            (summary (el-chronos-analysis-resource-summary window)))
+        (should (= (plist-get trend :cpu-ms-total) (plist-get summary :cpu-ms)))
+        (should (= (plist-get trend :wall-ms-total) (plist-get summary :wall-ms)))
+        (should (= (plist-get trend :cpu-pct-avg) (plist-get summary :cpu-pct)))
+        (should (= (plist-get trend :rss-kb-max) (plist-get summary :rss-kb-max)))
+        (should (= (plist-get trend :rss-kb-avg) (plist-get summary :rss-kb-avg)))
+        (should (= (plist-get trend :threads-max) (plist-get summary :threads-max)))
+        (should (= (plist-get trend :load1-avg) (plist-get summary :load1-avg)))
+        (should (= (plist-get trend :load5-avg) (plist-get summary :load5-avg)))
+        (should (= (plist-get trend :load15-avg) (plist-get summary :load15-avg)))
+        (should (= (plist-get trend :samples) (plist-get summary :samples)))
+        ;; 期望值：cpu 180 / wall 4500 → 4%；rss 峰值 300、均值 600/3 = 200
+        (should (< (abs (- 4.0 (plist-get summary :cpu-pct))) 1e-9))
+        (should (= 180.0 (plist-get summary :cpu-ms)))
+        (should (= 4500.0 (plist-get summary :wall-ms)))
+        (should (= 300 (plist-get summary :rss-kb-max)))
+        (should (= 200.0 (plist-get summary :rss-kb-avg)))
+        (should (= 8 (plist-get summary :threads-max)))
+        (should (= 2.0 (plist-get summary :load1-avg)))   ; (1+2+3)/3
+        (should (= 3 (plist-get summary :samples)))))))
+
+(ert-deftest el-chronos-analysis-test-resource-trend-span-merge ()
+  "显式传 buckets 使桶宽大于 1 小时：多个小时行落入同桶，累加与取大仍正确。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           ;; 桶数压到 2 → 桶宽 > 1 小时；取同一桶内两个连续小时
+           (hours (el-chronos-analysis-test--gc-hours window 2 2))
+           (h1 (nth 0 hours)) (h2 (nth 1 hours))
+           (span (plist-get (el-chronos-analysis-resource-trend window 2)
+                            :bucket-span)))
+      (should (< (- h2 h1) span))            ; 前提：两行确实同桶
+      (el-chronos-analysis-test--insert-resource h1 100 1000 100 100 4 1.0 1.0 1.0 1)
+      (el-chronos-analysis-test--insert-resource h2 100 1000 300 300 10 3.0 3.0 3.0 1)
+      (let* ((coarse (el-chronos-analysis-resource-trend window 2))
+             (items (plist-get coarse :buckets)))
+        (should (= 1 (length items)))
+        (should (= span (plist-get coarse :bucket-span)))
+        (should (= 200.0 (plist-get (car items) :cpu-ms)))
+        (should (= 2000.0 (plist-get (car items) :wall-ms)))
+        (should (= 300 (plist-get (car items) :rss-kb-max)))     ; max(100, 300)
+        (should (= 10 (plist-get (car items) :threads-max)))     ; max(4, 10)
+        (should (= 200.0 (plist-get (car items) :rss-kb-avg)))   ; (100+300)/2
+        (should (= 2 (plist-get (car items) :samples))))
+      ;; 反过来：默认 24 桶（桶宽 1 小时）时两条落在不同桶
+      (should (= 2 (length (plist-get (el-chronos-analysis-resource-trend window)
+                                      :buckets)))))))
+
+(ert-deftest el-chronos-analysis-test-resource-guard-degradation ()
+  "数据库打不开时两个查询都返回 nil 且不抛错（I6 降级）。"
+  (cl-letf (((symbol-function 'el-chronos-store-open)
+             (lambda (&rest _args) (error "测试模拟：库打不开"))))
+    (let ((el-chronos-store--db nil))
+      (should-not (el-chronos-analysis-resource-trend '1d))
+      (should-not (el-chronos-analysis-resource-summary '1d)))))
+
+;;; 桶数与桶宽：`--range' 的 +1ms 上界不得渗进桶计算
+
+(ert-deftest el-chronos-analysis-test-range-buckets-ignores-upper-bound-pad ()
+  "`--range-buckets' 按**真实跨度**取档：1d / 7d / 30d 分别 24 / 168 / 720。
+回归守门：`el-chronos-analysis--range' 的 END 是「真实上界 + 1 毫秒」（SQL 右开区间需要），
+若直接拿 `(- end start)' 当跨度，1d 会被算成 1.00000001 天而误落 168 档、8d 会被算成
+8.00000001 天而误落 720 档 —— 档位判断必须先把那 1 毫秒减掉。"
+  (dolist (case '((1d . 24) (7d . 168) (30d . 720)))
+    (let ((bounds (el-chronos-analysis--range (car case))))
+      (should (= (cdr case)
+                 (el-chronos-analysis--range-buckets (car bounds) (cdr bounds))))))
+  ;; 8 天边界：真实跨度恰为 8.0 天 → 仍命中 `(<= days 8.0)' 的 168 档，不能掉到 720 档
+  (let* ((now (el-chronos-analysis--now-ms))
+         (bounds (el-chronos-analysis--range
+                  (cons (- now (* 8 el-chronos-analysis--ms-per-day)) now))))
+    (should (= 8 (/ (- (cdr bounds) (car bounds) 1)
+                    el-chronos-analysis--ms-per-day)))
+    (should (= 168 (el-chronos-analysis--range-buckets (car bounds) (cdr bounds))))))
+
+(ert-deftest el-chronos-analysis-test-bucket-span-ignores-upper-bound-pad ()
+  "`--bucket-span' 对真实跨度取整小时倍数：默认桶数下 1d / 7d / 30d 的桶宽都是 1 小时。
+回归守门：把 END 的 1 毫秒计入会让 720 小时抬成 720.0000003（`ceiling' 得 721）、168 小时
+抬成 169，再按桶数求整小时倍数就合并成 **2 小时** —— 30d 的点数减半、7d 只剩 84 桶。"
+  (dolist (range '(1d 7d 30d))
+    (let* ((bounds (el-chronos-analysis--range range))
+           (buckets (el-chronos-analysis--range-buckets (car bounds) (cdr bounds))))
+      (should (= 3600000
+                 (el-chronos-analysis--bucket-span (car bounds) (cdr bounds) buckets)))))
+  ;; 7d：168 桶 × 1 小时恰好覆盖 7 天（桶宽被抬成 2 小时时这里会变成 84 小时覆盖一半）
+  (let* ((bounds (el-chronos-analysis--range '7d))
+         (buckets (el-chronos-analysis--range-buckets (car bounds) (cdr bounds))))
+    (should (= (* 168 3600000)
+               (* buckets (el-chronos-analysis--bucket-span
+                           (car bounds) (cdr bounds) buckets))))))
+
+(ert-deftest el-chronos-analysis-test-trends-default-span-is-one-hour ()
+  "三个 plist 型趋势查询默认调用（不传 buckets）时，30d 与 7d 的桶宽都是 1 小时。
+只断言 `:bucket-span'：造 720 行 fixture 太慢，桶数与桶宽本身的单元级断言已在上一条用例
+与 `el-chronos-analysis-test-bucket-planning' 里覆盖。"
+  (el-chronos-test-with-db
+    (dolist (fn '(el-chronos-analysis-gc-trend
+                  el-chronos-analysis-drift-trend
+                  el-chronos-analysis-resource-trend))
+      (dolist (range '(30d 7d 1d))
+        (should (= 3600000 (plist-get (funcall fn range) :bucket-span)))))))
 
 (provide 'el-chronos-analysis-test)
 

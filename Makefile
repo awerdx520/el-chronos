@@ -48,7 +48,7 @@ full-check: check-parens test
 
 # autoloads：生成 `el-chronos-autoloads.el`（按需生成，**生成物不入库、不进 L1/L2**）
 #
-# 用途：use-package / 手工 autoload 场景下让 15 个 interactive 命令在包未加载时也能 M-x 调用。
+# 用途：use-package / 手工 autoload 场景下让 16 个 interactive 命令在包未加载时也能 M-x 调用。
 # 不入库的原因：生成物与原文件必然漂移，按需重建即可（`.gitignore` 已忽略）；
 # 不进 L1/L2 的原因：`EL_FILES` 的 find 已显式排除，否则生成后检查范围会随生成物变化。
 # 实现分流：Emacs 29+ 用 `loaddefs-generate`（自身产物列入 EXCLUDED-FILES 防自引用），

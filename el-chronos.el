@@ -82,6 +82,24 @@
                  (const :tag "不记录包加载明细" nil))
   :group 'el-chronos)
 
+(defcustom el-chronos-resource-sampling t
+  "是否采集 Emacs **进程资源**与系统负载（默认开启）。
+采集项（每个采样窗口一次，复用既有采样 timer，**不新增 timer**）：
+- Emacs 进程 CPU：本窗口 CPU 时间增量 / 墙钟增量，由 `process-attributes' 的 `time'
+  字段差分得到（不读任何百分比接口）；
+- 常驻内存 RSS（`process-attributes' 的 `rss'，KB）；
+- 线程数（`thcount'）；
+- 系统负载 1 / 5 / 15（`load-average'）。
+只查 `(emacs-pid)' **自己**，不遍历全系统进程；只读取值，零副作用。
+**不采系统内存**：`memory-info' 给的是系统级内存，且 `default-directory' 为 remote 时
+查的是远端主机（TD-15），与「Emacs 进程自己占多少」不是一回事。
+
+取 nil 表示**完全不采**：连 `process-attributes' 都不调用（该分支直接返回，零开销）。
+关闭的场合：不关心资源趋势，或不想让 `hourly_resources'（**永久保留**表，只由
+`el-chronos-purge' 清理）持续增长。"
+  :type 'boolean
+  :group 'el-chronos)
+
 (defcustom el-chronos-heartbeat-seconds 0.25
   "心跳定时器间隔，单位秒。
 心跳用于检测「命令之外的主线程停转」：比较相邻两次触发的实际间隔，超过
@@ -196,6 +214,17 @@ I8：Web 服务只绑定 127.0.0.1，端口被占用时启动直接失败，不�
 (defcustom el-chronos-web-auto-start nil
   "启用观测时是否顺带启动 Web dashboard。
 默认 nil（不自动启动）：Web 服务需要用户显式 `M-x el-chronos-web-start'。"
+  :type 'boolean
+  :group 'el-chronos)
+
+(defcustom el-chronos-web-open-browser t
+  "交互式启动 Web dashboard 时是否自动用浏览器打开页面。
+默认 t：`M-x el-chronos-web-start' 启动后立即用 `browse-url' 打开页面；nil 时只在
+echo area 显示 URL。
+**只影响交互式调用**：程序化启动（`el-chronos-web-auto-start' 在启用观测时顺带起
+server）绝不弹浏览器，否则每次启动 Emacs 都会弹窗。
+`browse-url' 尊重用户的 `browse-url-browser-function' 等设置；打开失败只 `message'
+提示并给出 URL，不影响 server 启动（I11：可见降级，不静默、不中断）。"
   :type 'boolean
   :group 'el-chronos)
 

@@ -156,6 +156,11 @@
                   (session-id phase ms))
 (declare-function el-chronos-store-record-drift "el-chronos-store" (hour-ts gap-ms))
 (declare-function el-chronos-store-note-startup-ms "el-chronos-store" (ms))
+(declare-function el-chronos-store-record-resources "el-chronos-store" (hour-ts plist))
+;; 启动探针是**可选**的零依赖侧文件（用户在 `early-init.el' 里显式 load）：
+;; 这里只声明签名，配合 `fboundp' 软调用，**绝不 require** —— 探针缺失时 collect
+;; 必须完全照旧工作，且 collect 不加载它就没有任何探针相关开销。
+(declare-function el-chronos-startup-probe-take "el-chronos-startup-probe" ())
 
 ;;; 自定义项
 
@@ -227,6 +232,15 @@ report 侧 `defvar' 同名声明，避免跨模块 `let' 绑定未声明变量�
   "距上次堆采样已过去的采样窗口数。
 每窗口 +1，达到 `el-chronos-heap-sample-windows' 时归零并采一次堆大小
 （默认 6 个窗口 ≈ 60 秒；其余窗口给 store 传 nil，由 COALESCE 保住上次观测值）。")
+
+(defvar el-chronos-collect--resource-baseline nil
+  "上一次资源采样的基线，形如 `(CPU-TIME . FLOAT-TIME)'；nil 表示尚未初始化。
+CPU-TIME 是 `(process-attributes (emacs-pid))' 的 `time' 字段（`current-time' 格式的
+**进程累计 CPU 时间**，不是浮点秒）；FLOAT-TIME 是同一时刻的 `float-time'。
+CPU-TIME 是累计量、FLOAT-TIME 是墙钟锚点，两者都只用于差分，故首个窗口**只建基线、
+增量记 0**（与 `--collect-gc' 同口径）—— 否则会把开机以来累计的 CPU 时间全算进
+这一个采样窗口，`cpu_ms / wall_ms' 的比值首窗就会离谱。
+`el-chronos-collect-start' 初始化、`el-chronos-collect-stop' 清空（I5）。")
 
 (defvar el-chronos-collect--last-sample-tick nil
   "上一次采样窗口实际触发的时刻（`float-time'）；nil 表示尚无基线。
@@ -339,7 +353,11 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 每个帧名都经 `el-chronos-collect--frame-name' 归一（nil → \"unknown\"、非符号函数位 →
 \"anonymous\"），故结果里既没有 nil 也没有对象字面量，可直接 JSON 序列化进
 `slow_events.stack_json'。
-**注意**：这是**结算时刻**的栈，不是慢函数现场栈；精确现场栈由 T11 高精度剖析提供。"
+**注意**：这是**结算时刻**的栈，不是慢函数现场栈；精确现场栈由 T11 高精度剖析提供。
+当前无生产调用者：慢命令事件的 `:stack` 已改为恒 nil（见 `--finish` 的说明）。
+保留给「按命令窗口切分采样栈」的后续实现，同时
+`el-chronos-collect-test-frame-name-normalization` 用例仍直接覆盖本函数
+（nil 帧裁剪 / JSON 序列化），删掉本函数会让该逻辑失去测试。"
   (condition-case nil
       (let* ((frames (el-chronos-collect--backtrace-frames))
              (names nil))
@@ -475,7 +493,14 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
 (float-time))'）：把命令执行时间从心跳 gap 中切掉，使 block / drift 两档只覆盖
 「命令外停转」（ADR-0005 D4 / D7）。`--pending-p' 兜底门只是补充，**不是主判据**。
 此处**不得**调 `el-chronos-collect--heartbeat-check' —— 那会让 gap 恰等于刚执行完的
-命令时长，命令时长被记成 block / drift，双记立刻复活。"
+命令时长，命令时长被记成 block / drift，双记立刻复活。
+
+命令型慢事件的 `stack_json` 恒为 NULL：栈只能在结算路径（`--post-command'）里取，
+此时被观测命令的帧已弹出，栈顶必然是采集器自身
+（`--post-command' → `--finish' → `--safe-apply' → `--current-stack'
+ → `backtrace-frames'），记录它只会误导分析（真实排查中曾据此误判）。
+命令归属请查 `hourly_stacks' 同时段样本。
+与 `kind='block'` 的既有口径一致（TD-2 已定：block 的 stack_json 恒 NULL）。"
   (let ((start el-chronos-collect--command-start)
         (name el-chronos-collect--command-name)
         (gc-start el-chronos-collect--command-gc-elapsed))
@@ -529,10 +554,13 @@ Emacs 31 起 `(backtrace)' 改为打印调用栈并返回 nil，故优先用 `ba
             (el-chronos-collect--safe-apply #'el-chronos-store-record-usage
                                            (list hour-ts 'file file 1 duration-ms))))
         (when (>= duration-ms el-chronos-slow-command-threshold-ms)
+          ;; `stack_json' 恒为 NULL（**有意为之，不是缺失**）：栈只能在结算路径里取，
+          ;; 此时被观测命令的帧已弹出，栈顶必然是采集器自身，记录它只会误导分析
+          ;; （真实排查中曾据此误判「慢在某条命令内」）。详见 `--finish' docstring。
           (el-chronos-collect--safe-apply
            #'el-chronos-store-record-slow-event
            (list (list :duration-ms duration-ms :kind "command" :command name
-                       :stack (el-chronos-collect--current-stack)
+                       :stack nil
                        :context context)))))))
   nil)
 
@@ -816,6 +844,89 @@ GC 与内存趋势会跟着陪葬，而它恰恰是判断「是不是越用越�
     (error (el-chronos-collect--warn "GC 采集失败：%S" err)))
   nil)
 
+(defun el-chronos-collect--collect-resources ()
+  "采集本窗口的 Emacs 进程资源（CPU / RSS / 线程数）与系统负载，交给 store 累加。
+与 profiler 采样**互不依赖**，调用点与 `--collect-gc' 并列、同在其
+`(when el-chronos-collect--sampling-p ...)' **之外**：profiler 启动失败时按错误矩阵只
+「禁用采样、命令/心跳继续」，资源趋势不该跟着陪葬。
+
+取数只用两个内置函数，零副作用、只查自己：
+- `(process-attributes (emacs-pid))' 取本进程的 `time'（累计 CPU 时间）、`rss'（KB）、
+  `thcount'（线程数）—— **只查自己**，绝不遍历全系统进程；
+- `(load-average t)' 取系统负载 1 / 5 / 15。
+**不采系统内存**：`memory-info' 给的是系统级内存，且 `default-directory' 为 remote 时
+查的是远端主机（TD-15），与「Emacs 进程自己占多少」不是一回事。
+
+`cpu_ms' = 本窗口 CPU 时间增量（毫秒）、`wall_ms' = 本窗口墙钟增量（毫秒），两者之比
+即 CPU 占用率；都由 `--resource-baseline' 差分得到，不读任何百分比接口。
+首个窗口（基线为 nil）**只建基线不写库**，与 `--collect-gc' 同一口径：`time' 是启动至今
+的累计值，直接当增量会把开机以来的 CPU 全算进一个窗口。
+
+TRAMP 守卫（**必须**）：整段取数包在 `(let ((default-directory temporary-file-directory))
+...)` 里。`process-attributes' 的 docstring 明确「`default-directory' 指向远端时 PID 被
+当作**远端主机**上的进程」，而 `--sample-tick' 的 timer 捕获的是创建时的
+`default-directory' —— 用户在 TRAMP buffer 里启用模式就会把它带进来，不守就会去查远端
+同号进程（取到的是别人的数）或卡在 TRAMP 上。
+
+逐字段判空：任一项取不到（平台不支持 / 读失败）时该字段传 nil = 「本窗口没采到」，
+由 store 落 NULL 并用 COALESCE 保住上一次观测值 —— **绝不用 0 冒充**（0 会把峰值与
+均值拉偏）。`load-average' 可能抛错（部分平台未实现）→ 吞掉，本窗口三个负载字段不参与。
+
+**上一条有且只有一处例外：`cpu_ms' / `wall_ms' 是 `NOT NULL' 列。** `time' 字段缺失
+（`process-attributes' 的 alist 里没有 `time'，或本窗口 CPU 差分为 nil）时 CPU 时间传 nil，
+落库被列约束兜成 **0**，于是 `cpu_pct = 0.0` —— 这个 0 必须读作「**本窗口未采集到 CPU
+时间**」，**不是「CPU 空闲」**。同一行的 RSS / 线程 / 负载可能照常有值，所以「这一小时
+有资源行」并不等于「CPU 一定采到了」。要彻底区分只能让这两列可空（或加 `cpu_n' 采样
+计数），属 schema v5 范畴（TD-28）；在此之前读 `cpu_pct = 0' 时先看该桶的 `samples' 与
+RSS 是否有值，不要直接当成空闲。
+
+自身 `condition-case'：失败只限流告警，不向宿主抛错（I6），也不终止 timer。"
+  (condition-case err
+      (when el-chronos-resource-sampling
+        (let ((default-directory temporary-file-directory))
+          (let* ((now-float (float-time))
+                 (attrs (process-attributes (emacs-pid)))
+                 (cpu-time (let ((value (cdr (assq 'time attrs))))
+                             (and (consp value) value)))
+                 (rss (let ((value (cdr (assq 'rss attrs))))
+                        (and (numberp value) value)))
+                 (threads (let ((value (cdr (assq 'thcount attrs))))
+                            (and (numberp value) value)))
+                 (loads (condition-case nil
+                            (load-average t)
+                          (error nil)))
+                 (baseline el-chronos-collect--resource-baseline))
+            (if (not (consp baseline))
+                ;; 首窗口：只建基线，不写库（见 docstring）
+                (setq el-chronos-collect--resource-baseline
+                      (cons cpu-time now-float))
+              (let* ((previous-cpu (car baseline))
+                     (previous-float (cdr baseline))
+                     (cpu-ms (when (and cpu-time (consp previous-cpu))
+                               (max 0.0 (* 1000.0
+                                           (float-time
+                                            (time-subtract cpu-time
+                                                           previous-cpu))))))
+                     (wall-ms (when (numberp previous-float)
+                                (max 0.0 (* 1000.0
+                                            (- now-float previous-float))))))
+                (el-chronos-collect--safe-apply
+                 #'el-chronos-store-record-resources
+                 ;; hour-ts 与 `--flush-window' / `--collect-gc' 同口径（整点毫秒）；
+                 ;; rss 的峰值与总和各传一次同值（单点采样，峰值即当年值、总和逐窗口累加）。
+                 (list (el-chronos-collect--hour-ts)
+                       (list :cpu-ms cpu-ms :wall-ms wall-ms
+                             :rss-kb-max rss :rss-kb-sum rss
+                             :threads-max threads
+                             :load1-sum (nth 0 loads)
+                             :load5-sum (nth 1 loads)
+                             :load15-sum (nth 2 loads))))
+                (setq el-chronos-collect--resource-baseline
+                      (cons cpu-time now-float)))
+            t))))
+    (error (el-chronos-collect--warn "进程资源采集失败：%S" err)))
+  nil)
+
 (defun el-chronos-collect--check-sample-window (&optional now)
   "检查相邻两次采样 tick 之间是否丢了整窗，丢了就把 `sample-misses' 记进自监控。
 NOW 为本次 tick 的时刻（`float-time'，默认现取）。基线取 `--last-sample-tick'，
@@ -852,6 +963,8 @@ GC / 堆采集在 `(when el-chronos-collect--sampling-p ...)' **之外**调用�
 采样互不依赖：`gcs-done' / `gc-elapsed' / `garbage-collect-heapsize' 都不需要 profiler。
 若绑在 `sampling-p' 内，profiler 启动失败时（错误矩阵：禁用采样，命令/心跳继续）
 GC 与内存趋势会一起陪葬，而它正是「是不是越用越胖」的唯一依据。
+进程资源采集（`--collect-resources'）与它并列、同样在 `sampling-p' 之外，理由相同：
+`process-attributes' / `load-average' 都只读 OS 侧数值，与 profiler 无关。
 
 入口第一件事是 `--check-sample-window'：判定「上一个窗口是否整窗丢失」（主线程被占住期间
 timer 不触发，那段时间没有任何采样数据），丢则把 `sample-misses' 记进 `hourly_health'。
@@ -862,6 +975,8 @@ timer 不触发，那段时间没有任何采样数据），丢则把 `sample-mi
         (el-chronos-collect--check-sample-window)
         ;; 再采 GC/堆：不依赖 profiler，且 profiler 路径即便异常也不该吞掉它
         (el-chronos-collect--collect-gc)
+        ;; 进程资源（CPU / RSS / 线程 / 负载）：同样不依赖 profiler，理由同上
+        (el-chronos-collect--collect-resources)
         (when el-chronos-collect--sampling-p
           (el-chronos-collect--accumulate (profiler-cpu-log))
           (el-chronos-collect--flush-window)))
@@ -1047,6 +1162,71 @@ top-n 为 `0' / nil（不记明细）时用 200 兜底 —— 该上限只为防
       (setq entries (cl-subseq entries 0 (min top (length entries)))))
     entries))
 
+(defun el-chronos-collect--startup-trim-entries (entries)
+  "把 (LIBRARY . MS) 的 alist ENTRIES 按毫秒降序截断到 `el-chronos-startup-top-n' 条。
+与 `--startup-top-entries'（输入是 hash）**语义相同、输入形态不同**：探针交接拿到的
+已经是排好序的 alist，这里仍重排一次，是为了不依赖对端顺序（一次 `sort' 在几百条量级上
+可忽略）。排序前 `copy-sequence'：`sort' 是破坏性的，不得就地改动探针快照。
+`el-chronos-startup-top-n' 为 `0' / nil 时返回空列表（不记明细）。"
+  (let ((top (and (numberp el-chronos-startup-top-n)
+                  (> el-chronos-startup-top-n 0)
+                  el-chronos-startup-top-n)))
+    (when (and top entries)
+      (cl-subseq (sort (copy-sequence entries)
+                       (lambda (a b) (> (cdr a) (cdr b))))
+                 0 (min top (length entries))))))
+
+(defun el-chronos-collect--startup-take-probe ()
+  "把 `el-chronos-startup-probe' 采到的启动数据接过来写库；写入了数据返回非 nil。
+**两个调用来源共用本函数**（同一份逻辑，禁止分叉）：
+1. `--startup-instrument'（mode 启用时）—— 首次交接：探针在 `early-init' 上岗，
+   这里拿到的是 `early-init' 起的完整加载锚点与明细；
+2. 探针 `--finish' 的软调用（探针侧 `fboundp' 守卫 + 软调用，它不 require 本模块）——
+   补写增量：首次 take 之后到启动收尾之间又加载的包，只能由探针在收尾时交棒。
+
+判据（缺一不可）：
+- `fboundp' 对 `el-chronos-startup-probe-take' 返回 nil → 用户没在 early-init 里 load，
+  返回 nil，调用方完全走原有路径。**绝不 require**：探针是可选的侧文件，
+  collect 不依赖它也能工作。
+- `:anchors' 与 `:loads' **都**为空 → 返回 nil、不写库。只看探针的 `:captured-p' 不够：
+  它表示「探针在启动期工作过」（记到 `early-init' 锚点即为真），此时一条可写数据都
+  可能没有；按它分支会让调用方误以为「已有数据、不必自己挂钩子」。
+- `el-chronos--session-id' 为 nil（mode 尚未启用 / 已停止）→ 返回 nil、不写库。
+  **会话守卫在 `take' 之前**（`and' 短路），所以此时探针内存里的 `:loads' **不会被清空**：
+  用户之后真启用 mode 时，下一次交接仍能把这批明细补上。唯一代价是「始终未启用 mode」时
+  探针收尾后不再记录新加载，那批明细一直留在内存里不写库 —— 宁可如此，也不往
+  「不属于任何会话」的库里写孤儿行（store 侧也会因会话缺失告警）。
+
+幂等与重复写：`startup_phases' 主键是 `(session_id, phase)' 且落库走 upsert，
+锚点重复写同 phase 同值无害（`take' 对 `:anchors' 只读不重置，本来就重复返回同一份）；
+`:loads' 是增量（探针侧取走即清空），不会重复计数。
+
+写库形态：`:anchors' 每条 → `(PHASE, MS)' 一行；`:loads' 经 `--startup-trim-entries'
+按 `el-chronos-startup-top-n' 截断后每条 → `load:<LIBRARY>'。
+全部经 `--safe-apply'（store 未加载或出错时只限流告警），全程 `condition-case'，
+绝不向宿主抛错（I6）。"
+  (condition-case err
+      (when (and (fboundp 'el-chronos-startup-probe-take)
+                 el-chronos--session-id)
+        (let* ((snapshot (el-chronos-startup-probe-take))
+               (anchors (plist-get snapshot :anchors))
+               (loads (plist-get snapshot :loads)))
+          (when (or anchors loads)
+            (dolist (entry anchors)
+              (el-chronos-collect--safe-apply
+               #'el-chronos-store-record-startup-phase
+               (list el-chronos--session-id (car entry) (cdr entry))))
+            (dolist (entry (el-chronos-collect--startup-trim-entries loads))
+              (el-chronos-collect--safe-apply
+               #'el-chronos-store-record-startup-phase
+               (list el-chronos--session-id
+                     (concat "load:" (car entry))
+                     (cdr entry))))
+            t)))
+    (error
+     (el-chronos-collect--warn "启动探针交接失败（已跳过）：%S" err)
+     nil)))
+
 (defun el-chronos-collect--after-load (file)
   "记录启动期一次 load 的耗时（**近似归因**），并在三元条件满足时摘钩收尾。
 FILE 是 `after-load-functions' 的实参（刚 load 完的文件名）。
@@ -1163,36 +1343,64 @@ idle 时机受用户活动影响、不可预期，故它只是「阶段标记」
   (el-chronos-collect--startup-anchor 'first-idle))
 
 (defun el-chronos-collect--startup-instrument ()
-  "挂启动打点（T6a）：始终记 `mode-start' 锚点；仅当启动尚未结束时才挂钩子。
-**前置判定（最关键的一条）**：`after-init-time' 非 nil 表示启动已基本结束
-（启动流程先 `setq after-init-time' 再跑 `after-init-hook'，两行都在 init 文件加载之后）。
-用户（含本机配置）常用 `emacs-startup-hook' 启动 mode（本机 `init-chronos.el' 即如此）——
-那时 `emacs-startup-hook' 已跑完且**永不重触发**，三元摘钩里的第一条恒不可达，
-钩子会一直存活到「800 次 load」或「30 秒兜底」，把**日常加载冒充成启动耗时**、
-污染 `startup_phases'。所以这类配置下**一个钩子都不挂**（副作用是好的：零额外开销）。
-启动已结束时也不注册 30 秒 timer —— 没有钩子要摘，timer 只会白占一个登记项。"
+  "挂启动打点（T6a）：先尝试从 `early-init' 探针交接数据，再按需挂自己的钩子。
+两条**互斥**路径，判据是 `--startup-take-probe' 的返回值（非 nil = 确实写入了探针数据）：
+
+① **探针路径**（用户按 ADR-0006 在 `early-init.el' 里 load 了探针）：探针的
+   `after-load-functions' 从 `early-init' 起就覆盖了**完整**加载过程，锚点与 `load:*'
+   明细都已交接完毕 → 本模块**一个自有钩子都不挂**（`after-load-functions' /
+   `after-init-hook' / `emacs-startup-hook' / 30 秒兜底 timer 全不挂）。理由：再挂一遍
+   会把同一批 load 记两次（两套近似归因基线互相污染时间差），而探针那份覆盖范围更大。
+   仍然记 `mode-start' 锚点（探针在 mode 启用前就记完了自己的锚点，`mode-start' 只有
+   这里能记），并注册一次性 `first-idle' 锚点（纯阶段标记、不参与摘钩，与现状一致）。
+
+② **现状路径**（探针不存在 / 探针没采到数据 / 会话尚未建立）：完全保持原逻辑 ——
+   始终记 `mode-start' 锚点；仅当启动尚未结束时才挂钩子。
+   **前置判定（最关键的一条）**：`after-init-time' 非 nil 表示启动已基本结束
+   （启动流程先 `setq after-init-time' 再跑 `after-init-hook'，两行都在 init 文件加载之后）。
+   用户（含本机配置）常用 `emacs-startup-hook' 启动 mode（本机 `init-chronos.el' 即如此）——
+   那时 `emacs-startup-hook' 已跑完且**永不重触发**，三元摘钩里的第一条恒不可达，
+   钩子会一直存活到「800 次 load」或「30 秒兜底」，把**日常加载冒充成启动耗时**、
+   污染 `startup_phases'。所以这类配置下**一个钩子都不挂**（副作用是好的：零额外开销）。
+   启动已结束时也不注册 30 秒 timer —— 没有钩子要摘，timer 只会白占一个登记项。
+
+两条路径的差别只在**覆盖范围**：探针路径覆盖 `early-init' 起的完整加载；现状路径只覆盖
+mode 之后的加载（观测器无法观测自己被加载之前的事，TD-16）。"
   (condition-case err
       (progn
         (clrhash el-chronos-collect--startup-loads)
         (setq el-chronos-collect--startup-last-load-ts nil
               el-chronos-collect--startup-load-count 0
               el-chronos-collect--startup-hook-done nil)
-        (el-chronos-collect--startup-anchor 'mode-start)
-        (unless (bound-and-true-p after-init-time)
-          (add-hook 'after-load-functions #'el-chronos-collect--after-load)
-          (add-hook 'after-init-hook #'el-chronos-collect--startup-after-init)
-          (add-hook 'emacs-startup-hook #'el-chronos-collect--startup-on-startup)
-          ;; 可选锚点 first-idle：只作阶段标记，不参与摘钩（见 `--startup-first-idle'）
-          (when (fboundp 'run-with-idle-timer)
-            (ignore-errors
-              (setq el-chronos-collect--startup-idle-timer
-                    (el-chronos-collect--register-timer
-                     (run-with-idle-timer
-                      0 nil #'el-chronos-collect--startup-first-idle)))))
-          ;; 30 秒兜底 timer（三元摘钩的第三条）：`emacs-startup-hook' 迟迟不到时的下界
-          (setq el-chronos-collect--startup-timer
-                (el-chronos-collect--register-timer
-                 (run-with-timer 30 nil #'el-chronos-collect--startup-finish)))))
+        ;; 先交接探针（它含 `early-init' 起的更早阶段），再补记 `mode-start'
+        ;; —— `mode-start' 是探针无法知道的锚点，只能在这里记。
+        (let ((probed (el-chronos-collect--startup-take-probe)))
+          (el-chronos-collect--startup-anchor 'mode-start)
+          (cond
+           (probed
+            ;; ① 探针路径：只补 `first-idle' 锚点，一个自有钩子都不挂
+            (when (fboundp 'run-with-idle-timer)
+              (ignore-errors
+                (setq el-chronos-collect--startup-idle-timer
+                      (el-chronos-collect--register-timer
+                       (run-with-idle-timer
+                        0 nil #'el-chronos-collect--startup-first-idle))))))
+           ((not (bound-and-true-p after-init-time))
+            ;; ② 现状路径：启动未结束才挂钩子（判据与理由见 docstring）
+            (add-hook 'after-load-functions #'el-chronos-collect--after-load)
+            (add-hook 'after-init-hook #'el-chronos-collect--startup-after-init)
+            (add-hook 'emacs-startup-hook #'el-chronos-collect--startup-on-startup)
+            ;; 可选锚点 first-idle：只作阶段标记，不参与摘钩（见 `--startup-first-idle'）
+            (when (fboundp 'run-with-idle-timer)
+              (ignore-errors
+                (setq el-chronos-collect--startup-idle-timer
+                      (el-chronos-collect--register-timer
+                       (run-with-idle-timer
+                        0 nil #'el-chronos-collect--startup-first-idle)))))
+            ;; 30 秒兜底 timer（三元摘钩的第三条）：`emacs-startup-hook' 迟迟不到时的下界
+            (setq el-chronos-collect--startup-timer
+                  (el-chronos-collect--register-timer
+                   (run-with-timer 30 nil #'el-chronos-collect--startup-finish)))))))
     (error
      (el-chronos-collect--warn "启动打点挂载失败（已跳过）：%S" err)
      nil))
@@ -1248,6 +1456,8 @@ buffer 也补挂则会让同一命令双跑（D1）。
     ;; GC 基线：nil 表示未初始化，首个采样窗口只建立基线（见 `--collect-gc'）
     (setq el-chronos-collect--gc-baseline nil
           el-chronos-collect--heap-tick-counter 0)
+    ;; 资源基线：同上，首个窗口只建基线（见 `--collect-resources'）
+    (setq el-chronos-collect--resource-baseline nil)
     (el-chronos-collect--start-sampling)
     ;; 启动打点（T6a）：先记 `mode-start' 锚点；启动已结束则一个钩子都不挂
     ;; （判据与理由见 `el-chronos-collect--startup-instrument'）
@@ -1262,6 +1472,7 @@ buffer 也补挂则会让同一命令双跑（D1）。
 **各 buffer 的局部值也不含**（`--hooked-buffers' 清空、`buffer-list-update-hook' 不含补挂函数）、
 `(profiler-cpu-running-p)' 为 nil、窗口 hash 为空、pending 清空、
 GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）、
+资源采集基线归零（`--resource-baseline' 为 nil）、
 采样窗口基线归零（`--last-sample-tick' 为 nil）、
 启动打点全部摘净（`after-load-functions' / `after-init-hook' / `emacs-startup-hook'
 不含本模块函数、`--startup-timer' / `--startup-idle-timer' 为 nil、
@@ -1313,6 +1524,7 @@ GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）
         el-chronos-collect--last-sample-tick nil
         el-chronos-collect--gc-baseline nil
         el-chronos-collect--heap-tick-counter 0
+        el-chronos-collect--resource-baseline nil
         el-chronos-collect--pending-p nil
         el-chronos-collect--command-start nil
         el-chronos-collect--command-name nil

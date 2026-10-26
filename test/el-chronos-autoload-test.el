@@ -2,12 +2,12 @@
 
 ;; 覆盖三件事：
 ;; 1. `el-chronos-autoload-test-cookies-cover-all-interactive-commands`：
-;;    15 个 interactive 命令都带紧贴其定义的 `;;;###autoload` cookie，且
+;;    16 个 interactive 命令都带紧贴其定义的 `;;;###autoload` cookie，且
 ;;    「cookie 数 == 命令清单长度 == `(interactive` 代码出现次数 +
 ;;    `(define-minor-mode` 代码出现次数」三者相等（不写死单一数字，
 ;;    增删命令时用例自动跟随）。
 ;; 2. `el-chronos-autoload-test-autoloads-file-makes-commands-callable`：
-;;    按与 Makefile 同源逻辑生成 autoloads 到临时目录，加载后 15 个命令
+;;    按与 Makefile 同源逻辑生成 autoloads 到临时目录，加载后 16 个命令
 ;;    `autoloadp` 全为 t（包未加载时 M-x 可调用）。
 ;; 3. `el-chronos-autoload-test-library-matches-definition`：
 ;;    每条 autoload 记录的库名等于该命令的定义文件名（防 cookie 落错文件）。
@@ -43,9 +43,10 @@
     ("el-chronos-show-event" . "el-chronos-report")
     ("el-chronos-profile-command" . "el-chronos-report")
     ("el-chronos-web-start" . "el-chronos-web")
-    ("el-chronos-web-stop" . "el-chronos-web"))
+    ("el-chronos-web-stop" . "el-chronos-web")
+    ("el-chronos-web-browse" . "el-chronos-web"))
   "全部 interactive 命令与其定义文件（库名，不含 .el 后缀）。
-顺序与计划「需带 autoload cookie 的 15 个命令」表一致。")
+顺序与计划「需带 autoload cookie 的 16 个命令」表一致。")
 
 (defconst el-chronos-autoload-test--source-files
   '("el-chronos"
@@ -169,8 +170,8 @@
         (ert-fail
          (format "命令 %s 缺少紧贴定义的 `;;;###autoload` cookie（定义文件 %s.el）"
                  command library)))))
-  ;; 断言 B：计数不变量。当前实测为 `(interactive` 14 次 + `(define-minor-mode` 1 次
-  ;; = 15 次，与 cookie 数、清单长度三者相等；这里刻意不写死 14 / 1，
+  ;; 断言 B：计数不变量。当前实测为 `(interactive` 15 次 + `(define-minor-mode` 1 次
+  ;; = 16 次，与 cookie 数、清单长度三者相等；这里刻意不写死 15 / 1，
   ;; 以便未来增删命令时用例自动跟随（真正的守卫是「三者相等」）。
   (let ((cookies 0)
         (interactives 0)
@@ -210,7 +211,7 @@
 ;;; 用例 2：生成的 autoloads 让命令可调用
 
 (ert-deftest el-chronos-autoload-test-autoloads-file-makes-commands-callable ()
-  "加载生成的 autoloads 后，15 个命令都是 autoload stub。"
+  "加载生成的 autoloads 后，16 个命令都是 autoload stub。"
   (unless (fboundp 'loaddefs-generate)
     (ert-skip "loaddefs-generate 不存在，跳过（make autoloads 会走 make-directory-autoloads 回退）"))
   (let ((tmp (make-temp-file "el-chronos-autoloads-test-" t))
@@ -220,7 +221,7 @@
         (let ((out (el-chronos-autoload-test--generate tmp))
               (saved nil))
           ;; 隔离方案 A（本进程内保存 / 恢复）：`make test` 把全部测试文件加载进
-          ;; 同一进程，此时这 15 个命令多半已由其他测试的 `require` 变成真实定义。
+          ;; 同一进程，此时这 16 个命令多半已由其他测试的 `require` 变成真实定义。
           ;; 实测 `autoload` **不覆盖**已有定义——探针：
           ;;   (progn (defun foo () 1) (autoload 'foo "nonexistent")
           ;;          (autoloadp (symbol-function 'foo)))  ⇒ nil

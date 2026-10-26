@@ -170,13 +170,18 @@
       (should (equal "127.0.0.1" el-chronos-web--host)))))
 
 (ert-deftest el-chronos-web-test-index-html ()
-  "GET / 返回 200 + text/html，页面含 el-chronos 标识。"
+  "GET / 返回 200 + text/html，页面含 el-chronos 标识。
+另断言「资源」节与卡片容器存在：新增 section 忘了加容器 id 会让 `resPanel' 静默不渲染
+（`$('res')' 为 null），属 I11 的静默失败面。"
   (el-chronos-web-test--with-temp-db
     (el-chronos-web-test--with-server
       (let ((response (el-chronos-web-test--http "GET" "/")))
         (should (equal 200 (plist-get response :status)))
         (should (string-match-p "text/html" (plist-get response :headers)))
-        (should (string-match-p "el-chronos" (plist-get response :body)))))))
+        (should (string-match-p "el-chronos" (plist-get response :body)))
+        (should (string-match-p "资源（CPU / 内存 / 负载）" (plist-get response :body)))
+        (should (string-match-p "id='res'" (plist-get response :body)))
+        (should (string-match-p "CPU 均值" (plist-get response :body)))))))
 
 (ert-deftest el-chronos-web-test-api-summary ()
   "GET /api/summary 返回 200 + application/json，body 可解析且含 range / overview。"
@@ -446,8 +451,9 @@
         (should (eq :null (plist-get parsed :bucket-count)))))))
 
 (ert-deftest el-chronos-web-test-export-csv-new-sections ()
-  "GET /api/export.csv 含 12 个 `# section:'，其中 startup / health / config-history / drift
-四块齐备。四个手写块的区块名、表头与 report 侧逐字一致（两处内联重复实现，改动需同步）。"
+  "GET /api/export.csv 含 13 个 `# section:'，其中 startup / health / config-history / drift /
+resources 五块齐备。五个手写块的区块名、表头与 report 侧逐字一致（两处内联重复实现，
+改动需同步）。区块数由 12 抬到 13：多出 resources（进程资源，位置在 drift 之后 = 最末）。"
   (el-chronos-web-test--with-temp-db
     (el-chronos-web-test--open-fixture-db)
     (el-chronos-web-test--with-server
@@ -460,24 +466,228 @@
         (should (string-match-p "^# section: health$" body))
         (should (string-match-p "^# section: config-history$" body))
         (should (string-match-p "^# section: drift$" body))
+        (should (string-match-p "^# section: resources$" body))
         ;; 表头逐字对齐 report 侧
         (should (string-match-p "^kind,name,ms$" body))
         (should (string-match-p "^metric,value$" body))
         (should (string-match-p "^session_id,started_at_ms,git_head,config_sig,changed$" body))
         (should (string-match-p "^bucket_ms,count,total_ms,max_ms$" body))
+        (should (string-match-p
+                 (concat "^bucket_ms,cpu_ms,wall_ms,cpu_pct,rss_kb_max,rss_kb_avg,"
+                         "threads_max,load1_avg,load5_avg,load15_avg,samples$")
+                 body))
         ;; health 必带 rows 行（区分「没采集」与「没异常」）
         (should (string-match-p "^rows," body))
-        (should (= 12 (length (cl-remove-if-not
+        (should (= 13 (length (cl-remove-if-not
                                (lambda (line) (string-prefix-p "# section: " line))
                                (split-string body "\n")))))))))
 
+(ert-deftest el-chronos-web-test-api-resources ()
+  "GET /api/resources 返回 200 + JSON：空库 buckets 为 null 且均值为 null，有数据时按桶聚合。
+null 与 0 严格区分：`load_n` 为 0 时 `rss-kb-avg` / `load*-avg` 是 JSON null（不是 0）——
+用 0 顶替会把「负载采集全失败」显示成「系统空闲」（与 analysis docstring 同一口径）。
+`:cpu-pct-avg' 走 `--pct'，无墙钟样本时为 0.0 而非 null，故不在此列。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (let* ((empty-resp (el-chronos-web-test--http "GET" "/api/resources?range=1d&buckets=4"))
+             (empty (el-chronos-web-test--json empty-resp)))
+        (should (equal 200 (plist-get empty-resp :status)))
+        (should (string-match-p "application/json" (plist-get empty-resp :headers)))
+        (should (equal "1d" (plist-get empty :range)))
+        (should (= 4 (plist-get empty :bucket-count)))
+        ;; 空数组经 `--json-value' 序列化为 null（nil 分支），前端按 `buckets||[]' 处理
+        (should (plist-member empty :buckets))
+        (should (eq :null (plist-get empty :buckets)))
+        (should (eq :null (plist-get empty :rss-kb-max)))
+        (should (eq :null (plist-get empty :rss-kb-avg)))
+        (should (eq :null (plist-get empty :load1-avg)))
+        (should (= 0.0 (plist-get empty :cpu-ms-total)))
+        (should (= 0 (or (plist-get empty :samples) 0)))
+        (should (integerp (plist-get empty :bucket-span))))
+      ;; cpu 3000ms / 墙钟 12000ms → 25%；rss 峰值 204800KB；线程 18；
+      ;; 负载 6/9/12 之和除以 load_n=3 → 2.0/3.0/4.0
+      (el-chronos-test--exec
+       "INSERT INTO hourly_resources (hour_ts, session_id, cpu_ms, wall_ms, rss_kb_max,\
+ rss_kb_sum, threads_max, load1_sum, load5_sum, load15_sum, load_n)\
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+       (list (el-chronos-test--hour-ts) 0 3000.0 12000.0 204800 409600 18 6.0 9.0 12.0 3))
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/resources?range=1d"))
+             (parsed (el-chronos-web-test--json resp))
+             (items (plist-get parsed :buckets))
+             (first (aref items 0)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (= 1 (length items)))
+        (should (= 25.0 (plist-get first :cpu-pct)))
+        (should (= 204800 (plist-get first :rss-kb-max)))
+        (should (= 18 (plist-get first :threads-max)))
+        (should (= 2.0 (plist-get first :load1-avg)))
+        (should (= 3 (plist-get first :samples)))
+        (should (= 204800 (plist-get parsed :rss-kb-max)))
+        (should (= 18 (plist-get parsed :threads-max)))
+        (should (= 2.0 (plist-get parsed :load1-avg)))
+        ;; buckets 省略时由 analysis 按窗口长度决定，响应里为 null（不是 0）
+        (should (plist-member parsed :bucket-count))
+        (should (eq :null (plist-get parsed :bucket-count)))))))
+
 (ert-deftest el-chronos-web-test-routes-count ()
-  "路由表共 18 条且五个新查询路由已注册、无重复键。
-新增路由必须同步 `docs/ui.org' 的 16 条 API 路由表（T10）。"
-  (should (= 18 (length el-chronos-web--routes)))
-  (should (= 18 (length (delete-dups (mapcar #'car el-chronos-web--routes)))))
-  (dolist (path '("/api/gc" "/api/startup" "/api/health" "/api/config-history" "/api/drift"))
+  "路由表共 19 条且六个新查询路由已注册、无重复键。
+新增路由必须同步 `docs/ui.org' 的 17 条 API 路由表（T10）。"
+  (should (= 19 (length el-chronos-web--routes)))
+  (should (= 19 (length (delete-dups (mapcar #'car el-chronos-web--routes)))))
+  (dolist (path '("/api/gc" "/api/resources" "/api/startup" "/api/health"
+                  "/api/config-history" "/api/drift"))
     (should (assoc path el-chronos-web--routes))))
+
+;;; 交互启动时自动打开浏览器（`el-chronos-web-open-browser'）
+
+(defmacro el-chronos-web-test--with-browse-stub (calls &rest body)
+  "在 BODY 期间把 `browse-url' 桩成记录器，不真的打开浏览器（batch 下也没有图形界面）。
+每次调用把 URL `push' 进变量 CALLS（须为本用例 `let' 绑定的列表变量，最近一次在前），
+并原样返回 URL（真实 `browse-url' 的返回值不稳定，测试不依赖它）。"
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'browse-url)
+              (lambda (url &rest _)
+                (setq ,calls (cons url ,calls))
+                url)))
+     ,@body))
+
+(defmacro el-chronos-web-test--with-message-stub (msgs &rest body)
+  "在 BODY 期间把 `message' 桩成收集器，格式化后的文本 `push' 进变量 MSGS。
+用于断言降级路径确实发出了可见提示（I11：不得静默失败），同时不污染 batch 输出。
+CALLS / MSGS 同样是本用例 `let' 绑定的列表变量，最近一条在前。"
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'message)
+              (lambda (fmt &rest args)
+                (setq ,msgs
+                      (cons (condition-case nil
+                                (apply #'format-message fmt args)
+                              (error (if (stringp fmt) fmt (format "%s" fmt))))
+                            ,msgs)))))
+     ,@body))
+
+(ert-deftest el-chronos-web-test-start-browses-when-interactive ()
+  "交互式启动 + `el-chronos-web-open-browser' 为 t → `browse-url' 恰好被调用一次，
+参数是 `http://127.0.0.1:PORT/' 形态（PORT 取实际绑定端口，不是入参 0）。
+交互上下文用 `cl-letf' 桩 `called-interactively-p' 模拟，比 `call-interactively' 轻。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser t)
+          (calls nil))
+      (unwind-protect
+          (el-chronos-web-test--with-browse-stub calls
+            (cl-letf (((symbol-function 'called-interactively-p) (lambda (&rest _) t)))
+              (let* ((proc (el-chronos-web-start 0))
+                     (port (process-contact proc :service)))
+                (should (processp proc))
+                (should (integerp port))
+                (should (= 1 (length calls)))
+                (should (equal (format "http://127.0.0.1:%d/" port) (car calls))))))
+        (ignore-errors (el-chronos-web-stop))))))
+
+(ert-deftest el-chronos-web-test-start-keeps-quiet-when-disabled ()
+  "交互式启动但开关为 nil → 不打开浏览器；server 仍启动、URL 提示仍输出（可见不中断）。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser nil)
+          (calls nil)
+          (msgs nil))
+      (unwind-protect
+          (el-chronos-web-test--with-browse-stub calls
+            (cl-letf (((symbol-function 'called-interactively-p) (lambda (&rest _) t)))
+              (el-chronos-web-test--with-message-stub msgs
+                (let ((proc (el-chronos-web-start 0)))
+                  (should (processp proc))
+                  (should (el-chronos-web-running-p))
+                  (should-not calls)
+                  (should (= 1 (length msgs)))
+                  (should (string-match-p
+                           (format "127\\.0\\.0\\.1:%d" (process-contact proc :service))
+                           (car msgs)))))))
+        (ignore-errors (el-chronos-web-stop))))))
+
+(ert-deftest el-chronos-web-test-start-does-not-browse-programmatically ()
+  "程序化启动（非交互）即使开关为 t 也不弹浏览器 —— 这条挡住「每次启动 Emacs 都弹窗」。
+本用例**不桩** `called-interactively-p'：batch 下它真实返回 nil，也就是
+`el-chronos-web-auto-start' 等程序化调用所处的上下文。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser t)
+          (calls nil))
+      (unwind-protect
+          (el-chronos-web-test--with-browse-stub calls
+            (let ((proc (el-chronos-web-start 0)))
+              (should (processp proc))
+              (should (el-chronos-web-running-p))
+              (should-not calls)))
+        (ignore-errors (el-chronos-web-stop))))))
+
+(ert-deftest el-chronos-web-test-start-survives-browse-url-error ()
+  "`browse-url' 抛错（无 GUI / 无可用浏览器）→ 错误不外抛、server 照常运行，
+且给出含 URL 的可见降级提示（I11：可见降级，不静默、不变成错误）。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser t)
+          (msgs nil)
+          (proc nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'browse-url)
+                     (lambda (&rest _) (error "No usable browser")))
+                    ((symbol-function 'called-interactively-p) (lambda (&rest _) t)))
+            (el-chronos-web-test--with-message-stub msgs
+              (setq proc (el-chronos-web-start 0))
+              (should (processp proc))
+              (should (el-chronos-web-running-p))
+              ;; 两条消息：启动提示 + 打开失败提示（最近一条在前）
+              (should (= 2 (length msgs)))
+              (should (string-match-p "打开浏览器失败" (car msgs)))
+              (should (string-match-p
+                       (format "127\\.0\\.0\\.1:%d" (process-contact proc :service))
+                       (car msgs)))))
+        (ignore-errors (el-chronos-web-stop))))))
+
+(ert-deftest el-chronos-web-test-browse-starts-server-when-needed ()
+  "`el-chronos-web-browse' 未启动时先拉起 server，且只打开一次浏览器（不双弹）。
+顺带断言 `--url' 在 PROC 为 nil 时回落 `el-chronos-web-port'。
+`el-chronos-web-port' 绑 0：本命令内部调 `el-chronos-web-start' 走默认端口，而默认 8787
+可能正被用户运行中的 dashboard（或本机其它进程）占用，绑 0 由内核分配才不依赖环境。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser t)
+          (el-chronos-web-port 0)
+          (calls nil))
+      (unwind-protect
+          (el-chronos-web-test--with-browse-stub calls
+            (should-not (el-chronos-web-running-p))
+            (el-chronos-web-browse)
+            (should (el-chronos-web-running-p))
+            (should (= 1 (length calls)))
+            (should (equal (format "http://127.0.0.1:%d/"
+                                   (process-contact el-chronos-web--process :service))
+                           (car calls)))
+            ;; PROC 为 nil → 回落 `el-chronos-web-port'
+            (let ((el-chronos-web-port 65000))
+              (should (equal "http://127.0.0.1:65000/" (el-chronos-web--url)))))
+        (ignore-errors (el-chronos-web-stop))))))
+
+(ert-deftest el-chronos-web-test-browse-reuses-running-server ()
+  "`el-chronos-web-browse' 在 server 已运行时复用同一进程（不重启、不提端口），只打开一次。"
+  (el-chronos-web-test--with-temp-db
+    (ignore-errors (el-chronos-web-stop))
+    (let ((el-chronos-web-open-browser t)
+          (calls nil))
+      (unwind-protect
+          (let ((proc (el-chronos-web-start 0)))
+            (should (processp proc))
+            (el-chronos-web-test--with-browse-stub calls
+              (el-chronos-web-browse)
+              (should (eq proc el-chronos-web--process))
+              (should (process-live-p proc))
+              (should (= 1 (length calls)))
+              (should (equal (format "http://127.0.0.1:%d/"
+                                     (process-contact proc :service))
+                             (car calls)))))
+        (ignore-errors (el-chronos-web-stop))))))
 
 (provide 'el-chronos-web-test)
 

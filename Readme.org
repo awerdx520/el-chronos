@@ -16,6 +16,14 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 
 命名取意：=chronos= 是时间之神，本项目做的是"给 Emacs 记账"。
 
+启动与资源两个维度由 [[file:docs/adr/0006-resource-observation.md][ADR-0006]] 补齐：
+
+- **启动分解**（需 =early-init= 探针）：=early-init= / =after-init= / =startup= 三锚点 + 按包累计的加载耗时，
+  由独立**零依赖**探针 =el-chronos-startup-probe.el= 在 =early-init.el= 里提前上岗采集（装法见后文
+  「启动探针（推荐：在 =early-init= 里加载）」）——不装探针时只有 =mode-start= 一个锚点（物理边界，TD-16）。
+- **资源画像**（CPU / RSS / 负载）：Emacs 进程 CPU 毫秒、RSS（KB）、线程数、系统负载 1/5/15，
+  并入既有 10 秒采样 timer（**不新增 timer**），只查自己这个 pid，不遍历系统进程、不读 buffer 内容。
+
 * 它回答的 6 条目标
 
 | # | 问题 | 主要数据来源 |
@@ -23,9 +31,9 @@ GC 次数/耗时与 Emacs 堆大小、按会话分解启动阶段与包加载、
 | 1 | 哪些命令/操作慢，慢多久（含被 =C-g= 中断的卡顿）？ | =commands= 明细（=ok= / =aborted= / =error= 三态）+ =slow_events= |
 | 2 | 慢在哪个函数、调用链是什么？ | =hourly_functions= 的 self/total + =hourly_stacks= 的 top-N 栈 |
 | 3 | 归因到哪个 straight 包 / =lisp/init-*.el= 模块 / site-lisp 文件？ | =attrib= 归因（符号 → 源码文件 → 包/模块） |
-| 4 | 长期趋势如何、某次改动是否引入回归？ | 五张 =hourly_*= 小时聚合表 + 回归判定（近 N 天 vs 前 N 天） |
+| 4 | 长期趋势如何、某次改动是否引入回归？ | 七张 =hourly_*= 小时聚合表（含 =hourly_resources= 的 CPU / RSS / 负载）+ 回归判定（近 N 天 vs 前 N 天） |
 | 5 | 哪些高频用法值得优先优化？ | =hourly_usage= 的 command / mode / project 维度 |
-| 6 | 怎么把它们都看见？ | 两种形态：org 报告（**14 节**）/ 浏览器 Web dashboard（**18 条只读 GET 路由** = 1 页 + 17 条 =/api/*=） |
+| 6 | 怎么把它们都看见？ | 两种形态：org 报告（**15 节**）/ 浏览器 Web dashboard（**19 条只读 GET 路由** = 1 页 + 18 条 =/api/*=（17 JSON + 1 CSV）） |
 
 * 安装
 
@@ -64,7 +72,7 @@ recipe 三处非默认值，各有实测理由：
   =make autoloads= 的生成物：straight 自己的 autoloads 步骤要写同名文件，若该名字被软链进 build 目录
   就会穿透写回源仓库。
 - =:build (:not compile native-compile)= —— **保留** autoloads、禁用字节与 native 编译：
-  包侧 =;;;###autoload= cookie 于是真正生效（15 个 interactive 命令全部免配置可 =M-x=），
+  包侧 =;;;###autoload= cookie 于是真正生效（16 个 interactive 命令全部免配置可 =M-x=），
   同时不产生 =.elc= / =.eln= 副本，源码改动立刻可见。
   代价：**新增或改名 interactive 命令后**要 =M-x straight-rebuild-package RET el-chronos=
   刷新 autoloads，否则新命令不在 autoload 表里。
@@ -172,12 +180,52 @@ recipe 三处非默认值，各有实测理由：
   之后的首次需要时才加载。
 - 需要「只在看报告时才加载」的延迟形态不在设计目标内：代价就是拿不到启动分解。
 
+** 启动探针（推荐：在 =early-init.el= 里加载）
+
+观察器本体挂在 =emacs-startup-hook= 上启用，那时 init 文件已全部加载完，采集侧按既定设计
+**不再挂**包加载钩子（否则启动后的交互式 =load= 会被记成「启动耗时」）——于是 =startup_phases=
+只剩 =mode-start= 一行、=load:*= 明细 **0 条**（实测 20/20 会话）。要测到 init 主体，须让**独立探针**
+在 =early-init.el= 里先上岗。探针零依赖、只写内存：不开 SQLite、不写文件、所有入口 =condition-case= 包裹，
+数据等 =(el-chronos-mode 1)= 之后由采集侧取走写库。
+
+#+BEGIN_SRC elisp
+;; early-init.el（必须在 init 主体之前求值）
+;; 三重防护，缺一不可（这段跑在启动主路径上，出错即起不来）：
+;;   1. 实例守卫——隔离实例 / 纯实例不装探针（与 init-chronos.el 同一判据）
+;;   2. file-exists-p——仓库搬迁 / 改名时静默跳过
+;;   3. load 的 NOERROR——探针缺失或损坏时绝不打断启动
+(unless (member (getenv "THOMAS_EMACS_INSTANCE") '("isolated" "pure"))
+  (let ((chronos-probe "/home/thomas/Workspace/el-chronos/el-chronos-startup-probe.el"))
+    (when (file-exists-p chronos-probe)
+      (ignore-errors (load chronos-probe t t t)))))
+#+END_SRC
+
+三点必须照做：
+
+1. **用绝对路径 =load=，不要 =require=，也不要为此 =add-to-list 'load-path=**——探针不在 =load-path=
+   上（也不该在：early-init 期 =straight/build-*= 还没建立），=require= 必然失败，而把仓库根塞进全局
+   =load-path= 会污染所有后续加载。仓库改名 / 搬迁后 =(load ... t)= 按 NOERROR 语义**静默失败**，
+   表现就是 =load:*= 明细又变回 0 条——**排障口诀：=load:*= 为 0 先确认这个路径存在**。
+2. **三个 =t=** 是 NOERROR / NOMESSAGE / NOSUFFIX，缺了任何一个都可能让探针缺失变成启动错误。
+3. **多实例环境要加实例守卫**（示例里的 =THOMAS_EMACS_INSTANCE=）：隔离实例（=elisp-test=）与纯实例
+   （=elisp-pure=）是一次性验证环境，不需要启动分解数据，装了只会让验证结果里混进无关行。
+
+不装探针的降级行为：启动分解仍只有 =mode-start= 一个锚点，报告与 Web 的标题都标注覆盖范围
+（「自 mode 启动起 X ms / 总 Y ms」），**不会**把近似数据冒充全程；其余观测（命令、采样、GC、资源、用法）
+完全不受影响。装了探针的残留边界：load 明细覆盖到「最后一次取走（take）时刻」，=startup= 锚点之后到
+事件循环之间的少量加载可能缺失。
+
+探针的收尾有三条自证路径（正常 =emacs-startup-hook= 回调 / 加载数达 800 兜底 / =after-init= 后 30 秒
+兜底 timer），全部汇到 =--finish= 自摘钩子并取消 timer，不会在启动后继续挂着。注意它**不在**
+=el-chronos-mode= 的生命周期内：=M-x el-chronos-mode= 关掉观测**不会**摘它（I5 的零残留不覆盖它，
+见 ADR-0006 D1）。
+
 * 使用（两种形态）
 
 | 形态 | 启动 | 适合 |
 |---|---|---|
-| org 报告 | =M-x el-chronos-report=（**14 节**，默认近 7 天，可 =1d= / =30d=） | 归档、版本间 diff；=M-x el-chronos-weekly-report= 写周报，=M-x el-chronos-export= 导出 CSV/JSON |
-| 浏览器 Web dashboard | =M-x el-chronos-web-start=（默认 =http://127.0.0.1:8787/=，**18 条只读 GET 路由** = 1 页 + 17 条 =/api/*=） | 深度分析：多图表、火焰图、搜索/排序/分页、多会话对比、CSV 导出 |
+| org 报告 | =M-x el-chronos-report=（**15 节**，默认近 7 天，可 =1d= / =30d=） | 归档、版本间 diff；=M-x el-chronos-weekly-report= 写周报，=M-x el-chronos-export= 导出 CSV/JSON |
+| 浏览器 Web dashboard | =M-x el-chronos-web-start=（默认 =http://127.0.0.1:8787/=，**19 条只读 GET 路由** = 1 页 + 18 条 =/api/*=） | 深度分析：多图表、火焰图、搜索/排序/分页、多会话对比、CSV 导出 |
 
 单条命令的深挖：=M-x el-chronos-profile-command= 在 1ms CPU 采样下**当场**跑一次命令并生成剖析报告
 （热点 / 调用链 / 包归属 / 优化建议），不查库、不依赖历史数据；结果默认只出报告、不落库
@@ -189,9 +237,20 @@ recipe 三处非默认值，各有实测理由：
 - **数据同源**：共享同一 =el-chronos-analysis= 查询层，两边数字不会对不上。
 - **降级可见**：端口占用 → 明确报错，不自动换端口、不静默失败（I11）。
 
-**启动分解的物理边界**：=startup_phases= 的包加载明细只能覆盖 =el-chronos-mode= **启用之后**发生的 load
+**浏览器自动打开（Web dashboard）**：交互式 =M-x el-chronos-web-start= 在启动后默认用 =browse-url=
+打开页面，开关是 =el-chronos-web-open-browser=（默认 =t=）；设为 =nil= 时只在 echo area 显示 URL。
+两个必知边界：
+
+- **程序化启动绝不弹浏览器**（=el-chronos-web-auto-start= 在启用观测时顺带起 server 的那条路径），
+  否则每次启动 Emacs 都会弹一个窗口。
+- =M-x el-chronos-web-browse= 是「现在就打开看」的命令：**不看**这个开关，每次调用都打开当前页，
+  server 未运行时先启动再打开（先启动那次是非交互调用、天然不弹，因此不会双弹）。打开失败只
+  =message= 提示并给出 URL，不影响 server 运行（I11：可见降级、不中断）。
+
+**启动分解的物理边界**：=startup_phases= 的包加载明细只能覆盖采集起步**之后**发生的 =load=
 （观测器无法观测自己被加载之前的事，这是物理边界不是 bug）。若 mode 在启动结束之后才启用
-（例如挂在 =emacs-startup-hook=），就只有 =mode-start= 一个锚点、没有包加载明细；要完整剖析需把
+（例如挂在 =emacs-startup-hook=），就只有 =mode-start= 一个锚点、没有包加载明细；要完整剖析请装
+**启动探针**（见上文「启动探针（推荐：在 =early-init.el= 里加载）」），另一条路是把
 =(el-chronos-mode 1)= 提前到 =early-init.el=（含副作用说明，见
 [[file:docs/operations.org][docs/operations.org]]「启动分解的物理边界」）。
 
@@ -204,6 +263,7 @@ recipe 三处非默认值，各有实测理由：
 | 部分 | 依赖 | 说明 |
 |---|---|---|
 | 核心（入口 / 采集 / 归因 / 存储 / 分析 / 报告） | **零第三方** | 只用内置 =sqlite= / =profiler= / =cl-lib= / =subr-x= / =org= |
+| 启动探针（=el-chronos-startup-probe.el=） | **零依赖（更严格）** | 不 require 任何 el-chronos 模块，也**不** require =cl-lib= / =subr-x=，只用内置 subr；不开库、不写库（early-init 期 =straight/build-*= 尚未建立，任何 require 都可能失败） |
 | Web dashboard（=el-chronos-web.el=） | **零依赖** | 内置 =make-network-process= 自写最小 HTTP server，HTML/CSS/JS 以字符串内嵌，无 CDN（I10） |
 
 * 非目标
@@ -235,12 +295,16 @@ recipe 三处非默认值，各有实测理由：
 | 表 | 保留 |
 |---|---|
 | =commands= / =slow_events=（明细） | =el-chronos-retention-days=（默认 30 天）自动清理 |
-| 五张 =hourly_*= 聚合表（=hourly_functions= / =hourly_usage= / =hourly_stacks= / =hourly_gc= / =hourly_health=） | **永久保留**，只由 =M-x el-chronos-purge= 手动清理 |
+| 七张 =hourly_*= 聚合表（=hourly_functions= / =hourly_usage= / =hourly_stacks= / =hourly_gc= / =hourly_health= / =hourly_drift= / =hourly_resources=） | **永久保留**，只由 =M-x el-chronos-purge= 手动清理 |
 | =startup_phases= / =session_meta=（会话级） | 随 =sessions= 行一起保留（=startup_phases= 每会话 ≤ =el-chronos-startup-top-n= 条加载明细 + 3 个阶段锚点，默认 ≤ 53 行，是增长最快的一张），同样只由 =M-x el-chronos-purge= 清理 |
 
-两套清理粒度不同：五张 =hourly_*= 按**小时列**删，=startup_phases= / =session_meta= 无时间列、
+两套清理粒度不同：七张 =hourly_*= 按**小时列**删，=startup_phases= / =session_meta= 无时间列、
 只能按 =session_id= 的 =started_at= **整会话**删——跨表对账（「某会话的 GC 与启动」）时可能对不齐
 （TD-17）。
+
+=hourly_resources= 记的是**进程 / 系统级数值**——Emacs 进程 CPU 毫秒、RSS（KB）、线程数、系统负载
+1/5/15——**不含任何用户内容**：只查 =(emacs-pid)= 自己的 =process-attributes=，不遍历系统进程、不读
+命令行、不读 buffer。
 
 数据库默认落 =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=
 （连同 =chronos.sqlite-wal= / =-shm=），位于版本控制与备份系统通常忽略的状态目录内。
@@ -260,8 +324,8 @@ recipe 三处非默认值，各有实测理由：
 
 数据清理两条路径（不必卸载也能用）：
 
-- **保留式清理**：=M-x el-chronos-purge= 输入日期 =YYYY-MM-DD= → 删除该日期**之前**的全部数据（含五张 =hourly_*= 与两张会话级表）；
-  直接回车 → 清空全部 10 张表。之后建议 =M-x el-chronos-store-vacuum= 回收文件空间。
+- **保留式清理**：=M-x el-chronos-purge= 输入日期 =YYYY-MM-DD= → 删除该日期**之前**的全部数据（含七张 =hourly_*= 与两张会话级表）；
+  直接回车 → 清空全部 12 张表。之后建议 =M-x el-chronos-store-vacuum= 回收文件空间。
 - **直接删文件**：关闭 Emacs 后 =rm ~/.emacs.d/.local/state/chronos/chronos.sqlite*=，下次启动重建空库。
 
 完整运维步骤（含按平台差异的排障）见 [[file:docs/operations.org][docs/operations.org]]。
@@ -273,39 +337,44 @@ recipe 三处非默认值，各有实测理由：
 #+BEGIN_SRC sh
 make check-parens   # L1：逐文件括号平衡
 make lint           # L1 补充：字节编译告警（输出到临时目录，不污染仓库）
-make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 237 用例，0 skipped）
+make test           # L2：自动发现 test/*-test.el 并跑全部 ERT（当前 304 用例，0 skipped）
 make autoloads      # 按需生成 el-chronos-autoloads.el（生成物不入库、不进 L1/L2）
 make full-check     # check-parens + test
 #+END_SRC
 
-=make autoloads= 生成 =el-chronos-autoloads.el=——**15 个 interactive 命令**的 autoload 声明
+=make autoloads= 生成 =el-chronos-autoloads.el=——**16 个 interactive 命令**的 autoload 声明
 （每个都指向自己的定义文件，如 =(autoload 'el-chronos-report "el-chronos-report" ...)=）。
 **生成物不入库**（=.gitignore= 已忽略，改了源码按需重建即可，入库必然与源码漂移），
 **也不进 L1/L2**（=EL_FILES= 的 =find= 显式排除该文件，否则生成后括号检查与字节编译的检查范围
 会随生成物变化）。Emacs 29+ 用 =loaddefs-generate=，更早版本回退 =make-directory-autoloads=。
 
 测试文件固定命名 =test/*-test.el=（Makefile 用 =$(wildcard test/*-test.el)= 自动发现，
-新增测试无需改 Makefile）。237 用例分布：=collect= 66 / =store= 60 / =report= 33 / =autoload= 3 /
-=analysis= 29 / =attrib= 28 / =web= 18。手动 smoke：开 mode → **真实操作 1 分钟**（纯静止不产生 CPU 样本）→
-=M-x el-chronos-report=；详细清单见 [[file:docs/operations.org][docs/operations.org]]「验证步骤」。
+新增测试无需改 Makefile）。304 用例分布：=collect= 79 / =store= 68 / =analysis= 47 / =report= 38 /
+=attrib= 28 / =web= 25 / =startup-probe= 16 / =autoload= 3。手动 smoke：开 mode → **真实操作 1 分钟**
+（纯静止不产生 CPU 样本）→ =M-x el-chronos-report=；详细清单见 [[file:docs/operations.org][docs/operations.org]]「验证步骤」。
 
 * 当前状态
 
 - 阶段：**Phase 4（Review & Document）**，核心计划与观测面扩展计划均已归档。已实现：
-  **11 表 + 3 索引**（schema v3 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）+ =hourly_drift=（v3））、
-  六条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick / 启动打点 / GC 与自监控）、归因、
-  **18 个**只读聚合查询、org 报告（**14 节**）、Web dashboard（**18 条只读路由**）、单命令剖析、
-  ERT **237** 用例（含 =test/el-chronos-autoload-test.el= 的 3 条 autoload 契约用例）、文档全集。
-  **autoload 契约**：15 个 interactive 命令全部带 =;;;###autoload= cookie，生成入口 =make autoloads=
+  **12 表 + 3 索引**（schema v4 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）
+  + =hourly_drift=（v3）+ =hourly_resources=（v4））、
+  六条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick（**含进程资源与系统负载**） / 启动打点（**可由 early-init 探针前移**） / GC 与自监控）、归因（**self + 栈包含两口径**）、
+  **21 个**只读聚合查询、org 报告（**15 节**）、Web dashboard（**19 条只读路由**）、单命令剖析、
+  ERT **304** 用例（含 =test/el-chronos-autoload-test.el= 的 3 条 autoload 契约用例、
+  =test/el-chronos-startup-probe-test.el= 的 16 条探针用例）、文档全集。
+  **autoload 契约**：16 个 interactive 命令全部带 =;;;###autoload= cookie，生成入口 =make autoloads=
   （产物不入库、不进 L1/L2），供 =use-package= 等声明式配置使用。
+- 计划（已全部归档）：[[file:openspec/completed/startup-probe-and-resources.md][openspec/completed/startup-probe-and-resources.md]]（启动探针 + 资源观测，T1–T9 已完成，2026-10-26 归档）、
+  [[file:openspec/completed/2026-10-26-compact-observability.md][openspec/completed/2026-10-26-compact-observability.md]]（观测能力收敛：栈包含归因 + 命令型慢事件不再记自身栈，T1–T5 已完成，2026-10-26 归档）
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]（核心，2026-10-24 归档）、
   [[file:openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]（观测面扩展 S1 已完成，T1–T10，2026-10-25 归档）
-- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]
+- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]、[[file:docs/adr/0005-two-tier-block-detection.md][ADR-0005 两档阈值（block + drift）]]、[[file:docs/adr/0006-resource-observation.md][ADR-0006 启动探针提前到 early-init + 资源维度观测]]
 - 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]。仍未实施：P95 精度 TD-7、
   清理粒度不一致 TD-17、JSON 导出键名风格 TD-18、CSV 导出两处内联重复 TD-19、
   GUI 侧开销与 redisplay 未实测 TD-21、drift 阈值未经数据校准 TD-22、
-  连续命令流累计卡顿不可见 TD-23、命令边界钩子开销未实测 TD-24；
-  按设计**不修**的边界：堆大小需 Emacs **31.1+**（TD-15）、启动分解覆盖范围受加载时机限制（TD-16）；
+  连续命令流累计卡顿不可见 TD-23、命令边界钩子开销未实测 TD-24、
+  测试临时目录残留 **TD-25**、命令窗口内采样栈未按命令切分 **TD-26**、=hourly_resources= 缺独立 RSS 样本计数 **TD-27**；
+  按设计**不修**的边界：堆大小需 Emacs **31.1+**（TD-15）、启动分解的残留覆盖边界（TD-16，主体已由 early-init 探针解决）；
   已关闭：TD-1 =.eln= 归因、TD-2 阻塞覆盖率、TD-3 采样开销、TD-5 ETAF 性能、TD-9 局部 hook、TD-11 阻塞捕获残余缺口（主体 2026-10-25，残余转 TD-21～TD-24）、TD-12 Web 自观测抑制、TD-13 全 nil 栈
 - 文档：[[file:docs/architecture.org][架构与实测结论]]、[[file:docs/schema.org][数据模型]]、[[file:docs/ui.org][界面与路由]]、[[file:docs/api.org][接口索引]]、[[file:docs/operations.org][运维手册]]
 

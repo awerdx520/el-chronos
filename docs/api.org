@@ -13,24 +13,32 @@
 所有查询函数在数据库打不开或 SQL 出错时 =display-warning= 并返回 =nil=，**不向调用方抛错**（I6）。
 #+END_QUOTE
 
-* 概览：7 个模块
+* 概览：8 个模块
 
 | 模块 | 文件 | 职责 | 对外符号数 |
 |---|---|---|---|
-| 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 19 defcustom |
+| 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 21 defcustom |
 | 归因 | =el-chronos-attrib.el= | 符号 → 源码文件 → 包 / 模块；命令上下文 | 4 |
-| 存储 | =el-chronos-store.el= | SQLite schema（v3，11 表）、批量 flush、保留与 purge | 16 |
-| 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合、GC / 启动打点 | 2 + 1 defcustom |
-| 分析 | =el-chronos-analysis.el= | 18 个只读聚合查询 | 18 |
+| 存储 | =el-chronos-store.el= | SQLite schema（v4，12 表）、批量 flush、保留与 purge | 17 |
+| 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合、GC / 资源 / 启动打点 | 2 + 1 defcustom |
+| 分析 | =el-chronos-analysis.el= | 21 个只读聚合查询 | 21 |
 | 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
-| Web | =el-chronos-web.el= | 最小 HTTP server（18 条只读 GET 路由）+ 内嵌 Web dashboard | 3 |
+| Web | =el-chronos-web.el= | 最小 HTTP server（19 条只读 GET 路由）+ 内嵌 Web dashboard | 4（**零 defcustom**；=el-chronos-web-open-browser= 物理落位在 =el-chronos.el=，已计入入口模块的 21 个） |
+| 启动探针 | =el-chronos-startup-probe.el= | **零依赖**：early-init 起的加载打点 + 三个启动锚点（只写内存，不开库不写库） | 2 |
 
-defcustom 合计 **21 个**：=el-chronos.el= 19 个 + =el-chronos-collect-notify-blocks=（collect）
+defcustom 合计 **23 个**：=el-chronos.el= 21 个 + =el-chronos-collect-notify-blocks=（collect）
 + =el-chronos-profile-save=（report）。后两个是历史分散项，**不迁移**（迁走会破坏用户已有的
 =setq= 位置与 =custom-file= 记录）；新增的 defcustom 一律落 =el-chronos.el=。
+计数口径按**定义物理落位**统计（不是按功能归属）：=el-chronos-web.el= 零 defcustom ——
+=el-chronos-web-open-browser= 定义在 =el-chronos.el=，只在入口模块算一次。
 
 可视化只有两种形态：**浏览器 Web dashboard**（=el-chronos-web.el=）与 **org 报告**（=el-chronos-report.el=），
 没有 Emacs 内的独立页面模块。
+
+=el-chronos-startup-probe.el= 是**可选侧文件**：由用户在 =early-init.el= 里
+=(load "el-chronos-startup-probe" t t t)= 加载，不在 =el-chronos-mode= 生命周期内
+（I5 例外，见 ADR-0006 D1）。它**不 require 任何 el-chronos 模块**，也不 require
+=cl-lib= / =subr-x=（early-init 期 =straight/build-*= 还没建立）。
 
 * 入口模块（=el-chronos.el=）
 
@@ -48,7 +56,7 @@ defcustom 合计 **21 个**：=el-chronos.el= 19 个 + =el-chronos-collect-notif
 (el-chronos-mode -1)    ; 停止，清理 timer / hook / profiler / 未 flush 缓冲
 #+END_SRC
 
-** defcustom（=el-chronos.el= 内 19 个，属于 =el-chronos= 组）
+** defcustom（=el-chronos.el= 内 21 个，属于 =el-chronos= 组）
 
 | 变量 | 默认值 | 类型 | 说明 |
 |---|---|---|---|
@@ -58,6 +66,7 @@ defcustom 合计 **21 个**：=el-chronos.el= 19 个 + =el-chronos-collect-notif
 | =el-chronos-heap-sample-windows= | =6= | integer | 每 N 个采样窗口取一次 Emacs 堆大小（≈ N × 窗口长度，默认约 60s）。堆采样稀疏，同小时只保留最后一个非空值（=COALESCE=）；Emacs < 31.1 无 =garbage-collect-heapsize= 时该列恒 NULL。 |
 | =el-chronos-startup-top-n= | =50= | integer | 启动期包加载明细入库的条数上限（内存留全部、写库前按 ms 降序截断）。决定 =startup_phases= 每会话行数的上界（top-N + 3，=first-idle= 记录时 +4）。 |
 | =el-chronos-heartbeat-seconds= | =0.25= | number | 心跳间隔（秒），用于检测**命令外**主线程停转。默认 **250ms**（v3 由 1 改为 0.25）：把 block / drift 两档的**高估上界从 1s 压到 250ms**。开销依据：实测相对开销 **+0.0357%**（[[file:architecture.org][docs/architecture.org]]「实测结论 13」，距 0.5% 预算余 14 倍），但该数字是 =emacs -Q --batch= 下测的，**GUI 主循环未验证**（只能作上界估计）。**硬约束**：本值必须小于 =el-chronos-drift-threshold-ms=，否则每次正常心跳间隔都会被判成 drift（代码不断言，调档见 [[file:operations.org][docs/operations.org]]）。 |
+| =el-chronos-resource-sampling= | =t= | boolean | **是否采集 Emacs 进程资源与系统负载（v4，默认开启）**。采集项：进程 CPU（=process-attributes= 的 =time= 差分成 =cpu_ms= / =wall_ms=）、RSS（=rss=，KB）、线程数（=thcount=）、系统负载 1/5/15（=load-average= **需传 =t=** 才返回列表）。只查 =(emacs-pid)= **自己**，零副作用；复用既有采样 timer，**不新增 timer**。**不采系统内存**（=memory-info= 是整机内存，remote =default-directory= 下查的是远端主机）。取 =nil= 表示**完全不采**：连 =process-attributes= 都不调用（该分支直接返回，零开销）。口径见 [[file:operations.org][docs/operations.org]]「资源采集的开关与口径」。 |
 | =el-chronos-block-threshold-ms= | =2000= | number | 心跳 drift 超过该值记一条 =block= 明细（毫秒）。v3 起 block **只覆盖命令外停转**（命令执行时间被 =--finish= 的基线重置切出 gap），=command= 列恒 =nil=。 |
 | =el-chronos-drift-threshold-ms= | =500= | number | **命令外停转**的 drift 档阈值（毫秒，v3 新增）：超过即累加到 =hourly_drift= 小时聚合（只记次数 / 累计 / 最坏，**不记明细、不发提示**）；超过 =el-chronos-block-threshold-ms= 则记 block 档（两档互斥）。**语义限定「命令之外」**：命令内停转由 =commands= 的 =duration_ms= 负责，两表**不可相加**。**硬约束**：必须大于 =el-chronos-heartbeat-seconds= × 1000。真实频率未知（batch 只能注入人造延迟），建议上线观察一周后调档。 |
 | =el-chronos-slow-command-threshold-ms= | =200= | number | 慢命令阈值（毫秒）。 |
@@ -69,7 +78,8 @@ defcustom 合计 **21 个**：=el-chronos.el= 19 个 + =el-chronos-collect-notif
 | =el-chronos-regression-threshold= | =0.5= | number | 回归增长率阈值（0.5 = +50%）。 |
 | =el-chronos-regression-min-samples= | =10= | integer | 回归判定要求的最小样本数（两窗口各自满足）。 |
 | =el-chronos-web-port= | =8787= | integer | Web dashboard 端口（只绑 =127.0.0.1=，占用即失败不换端口）。 |
-| =el-chronos-web-auto-start= | =nil= | boolean | 启用观测时是否顺带启动 Web（默认不启动）。 |
+| =el-chronos-web-auto-start= | =nil= | boolean | 启用观测时是否顺带启动 Web（默认不启动）。程序化启动**绝不弹浏览器**（见 =el-chronos-web-open-browser=）。 |
+| =el-chronos-web-open-browser= | =t= | boolean | **交互式**启动 Web dashboard 时是否自动用 =browse-url= 打开页面（默认开启）。=nil= 时只在 echo area 显示 URL。**只影响交互式调用**（=M-x el-chronos-web-start=）：程序化启动（=el-chronos-web-auto-start= 顺带起 server）绝不弹，否则每次启动 Emacs 都弹窗。打开失败只 =message= 提示并给出 URL，不影响 server 启动（I11：可见降级）。 |
 | =el-chronos-config-watch-globs= | ='("early-init.el" "init.el" "lisp/init-*.el")= | (repeat string) | 计算 =session_meta.config-sig= 时要指纹化的文件清单，用 =file-expand-wildcards= **相对 =user-emacs-directory=** 展开。指纹是 =(相对路径 mtime size)= 排序后的 =secure-hash 'sha1=，**不含文件内容**。无匹配文件时**不写该键**（不写 NULL 值行）。 |
 
 collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=）：
@@ -108,11 +118,12 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 | =el-chronos-store-record-gc= | =(HOUR-TS GC-COUNT GC-MS HEAP-BYTES)= | 无 | 累加小时 GC 统计（v2）。=HEAP-BYTES= 为 nil 表示本窗口无堆样本 → 该行 =heap_bytes= **保持上一次观测值**（=COALESCE=，last-observation-carried-forward）；只有非 nil 才覆盖。 |
 | =el-chronos-store-record-health= | =(HOUR-TS KEY VALUE)= | 无 | 累加采集器自监控计数（v2）。=KEY= 为固定枚举：=dropped-commands= / =dropped-events= / =flush-failures= / =flush-count= / =flush-ms= / =sample-misses=。库里是 **eventual** 值（flush 失败时无法写库，下一次成功 flush 补写）。 |
 | =el-chronos-store-record-drift= | =(HOUR-TS GAP-MS)= | 无 | 累加「命令外停转」小时聚合（v3）：=count= +1、=total_ms= 累加、=max_ms= 取较大值。=GAP-MS= 是**浮点毫秒**（当前时刻与 =--last-heartbeat= 之差 × 1000，含 ∈[0, 心跳间隔] 的偏移，故为**高估值**）。整体 =condition-case= 包裹；会话未知时**跳过并每进程告警一次**（=hourly_drift= 无外键，孤儿行 purge 删不掉）。 |
+| =el-chronos-store-record-resources= | =(HOUR-TS PLIST)= | 无 | 累加一次**进程资源**采样到 =hourly_resources=（v4）。=PLIST= 键全部可选：=:cpu-ms= / =:wall-ms=（毫秒，**累加**；两者之比即 CPU 占用率）、=:rss-kb-max= / =:rss-kb-sum=（**KB**）、=:threads-max=（峰值）、=:load1-sum= / =:load5-sum= / =:load15-sum=（累加）。=load_n= **不接受显式传值**：三值里任一非空即记一条负载样本（+1）。**NULL 语义**：可空字段传 nil **不得覆盖已有非 NULL 值**（内存槽「有值才更新」+ 落库 =COALESCE= 两道都必要）。非数值（字符串 / 符号）一律按「没采到」处理，不让脏输入毁掉整批 flush。 |
 | =el-chronos-store-record-startup-phase= | =(SESSION-ID PHASE MS)= | 无 | 记录启动阶段耗时（v2）。=PHASE= 取 =mode-start= / =after-init= / =startup= / =first-idle=，包加载明细用 ="load:<library>"=；同 =(SESSION-ID, PHASE)= 重复打点**覆盖**。 |
 | =el-chronos-store-record-session-meta= | =(SESSION-ID KEY VALUE)= | 无 | 写会话级元数据（v2，=git-head= / =config-sig=）。**直接 =sqlite-execute= 写入、不走缓冲**（每会话一次的冷路径，立即可见、不占缓冲、失败可独立告警）；=VALUE= 为 nil 时**不写行**。 |
 | =el-chronos-store-note-startup-ms= | =(MS)= | 无 | 登记待补写的 =sessions.startup_ms=，落库并入**下一次 flush 的既有事务**。**纯内存、零 IO**：不碰 sqlite、不告警、不登记 timer（见「内部函数约定」）。 |
-| =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 四表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
-| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含六张 =hourly_*= 与两张会话级表）：**共 11 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 11 表删除顺序」）。=BEFORE= 为 nil 时清空全部 11 张表。与自动 retention 的区别是连聚合一起删。 |
+| =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 / v3 / v4 新表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
+| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含七张 =hourly_*= 与两张会话级表）：**共 12 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 12 表删除顺序」）。=BEFORE= 为 nil 时清空全部 12 张表。与自动 retention 的区别是连聚合一起删。 |
 | =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
 
 #+BEGIN_SRC elisp
@@ -135,7 +146,7 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 一般**不直接调用**：由 =el-chronos-mode= 编排（=--start= / =--stop=）。单独加载 collect 时对
 store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
-* 分析模块（=el-chronos-analysis.el=，18 个查询）
+* 分析模块（=el-chronos-analysis.el=，21 个查询）
 
 =RANGE= 取 ='1d= / ='7d= / ='30d=（按当前时刻倒推，上界含当前毫秒 +1 毫秒避免漏行），
 或显式半开区间 ='(START . END)=（epoch 毫秒）。全部只读，返回 plist 或 list of plist；
@@ -145,10 +156,13 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 |---|---|---|---|
 | =el-chronos-analysis-overview= | =(RANGE)= | plist | 概览 6+1 指标：=:commands= =:blocked-ms= =:slow-commands= =:samples= =:db-size= =:startup-ms=（近 10 次有效会话中位数）= =:sessions= |
 | =el-chronos-analysis-top-functions= | =(RANGE &optional LIMIT INCLUDE-GC)= | list of plist | 热点函数，按 self 降序；元素 =(:function :file :package :self-ms :samples :pct)=；默认排除 ="Automatic GC"= |
+| =el-chronos-analysis-inclusive-functions= | =(RANGE &optional LIMIT)= | list of plist | **栈包含归因（v4）**：按「栈包含样本数」降序；元素 =(:function :samples :pct :stacks)=（=:samples= 是该函数**出现在其中的栈样本数之和**，=:stacks= 是涉及的不同栈条数，=:pct= 占**窗口内全部栈样本数**的百分比，分母取自截断前）。=LIMIT= 默认 100。与 =top-functions= 的差别：后者是 self 口径，成本记在被调用的 built-in 帧上时会把**调用者**严重低估；本函数能让「只作中间帧出现」（=hourly_functions.samples= 恒 0、=total_ms= > 0）的函数被找出。 |
 | =el-chronos-analysis-slow-commands= | =(RANGE &optional LIMIT)= | list of plist | 命令排行，按总耗时降序；=(:name :count :total-ms :max-ms :avg-ms :aborted)= |
 | =el-chronos-analysis-package-breakdown= | =(RANGE &optional LIMIT)= | list of plist | 包 / 模块占比；=(:package :self-ms :pct)=；=unknown= 与 =GC= 恒排末尾 |
 | =el-chronos-analysis-trend= | =(RANGE &optional BUCKETS)= | list of plist | 分桶趋势；=(:bucket :samples :slow-commands :blocked)=；空桶不返回 |
 | =el-chronos-analysis-gc-trend= | =(RANGE &optional BUCKETS)= | plist | **GC 与内存趋势（v2）**。=:range= =:bucket-span= =:buckets= =:gc-total= =:heap-latest=；=:buckets= 元素 =(:bucket :gc-count :gc-ms :heap-bytes)=。三条关键约定：① =:heap-bytes= 取桶内**按 =hour_ts= 升序最后一个非 NULL 值**（瞬时量：求和没意义、平均会被采样间隔拉偏），桶内全 NULL 时为 nil；② 只在 Emacs 31.1+ 有值（更低版本恒 nil，不是数据丢失）；③ 会话首个采样窗口只建基线，可能出现 =gc-count= / =gc-ms= 全 0 的桶（那是基线桶，不等于「没有发生 GC」）。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**，避免调用方判空分支分叉。 |
+| =el-chronos-analysis-resource-trend= | =(RANGE &optional BUCKETS)= | plist | **进程资源趋势（v4）**。=:range= =:bucket-span= =:buckets=，窗口级汇总 =:cpu-ms-total= =:wall-ms-total= =:cpu-pct-avg= =:rss-kb-max= =:rss-kb-avg= =:threads-max= =:load1-avg= =:load5-avg= =:load15-avg= =:samples=；=:buckets= 元素 =(:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max :load1-avg :load5-avg :load15-avg)=，按桶起点升序。三条口径：① =:cpu-pct= 必须先 =SUM(cpu_ms) / SUM(wall_ms)= 再算比值（各桶窗口总时长不同，不能对单窗比率取平均）；② RSS / 负载的均值分母是 **=load_n=**，为 0 时是 **NULL（渲染 =-=）而不是 0**（I11）；③ 均值为 NULL 时渲染 =-=，不造假象。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**。 |
+| =el-chronos-analysis-resource-summary= | =(RANGE)= | plist 或 =nil= | **进程资源汇总（v4，供概览卡片）**：=(:cpu-pct :cpu-ms :wall-ms :rss-kb-max :rss-kb-avg :threads-max :load1-avg :load5-avg :load15-avg :samples)=。各键口径与 =resource-trend= 的窗口级汇总字段**完全一致**（改动须两处同步，否则报告与 Web 给出两个数）。与 trend 的唯一差别：**无数据时返回 =nil=**（「窗口汇总类」查询的一致形态），因为概览卡片需要区分「无数据」与「有数据但全 0」；实现走一条 SQL 聚合，不把窗口内全部行搬进 Elisp。 |
 | =el-chronos-analysis-heatmap= | =(RANGE &optional LIMIT)= | list of plist | 命令 × 时间桶热力；=(:bucket :command :count :duration-ms)= |
 | =el-chronos-analysis-stacks= | =(RANGE &optional LIMIT)= | list of plist | 调用栈排行；=(:stack :samples :pct)=，=:stack= 第 0 帧是 leaf；默认 50 |
 | =el-chronos-analysis-sessions= | =(RANGE)= | list of plist | 会话列表，按启动时间降序；=(:id :started-at :startup-ms :emacs-version :host)= |
@@ -172,7 +186,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
-| =el-chronos-report= | =(&optional RANGE)=，interactive | 报告 buffer | 生成（或刷新）=*el-chronos-report*= 只读 org 报告；默认 =7d=，**14 节**内容见 [[file:ui.org][docs/ui.org]]。 |
+| =el-chronos-report= | =(&optional RANGE)=，interactive | 报告 buffer | 生成（或刷新）=*el-chronos-report*= 只读 org 报告；默认 =7d=，**15 节**内容见 [[file:ui.org][docs/ui.org]]（「热点函数」节内的 =** 栈包含占比 TOP= 是**子小节、不增节**）。 |
 | =el-chronos-weekly-report= | =(&optional FILE)=，interactive | 文件名 | 把近 7 天报告写入 =FILE=（默认 =chronos-weekly.org=，落运行时状态目录）。 |
 | =el-chronos-export= | =(FORMAT FILE &optional RANGE)=，interactive | 文件名 | =FORMAT= 取 ='csv= / ='json=；CSV 用 =# section:= 分块。 |
 | =el-chronos-show-event= | =(ID)=，interactive | 事件 buffer | 在 =*el-chronos-event*= 展示慢事件完整栈与 context。 |
@@ -191,26 +205,28 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
-| =el-chronos-web-start= | =(&optional PORT)=，interactive | server 进程对象 | 起 server，只绑 =127.0.0.1=（I8）；端口占用 =user-error=，不换端口。 |
+| =el-chronos-web-start= | =(&optional PORT)=，interactive | server 进程对象 | 起 server，只绑 =127.0.0.1=（I8）；端口占用 =user-error=，不换端口。**交互式调用**时若 =el-chronos-web-open-browser= 为真（默认），启动后用 =browse-url= 打开页面；程序化启动（=el-chronos-web-auto-start= 顺带起）**绝不弹浏览器**。打开失败只 =message= 提示并给出 URL，不影响 server（I11）。 |
 | =el-chronos-web-stop= | =()=，interactive | =t=（确有关闭）/ =nil= | 关闭 server 并释放端口。 |
 | =el-chronos-web-running-p= | =()= | boolean | server 是否在运行。 |
+| =el-chronos-web-browse= | =()=，interactive | URL 字符串 | **打开（必要时先启动）Web dashboard 页面（v4）**。server 未运行时按默认端口启动它，然后用 =browse-url= 打开。**忽略 =el-chronos-web-open-browser=**：本命令本身就是用户显式要求打开页面，再判那个「启动时是否自动弹」的开关没有意义。 |
 
-18 条只读 GET 路由（1 条 HTML + 16 条 JSON + 1 条 CSV）见 [[file:ui.org][docs/ui.org]]「浏览器 Web dashboard」节。
+19 条只读 GET 路由（1 条 HTML + 17 条 JSON + 1 条 CSV）见 [[file:ui.org][docs/ui.org]]「浏览器 Web dashboard」节。
 
 #+BEGIN_SRC elisp
-(el-chronos-web-start)        ; → http://127.0.0.1:8787/
+(el-chronos-web-start)        ; → http://127.0.0.1:8787/（交互式调用会顺带开浏览器）
 (el-chronos-web-running-p)    ; => t
+(el-chronos-web-browse)       ; 只需打开页面时用它（未启动则先启动）
 (el-chronos-web-stop)         ; => t
 #+END_SRC
 
 * autoload 与 use-package 集成
 
-包侧提供标准 autoload 契约：**15 个 interactive 命令**全部带 =;;;###autoload= cookie，
+包侧提供标准 autoload 契约：**16 个 interactive 命令**全部带 =;;;###autoload= cookie，
 由 =make autoloads= 生成 =el-chronos-autoloads.el=。契约由
 =test/el-chronos-autoload-test.el=（3 用例）守门——cookie 覆盖全部 interactive 命令（计数不变量）、
-生成后 15 个命令 =autoloadp= 为 =t=、每条 autoload 的库名等于其定义文件。
+生成后 16 个命令 =autoloadp= 为 =t=、每条 autoload 的库名等于其定义文件。
 
-** 15 个 interactive 命令与定义文件
+** 16 个 interactive 命令与定义文件
 
 | # | 命令 | 定义文件 | 生成 autoloads 后可直接 =M-x= | 备注 |
 |---|---|---|---|---|
@@ -229,8 +245,9 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 | 13 | =el-chronos-store-vacuum= | =el-chronos-store.el= | 是 | |
 | 14 | =el-chronos-web-start= | =el-chronos-web.el= | 是 | |
 | 15 | =el-chronos-web-stop= | =el-chronos-web.el= | 是 | |
+| 16 | =el-chronos-web-browse= | =el-chronos-web.el= | 是 | 打开（未启动则先启动）dashboard 页面；**不看** =el-chronos-web-open-browser= |
 
-按文件分布：入口 2 / 归因 1 / 存储 3 / 采集 2 / 报告 5 / Web 2 = **15**。
+按文件分布：入口 2 / 归因 1 / 存储 3 / 采集 2 / 报告 5 / Web 3 = **16**。
 
 ** =make autoloads= 的作用与产物
 
@@ -278,7 +295,7 @@ straight 的 autoloads 步骤依据包侧 cookie 生成 =build-<ver>/el-chronos/
 包不住 =:straight= 生成的安装调用（实测展开仍是 =(progn (straight-use-package …) (when COND …))=，
 条件为假照样去 clone；正确形态的展开把该调用关进 =if= 的 then 分支）。
 
-完整逐项解释与陷阱见 [[file:operations.org][docs/operations.org]]「方式 A / 方式 C」与「四个静默陷阱」，
+完整逐项解释与陷阱见 [[file:operations.org][docs/operations.org]]「方式 A / 方式 C」与「静默陷阱」，
 面向使用者的简版见 [[file:../Readme.org][Readme.org]]「安装」。若坚持 =:load-path= 形态（无 straight），
 则须逐条 =(autoload SYM "定义文件")=，库名规则见下一节。
 
@@ -329,8 +346,50 @@ straight 的 autoloads 步骤依据包侧 cookie 生成 =build-<ver>/el-chronos/
     兜底门（=--pending-p=）→ block / drift 分档」，两档共用同一对门。=condition-case= **必须在
     本函数内部**：=--pre-command= 自身没有它，异常逃出去会经 =pre-command-hook= 中断用户正在
     执行的命令。三处调用形态由用例 =heartbeat-check-is-single-source-of-truth= 守门。
+- **v4 的两条交接约定（探针 → collect → store）**（2026-10-26）：
+  - =el-chronos-collect--startup-take-probe ()= 是**唯一交接点，两个调用来源共用、禁止分叉**：
+    ① =--startup-instrument=（mode 启用时的首次交接）；② 探针 =--finish= 的**软调用**
+    （补写「首次 take 之后到启动收尾之间」又加载的包）。判据三连，缺一返回 nil：
+    =(fboundp 'el-chronos-startup-probe-take)=（用户没在 early-init 里 load → 完全走原有路径）、
+    =:anchors= 与 =:loads= **至少一个非空**（只看探针的 =:captured-p= 不够，它可能为真而一条
+    可写数据都没有）、=el-chronos--session-id= 非 nil。**会话守卫必须在 =take= 之前**
+    （=and= 短路）：此时探针内存里的 =:loads= **不会被清空**，用户之后真启用 mode 时下一次交接
+    仍能补上。**collect 绝不 =require= 探针** —— 它是可选侧文件。
+  - =el-chronos-collect--collect-resources ()= 是资源采集的唯一入口：与 =--collect-gc= 并列、
+    **同在其 =(when el-chronos-collect--sampling-p …)= 之外**（profiler 启动失败时资源趋势不该
+    陪葬）；整段包 TRAMP 守卫 =(let ((default-directory temporary-file-directory)) …)=；
+    逐字段判空、=nil= 表示「本窗口没采到」（**绝不用 0 冒充**）；首窗口只建基线不写库；
+    **复用既有采样 timer，不新增 timer**（实测结论 13 第 4 条：成本在事件循环唤醒而非回调）。
+  - 探针侧的对应约定（=el-chronos-startup-probe.el=）：=-data= **纯只读**（可反复调用拿同一份，
+    排障 / 断言用）；=-take= **增量**（=:anchors= 只读不重置 —— 重复写同 phase 由 =startup_phases=
+    主键 upsert 吸收幂等；=:loads= 取走即 =clrhash=）；=--finish= **幂等**且必须 =cancel-timer=
+    **两个** timer（=--finish-timer= 与 =--fallback-timer=，漏一个就是探针侧遗留 timer，
+    I5 在此无覆盖）；探针**不 require** 任何 el-chronos 模块（反向交接靠 =fboundp= 软调用）。
 - 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
   继续，不向宿主抛错（I6）。
+
+* 启动探针模块（=el-chronos-startup-probe.el=，2 个对外接口）
+
+**零依赖**：不 require 任何 el-chronos 模块，也不 require =cl-lib= / =subr-x= —— early-init 期
+=straight/build-*= 还没建立，任何 require 都可能失败并打断启动。它**不开库、不建库、不写库**
+（SQLite 与 flush 事务全部留给 collect），启动路径上不出现任何可能阻塞的 IO。
+
+| 符号 | 签名 | 返回 | 说明 |
+|---|---|---|---|
+| =el-chronos-startup-probe-data= | =()= | plist =(:anchors ALIST :loads ALIST :captured-p BOOL)= 或 =nil= | **纯只读快照**：不清空、不重置任何状态，可反复调用拿同一份数据（排障与断言用）。=:anchors= 是 phase 符号 → 相对 =before-init-time= 的毫秒（按记录顺序，早→晚）；=:loads= 是 library 名 → 累计毫秒（按毫秒降序）。永不抛错（异常时返回 nil）。 |
+| =el-chronos-startup-probe-take= | =()= | 同上的 plist | **取走数据（增量语义）**：=:anchors= **只读不重置**（重复 take 返回同一份，写库侧靠 =startup_phases= 主键 upsert 吸收幂等）；=:loads= **取走即清空**（=clrhash=，第二次 take 的 =:loads= 为空）；=:captured-p= 在清空前算好，故与是否清空无关。永不抛错。 |
+
+#+BEGIN_SRC elisp
+;; early-init.el（两行；NOERROR 语义，仓库搬走后静默降级）
+(load "/home/thomas/Workspace/el-chronos/el-chronos-startup-probe" t t t)
+
+;; 运行时查看快照（只读，可反复调用）
+(plist-get (el-chronos-startup-probe-data) :anchors)
+#+END_SRC
+
+安装、三重防护与降级行为见 [[file:operations.org][docs/operations.org]]「启动探针的安装」；
+采集语义（三条收尾路径、=take= 增量、覆盖终点）见 [[file:architecture.org][docs/architecture.org]]
+「启动探针（early-init 路径）」。
 
 * 关联
 
@@ -338,6 +397,8 @@ straight 的 autoloads 步骤依据包侧 cookie 生成 =build-<ver>/el-chronos/
 - 观测面扩展计划（v2）：[[file:../openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]
 - ADR：[[file:adr/0003-web-only-visualization.md][docs/adr/0003-web-only-visualization.md]]（可视化收敛为 Web dashboard + org 报告两形态，取代 ADR-0002）
 - ADR：[[file:adr/0004-observation-surface-expansion.md][docs/adr/0004-observation-surface-expansion.md]]（schema v2：内存 / GC、启动分解、自监控、配置变更）
+- ADR：[[file:adr/0005-two-tier-block-detection.md][docs/adr/0005-two-tier-block-detection.md]]（schema v3：block / drift 两档阈值，命令外停转小时聚合）
+- ADR：[[file:adr/0006-resource-observation.md][docs/adr/0006-resource-observation.md]]（schema v4：启动探针提前到 early-init + 进程资源观测）
 - 界面与路由：[[file:ui.org][docs/ui.org]]
 - 数据模型：[[file:schema.org][docs/schema.org]]
 - 装卸与排障：[[file:operations.org][docs/operations.org]]

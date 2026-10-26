@@ -143,7 +143,8 @@
 ;;; 命令结算
 
 (ert-deftest el-chronos-collect-test-finish-aborted-slow-command ()
-  "`aborted' 结算写命令事件、三维用法与超阈值慢事件，并清空命令状态。"
+  "`aborted' 结算写命令事件、三维用法与超阈值慢事件，并清空命令状态。
+慢事件的 `:stack` 恒 nil 是**设计**（结算时刻取栈只会取到采集器自身的帧），不是缺失。"
   (let ((events nil)
         (el-chronos-slow-command-threshold-ms 200)
         (el-chronos-usage-granularity 'command))
@@ -170,7 +171,10 @@
       (should (>= (plist-get command :duration-ms) 300))
       (should (equal "command" (plist-get slow :kind)))
       (should (equal "slow-cmd" (plist-get slow :command)))
-      (should (listp (plist-get slow :stack)))
+      ;; 命令型事件的 stack 恒 nil 是**设计**，不是缺失：栈只有在结算路径里才取得到，
+      ;; 而那时被观测命令的帧已弹出，栈顶只会是采集器自身（详见 `--finish` docstring）。
+      ;; 不要把它「修复」成 `(listp …)` —— 那是在记录假数据。
+      (should-not (plist-get slow :stack))
       ;; 用法统计按 command → mode → project 顺序记录（维度是符号）
       (should (eq 'command (car dimensions)))
       (should (eq 'project (car (last dimensions))))
@@ -1615,5 +1619,329 @@ store 侧 `-record-drift' 的签名是 `(hour-ts gap-ms)'，单位是毫秒而�
     (should-not (el-chronos-collect-test--calls cap 'drift))))
 
 (provide 'el-chronos-collect-test)
+
+;;; T3 探针交接（early-init 探针 → collect 写库）
+;; 探针是 `early-init.el' 里由用户显式 load 的**可选**侧文件：collect 只用 `fboundp' 软调用，
+;; 绝不 require。因此这里全部用 `cl-letf' 桩 `el-chronos-startup-probe-take' 来造两种场景
+;; （不存在 → 走现状路径；有数据 → 走探针路径），并把 store 的写接口换成捕获器。
+
+(ert-deftest el-chronos-collect-test-startup-instrument-without-probe-keeps-current-path ()
+  "探针函数不存在（`fboundp' 为 nil）时**完全走现状路径**：挂钩子 + 只记 `mode-start'。
+锁住「探针缺失时行为一字不变」这条兼容性契约（探针是可选件，不能变成隐性必需依赖）。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((el-chronos-heartbeat-seconds 3600)
+          (el-chronos-sample-window-seconds 3600)
+          (el-chronos--active-timers nil)
+          (el-chronos--session-id 7)   ; 有会话也不该改变路径判定（判据是 fboundp）
+          (anchors nil)
+          (real-fboundp (symbol-function 'fboundp)))
+      (cl-letf (((symbol-function 'fboundp)
+                 (lambda (symbol &rest args)
+                   (if (eq symbol 'el-chronos-startup-probe-take)
+                       nil
+                     (apply real-fboundp symbol args))))
+                ((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase _ms) (push phase anchors))))
+        (unwind-protect
+            (progn
+              (should (eq t (el-chronos-collect-start)))
+              (should (memq #'el-chronos-collect--after-load
+                            after-load-functions))
+              (should (memq #'el-chronos-collect--startup-after-init
+                            after-init-hook))
+              (should (memq #'el-chronos-collect--startup-on-startup
+                            emacs-startup-hook))
+              (should (timerp el-chronos-collect--startup-timer))
+              (should (equal '(mode-start) anchors)))
+          (el-chronos-collect-stop))))))
+
+(ert-deftest el-chronos-collect-test-startup-take-probe-writes-and-skips-own-hooks ()
+  "探针有数据时：锚点与 `load:*' 明细全部写库，且**一个自有钩子都不挂**。
+探针路径覆盖 `early-init' 起的完整加载，再挂自有钩子只会把同一批 load 记两遍
+（两套近似归因基线互相污染时间差）。`mode-start' 与 `first-idle' 仍由本模块补记。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((el-chronos-heartbeat-seconds 3600)
+          (el-chronos-sample-window-seconds 3600)
+          (el-chronos--active-timers nil)
+          (el-chronos--session-id 7)
+          (before-init-time (time-subtract (current-time) 5))
+          (rows nil))
+      (cl-letf (((symbol-function 'el-chronos-startup-probe-take)
+                 (lambda ()
+                   (list :anchors '((early-init . 10.0) (after-init . 900.0))
+                         :loads '(("org" . 30.0) ("sqlite" . 5.0))
+                         :captured-p t)))
+                ((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (session phase ms) (push (list session phase ms) rows))))
+        (unwind-protect
+            (progn
+              (should (eq t (el-chronos-collect-start)))
+              ;; ① 写库内容：探针锚点（早→晚）→ load:*（按毫秒降序）→ 本模块补的 mode-start
+              (let ((written (nreverse rows)))
+                (should (= 5 (length written)))
+                (should (equal '(early-init after-init "load:org" "load:sqlite" mode-start)
+                               (mapcar (lambda (row) (nth 1 row)) written)))
+                (should (equal '(7 7 7 7 7) (mapcar #'car written)))
+                (should (equal '(10.0 900.0) (list (nth 2 (nth 0 written))
+                                                   (nth 2 (nth 1 written)))))
+                (should (equal '(30.0 5.0) (list (nth 2 (nth 2 written))
+                                                 (nth 2 (nth 3 written)))))
+                (should (floatp (nth 2 (nth 4 written)))))  ; mode-start 现算偏移
+              ;; ② 自有钩子与 30 秒兜底 timer 一个都不挂（探针已覆盖）
+              (should-not (memq #'el-chronos-collect--after-load
+                                after-load-functions))
+              (should-not (memq #'el-chronos-collect--startup-after-init
+                                after-init-hook))
+              (should-not (memq #'el-chronos-collect--startup-on-startup
+                                emacs-startup-hook))
+              (should-not el-chronos-collect--startup-timer)
+              ;; ③ `first-idle' 纯粹是阶段标记，仍注册（不参与摘钩）
+              (should (timerp el-chronos-collect--startup-idle-timer)))
+          (el-chronos-collect-stop))))))
+
+(ert-deftest el-chronos-collect-test-startup-take-probe-trims-loads-to-top-n ()
+  "探针交来的 `:loads' 按 `el-chronos-startup-top-n' 截断后才写库（探针在内存里存全量）。
+top-n = 1 → 只留最大那条；top-n = 0 → 一条明细都不写（只写锚点）。"
+  (el-chronos-collect-test--with-startup 1
+    (let ((el-chronos--session-id 7)
+          (written nil))
+      (cl-letf (((symbol-function 'el-chronos-startup-probe-take)
+                 (lambda ()
+                   (list :anchors '((early-init . 2.0))
+                         :loads '(("small" . 1.0) ("big" . 99.0) ("mid" . 42.0))
+                         :captured-p t)))
+                ((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase ms) (push (list phase ms) written))))
+        (should (el-chronos-collect--startup-take-probe))
+        (should (equal '((early-init 2.0) ("load:big" 99.0))
+                       (nreverse written)))
+        ;; top-n = 0：不记明细，锚点照写
+        (setq written nil
+              el-chronos-startup-top-n 0)
+        (should (el-chronos-collect--startup-take-probe))
+        (should (equal '((early-init 2.0)) (nreverse written)))))))
+
+(ert-deftest el-chronos-collect-test-startup-take-probe-empty-data-keeps-own-hooks ()
+  "`:captured-p' 为 t 但 `:anchors' / `:loads' 都空 → 不写库、仍走现状路径挂钩子。
+反例靶子：按 `captured-p' 分支会把「探针工作过」误当成「有数据可交接」，
+于是既不挂钩子（自有路径被跳过）也没写任何明细，启动分解彻底空转。"
+  (el-chronos-collect-test--with-startup 50
+    (let ((el-chronos-heartbeat-seconds 3600)
+          (el-chronos-sample-window-seconds 3600)
+          (el-chronos--active-timers nil)
+          (el-chronos--session-id 7)
+          (before-init-time (time-subtract (current-time) 5))
+          (phases nil))
+      (cl-letf (((symbol-function 'el-chronos-startup-probe-take)
+                 (lambda () (list :anchors nil :loads nil :captured-p t)))
+                ((symbol-function 'el-chronos-store-record-startup-phase)
+                 (lambda (_session phase _ms) (push phase phases))))
+        (unwind-protect
+            (progn
+              ;; ① 单独调用：返回 nil（调用方据此判定「没拿到数据」）
+              (should-not (el-chronos-collect--startup-take-probe))
+              (should-not phases)
+              ;; ② 走 `--startup-instrument'：回到现状路径
+              (should (eq t (el-chronos-collect-start)))
+              (should (equal '(mode-start) (nreverse phases)))
+              (should-not (cl-some (lambda (phase)
+                                     (and (stringp phase)
+                                          (string-prefix-p "load:" phase)))
+                                   phases))
+              (should (memq #'el-chronos-collect--after-load
+                            after-load-functions))
+              (should (timerp el-chronos-collect--startup-timer)))
+          (el-chronos-collect-stop))))))
+
+(ert-deftest el-chronos-collect-test-startup-take-probe-skipped-without-session ()
+  "会话未建立（`el-chronos--session-id' 为 nil）时返回 nil、不写库、**也不调 `take'**。
+探针 `--finish' 会软调到这里（那时 mode 可能从未启用）；守卫放在 `take' 之前，
+故探针内存里的 `:loads' 不被清空 —— 用户之后真启用 mode 时仍能补上这批明细。"
+  (let ((el-chronos--session-id nil)
+        (written nil)
+        (take-calls 0))
+    (cl-letf (((symbol-function 'el-chronos-startup-probe-take)
+               (lambda ()
+                 (cl-incf take-calls)
+                 (list :anchors '((early-init . 1.0)) :loads nil :captured-p t)))
+              ((symbol-function 'el-chronos-store-record-startup-phase)
+               (lambda (&rest args) (push args written))))
+      (should-not (el-chronos-collect--startup-take-probe)))
+    (should (= 0 take-calls))
+    (should-not written)))
+
+(ert-deftest el-chronos-collect-test-startup-take-probe-swallows-errors ()
+  "探针侧抛错时只限流告警、返回 nil，绝不向宿主抛错（I6）。
+探针的 `--finish' 在 `emacs-startup-hook' 之后运行，这里抛错会打断启动收尾。
+`--warned-at' 绑 nil：告警有 10 分钟限流窗口，不复位就会依赖用例执行顺序。"
+  (let ((el-chronos--session-id 7)
+        (el-chronos-collect--warned-at nil)
+        (warnings nil))
+    (cl-letf (((symbol-function 'el-chronos-startup-probe-take)
+               (lambda () (error "boom")))
+              ((symbol-function 'display-warning)
+               (lambda (&rest args) (push args warnings))))
+      (should-not (el-chronos-collect--startup-take-probe)))
+    (should (= 1 (length warnings)))))
+
+;;; T3 资源采集（CPU / RSS / 线程数 / 系统负载）
+;; 只伪造 `process-attributes' / `load-average' 两个内置读取接口与 `float-time'，
+;; 其余走真实实现：资源数据经 store 的内存缓冲 + `flush' 落库，故断言直接查库。
+
+(defmacro el-chronos-collect-test--with-resource-fixture (cpu-var now-var &rest body)
+  "在可控的资源采集环境下执行 BODY。
+`process-attributes' 返回 `time' 取 CPU-VAR、`rss' 51200、`thcount' 8 的 alist；
+`load-average' 返回 (0.5 0.4 0.3)；`float-time' 无参时返回 NOW-VAR（带参时走真实实现，
+`cpu_ms' 的差分需要它）。两个变量都由 BODY 用 `setq' 推进。"
+  (declare (indent 2) (debug t))
+  `(let ((real-float-time (symbol-function 'float-time)))
+     (cl-letf (((symbol-function 'process-attributes)
+                (lambda (_pid)
+                  (list (cons 'time ,cpu-var) (cons 'rss 51200) (cons 'thcount 8))))
+               ((symbol-function 'load-average) (lambda (&optional _all) '(0.5 0.4 0.3)))
+               ((symbol-function 'float-time)
+                (lambda (&optional time)
+                  (if time (funcall real-float-time time) ,now-var))))
+       ,@body)))
+
+(ert-deftest el-chronos-collect-test-collect-resources-first-window-only-baseline ()
+  "首个窗口只建基线、不写库；第二个窗口按 CPU / 墙钟差分落一行（cpu 1000ms / wall 2000ms）。
+与 `--collect-gc' 同口径：`time' 是启动至今的累计值，直接当增量会把开机以来的 CPU
+全算进一个窗口。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-collect--resource-baseline nil)
+          (el-chronos-resource-sampling t)
+          (cpu (seconds-to-time 100))
+          (now 1000.0))
+      (el-chronos-collect-test--with-resource-fixture cpu now
+        ;; ① 首窗口：只建基线（采集函数无返回值，异常也吞掉）
+        (el-chronos-collect--collect-resources)
+        (should (consp el-chronos-collect--resource-baseline))
+        (should-not (el-chronos-store--pending-p))
+        ;; 首窗口没有任何待写聚合 → flush 无事可做（返回 nil 是正常语义）
+        (should-not (el-chronos-store-flush))
+        (should (= 0 (el-chronos-test--count "hourly_resources")))
+        ;; ② 第二窗口：CPU +1 秒、墙钟 +2 秒
+        (setq cpu (seconds-to-time 101)
+              now 1002.0)
+        (el-chronos-collect--collect-resources)
+        (should (el-chronos-store-flush))
+        (should (= 1 (el-chronos-test--count "hourly_resources")))
+        (should (= 1000.0 (el-chronos-test--scalar "SELECT cpu_ms FROM hourly_resources")))
+        (should (= 2000.0 (el-chronos-test--scalar "SELECT wall_ms FROM hourly_resources")))
+        (should (= 51200 (el-chronos-test--scalar "SELECT rss_kb_max FROM hourly_resources")))
+        (should (= 51200 (el-chronos-test--scalar "SELECT rss_kb_sum FROM hourly_resources")))
+        (should (= 8 (el-chronos-test--scalar "SELECT threads_max FROM hourly_resources")))
+        (should (= 1 (el-chronos-test--scalar "SELECT load_n FROM hourly_resources")))
+        (should (= 0.5 (el-chronos-test--scalar "SELECT load1_sum FROM hourly_resources")))
+        (should (= 0.3 (el-chronos-test--scalar "SELECT load15_sum FROM hourly_resources")))))))
+
+(ert-deftest el-chronos-collect-test-collect-resources-degrades-missing-fields ()
+  "`process-attributes' 缺 `rss' / `thcount' 时那两个字段落 NULL，`cpu_ms' 照常采集。
+逐字段判空的意义：缺一个指标不该让整行失效，更不该用 0 冒充（0 会把峰值与均值拉偏）。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-collect--resource-baseline (cons (seconds-to-time 10) 500.0))
+          (el-chronos-resource-sampling t))
+      (cl-letf (((symbol-function 'process-attributes)
+                 (lambda (_pid) (list (cons 'time (seconds-to-time 11)))))
+                ((symbol-function 'load-average) (lambda (&optional _all) '(1.0 2.0 3.0))))
+        (el-chronos-collect--collect-resources))
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--count "hourly_resources")))
+      (should (= 1000.0 (el-chronos-test--scalar "SELECT cpu_ms FROM hourly_resources")))
+      (should-not (el-chronos-test--scalar "SELECT rss_kb_max FROM hourly_resources"))
+      (should-not (el-chronos-test--scalar "SELECT rss_kb_sum FROM hourly_resources"))
+      (should-not (el-chronos-test--scalar "SELECT threads_max FROM hourly_resources"))
+      (should (= 1.0 (el-chronos-test--scalar "SELECT load1_sum FROM hourly_resources"))))))
+
+(ert-deftest el-chronos-collect-test-collect-resources-degrades-when-load-average-fails ()
+  "`load-average' 抛错时三个负载字段落 NULL，其余字段照采，且不向宿主抛错（I6）。
+部分平台的 `load-average' 可以未实现（抛错），资源采集不能因此整体失效、更不能
+终止 `--sample-tick' 的 timer。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-collect--resource-baseline (cons (seconds-to-time 10) 500.0))
+          (el-chronos-resource-sampling t)
+          (warnings nil))
+      (cl-letf (((symbol-function 'process-attributes)
+                 (lambda (_pid) (list (cons 'time (seconds-to-time 11))
+                                      (cons 'rss 4096) (cons 'thcount 4))))
+                ((symbol-function 'load-average)
+                 (lambda (&optional _all) (error "boom")))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings))))
+        ;; 不抛错（异常若冒出，ERT 会把本用例判失败）；采集函数本身无返回值
+        (el-chronos-collect--collect-resources))
+      (should-not warnings)
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--count "hourly_resources")))
+      (should (= 1000.0 (el-chronos-test--scalar "SELECT cpu_ms FROM hourly_resources")))
+      (should (= 4096 (el-chronos-test--scalar "SELECT rss_kb_max FROM hourly_resources")))
+      (should-not (el-chronos-test--scalar "SELECT load1_sum FROM hourly_resources"))
+      (should-not (el-chronos-test--scalar "SELECT load5_sum FROM hourly_resources"))
+      (should-not (el-chronos-test--scalar "SELECT load15_sum FROM hourly_resources"))
+      (should (= 0 (el-chronos-test--scalar "SELECT load_n FROM hourly_resources"))))))
+
+(ert-deftest el-chronos-collect-test-collect-resources-disabled-skips-everything ()
+  "`el-chronos-resource-sampling' 为 nil 时连 `process-attributes' 都不调用（零开销）、不写库。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-collect--resource-baseline nil)
+          (el-chronos-resource-sampling nil)
+          (calls 0))
+      (cl-letf (((symbol-function 'process-attributes)
+                 (lambda (&rest _args) (cl-incf calls) nil))
+                ((symbol-function 'load-average)
+                 (lambda (&rest _args) (cl-incf calls) nil)))
+        (should-not (el-chronos-collect--collect-resources)))
+      (should (= 0 calls))
+      (should-not el-chronos-collect--resource-baseline)
+      (should-not (el-chronos-store--pending-p)))))
+
+(ert-deftest el-chronos-collect-test-collect-resources-guards-tramp-default-directory ()
+  "取数期间 `default-directory' 必须是本地目录。
+`process-attributes' 的 docstring 明确：`default-directory' 指向远端时 PID 被当作
+**远端主机**上的进程；而 `--sample-tick' 的 timer 捕获的是创建时的 `default-directory' ——
+用户在 TRAMP buffer 里启用模式就会把它带进来。"
+  (let ((el-chronos-collect--resource-baseline (cons (seconds-to-time 10) 100.0))
+        (el-chronos-resource-sampling t)
+        (seen nil))
+    (cl-letf (((symbol-function 'process-attributes)
+               (lambda (pid) (setq seen (list pid default-directory)) nil))
+              ((symbol-function 'load-average) (lambda (&optional _all) nil))
+              ((symbol-function 'el-chronos-store-record-resources)
+               (lambda (&rest _args) t)))
+      (let ((default-directory "/ssh:somehost:/tmp"))
+        (el-chronos-collect--collect-resources)))
+    (should (equal (emacs-pid) (nth 0 seen)))
+    (should (equal temporary-file-directory (nth 1 seen)))))
+
+(ert-deftest el-chronos-collect-test-sample-tick-collects-resources ()
+  "`--sample-tick' 在 profiler 未采样时也调资源采集。
+锁住「`--collect-resources' 与 `--collect-gc' 并列、且必须在
+`(when el-chronos-collect--sampling-p ...)' 之外」：挪进 `sampling-p' 内时
+profiler 启动失败会让资源趋势跟着陪葬。"
+  (let ((el-chronos-collect--sampling-p nil)
+        (el-chronos-collect--gc-baseline (cons gcs-done gc-elapsed))
+        (el-chronos-collect--heap-tick-counter 0)
+        (el-chronos-collect--last-sample-tick nil)
+        (calls 0))
+    (cl-letf (((symbol-function 'el-chronos-collect--collect-resources)
+               (lambda () (cl-incf calls)))
+              ((symbol-function 'el-chronos-store-record-gc)
+               (lambda (&rest _args) nil)))
+      (el-chronos-collect--sample-tick))
+    (should (= 1 calls))))
+
+(ert-deftest el-chronos-collect-test-collect-resources-baseline-reset-on-start-stop ()
+  "`collect-start' 把资源基线置 nil（首个窗口重建基线）、`collect-stop' 清空（I5）。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600)
+        (el-chronos-collect--resource-baseline (cons (seconds-to-time 5) 1.0)))
+    (unwind-protect
+        (progn
+          (el-chronos-collect-start)
+          (should-not el-chronos-collect--resource-baseline)
+          (setq el-chronos-collect--resource-baseline (cons (seconds-to-time 9) 2.0)))
+      (el-chronos-collect-stop))
+    (should-not el-chronos-collect--resource-baseline)))
 
 ;;; el-chronos-collect-test.el ends here

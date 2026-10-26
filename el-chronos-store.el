@@ -14,9 +14,10 @@
 ;;     不向宿主抛错（I6）；
 ;;   - schema 版本用 `PRAGMA user_version'：迁移前复制 .bak，失败则关句柄并用 .bak
 ;;     覆盖回原文件，不破坏原库；
-;;   - `commands' / `slow_events' 按 `el-chronos-retention-days' 清理，六张 hourly_*
+;;   - `commands' / `slow_events' 按 `el-chronos-retention-days' 清理，七张 hourly_*
 ;;     聚合表（`hourly_functions' / `hourly_usage' / `hourly_stacks' / `hourly_gc' /
-;;     `hourly_health' / `hourly_drift'）永久保留、只由 `el-chronos-purge' 手动清理；
+;;     `hourly_health' / `hourly_drift' / `hourly_resources'）永久保留、只由
+;;     `el-chronos-purge' 手动清理；
 ;;   - `hourly_stacks' 每 (hour_ts, session_id) 只留 samples 最大的 top-N 条。
 ;; 单位（I4）：时间戳与耗时用毫秒，采样间隔用纳秒；数据只写 `el-chronos-db-path'。
 
@@ -29,8 +30,10 @@
 
 ;;; 常量
 
-(defconst el-chronos-store--schema-version 3
+(defconst el-chronos-store--schema-version 4
   "支持的 schema 版本，对应 `PRAGMA user_version'；升级时递增并追加迁移步骤。
+版本 4 = 新增 hourly_resources 表（进程 CPU / RSS / 线程数 / 系统负载的按小时聚合，
+增量脚本见 `el-chronos-store--sql-migrate-v4'）；
 版本 3 = 新增 hourly_drift 表（增量脚本见 `el-chronos-store--sql-migrate-v3'）；
 版本 2 = 新增 hourly_gc / startup_phases / hourly_health / session_meta 四表
 （增量脚本见 `el-chronos-store--sql-migrate-v2'）；版本 1 = 最初的 6 表 + 3 索引。")
@@ -72,6 +75,26 @@
 `MAX(max_ms, excluded.max_ms)'。
 不写外键：同 `el-chronos-store--ddl-hourly-gc'（避免 purge 的删除顺序与级联约束耦合）。
 保留策略：**永久保留**，只由 `el-chronos-purge' 清理（`el-chronos-store--prune' 不碰它）。")
+(defconst el-chronos-store--ddl-hourly-resources
+  "CREATE TABLE IF NOT EXISTS hourly_resources (hour_ts INTEGER NOT NULL, session_id INTEGER NOT NULL, cpu_ms REAL NOT NULL DEFAULT 0, wall_ms REAL NOT NULL DEFAULT 0, rss_kb_max INTEGER, rss_kb_sum INTEGER, threads_max INTEGER, load1_sum REAL, load5_sum REAL, load15_sum REAL, load_n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (hour_ts, session_id));"
+  "v4 新增：Emacs **进程自身**资源占用的按小时聚合（每会话每小时一行）。
+口径（不可与别的表混读）：
+- `cpu_ms' / `wall_ms'：本小时内**采样窗口**累计的进程 CPU 时间与墙钟时间（毫秒，I4）；
+  二者之比即该小时的进程 CPU 占用率。它们是**增量累加量**，不是瞬时值。
+- `rss_kb_max' / `rss_kb_sum'：进程常驻集大小（**KB**，不是时间单位，不受 I4 约束）。
+  两者并存是因为单独一个都不够用：`max' 抓峰值（内存回归最先表现在峰值上），
+  `sum' 抓体重（峰值相同的两小时，平均占用可能差一倍）。
+- `threads_max'：进程线程数峰值。
+- `load1_sum' / `load5_sum' / `load15_sum'：系统负载（`load-average'，1/5/15 分钟）的
+  累加和；`load_n' 是**负载样本条数**（每次采样三值同时到达，故一条样本记 1 次）。
+  读作「本小时平均负载 = `loadN_sum' / `load_n'」—— 存和而非均值是 upsert 累加语义的
+  直接结果（写库时不知道最终样本数，先算均值会因样本陆续到达而失真）。
+可空列（`rss_kb_*' / `threads_max' / `load*_sum'）语义：**NULL = 本行从未观测到该指标**
+（平台不支持或采样关闭），0 则是「观测到了，值为 0」。写层用 COALESCE / 条件累加保证
+「nil 不覆盖既有非 NULL 值」，与 `hourly_gc.heap_bytes' 同一类陷阱（见
+`el-chronos-store--sql-upsert-resources'）。
+不写外键：同 `el-chronos-store--ddl-hourly-gc'（避免 purge 的删除顺序与级联约束耦合）。
+保留策略：**永久保留**，只由 `el-chronos-purge' 清理（`el-chronos-store--prune' 不碰它）。")
 (defconst el-chronos-store--ddl-session-meta
   "CREATE TABLE IF NOT EXISTS session_meta (session_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (session_id, key));"
   "v2 新增：会话级元数据 KV，加一个键无需再迁移。
@@ -96,10 +119,12 @@ CREATE TABLE IF NOT EXISTS hourly_stacks (hour_ts INTEGER NOT NULL, session_id I
           "\n" el-chronos-store--ddl-startup-phases
           "\n" el-chronos-store--ddl-hourly-health
           "\n" el-chronos-store--ddl-hourly-drift
+          "\n" el-chronos-store--ddl-hourly-resources
           "\n" el-chronos-store--ddl-session-meta)
-  "全量建表建索引语句（11 表 + 3 索引），一次批量执行（幂等）；`commands' 引用
-`sessions'，顺序不能改。v2 / v3 的新表由单表 DDL 常量 concat 而来，与
-`el-chronos-store--sql-migrate-v2' / `el-chronos-store--sql-migrate-v3'
+  "全量建表建索引语句（12 表 + 3 索引），一次批量执行（幂等）；`commands' 引用
+`sessions'，顺序不能改。v2 / v3 / v4 的新表由单表 DDL 常量 concat 而来，与
+`el-chronos-store--sql-migrate-v2' / `el-chronos-store--sql-migrate-v3' /
+`el-chronos-store--sql-migrate-v4'
 共用同一批字面量（两份字面量必然漂移，而漂移的表现是
 「新库对、旧库缺表」）。
 **必须始终是全量**：`el-chronos-store--ensure-schema' 建完表就无条件把 `user_version'
@@ -124,6 +149,14 @@ CREATE TABLE IF NOT EXISTS hourly_stacks (hour_ts INTEGER NOT NULL, session_id I
 `el-chronos-store--migrate'）。
 注意：v1 老库会先跑 v2 脚本再跑本脚本（迁移链按版本变量逐级推进），因此本脚本
 不能假设库里已有 v2 的 4 张表 —— 它只负责自己这一步。")
+(defconst el-chronos-store--sql-migrate-v4
+  el-chronos-store--ddl-hourly-resources
+  "version 3 → 4 的增量迁移脚本：只建 `hourly_resources' 一张新表。
+与 `el-chronos-store--sql-migrate-v2' / `-v3' 同款：单条 DDL 常量、不含既有表与索引、
+`CREATE TABLE IF NOT EXISTS' 可无条件重跑，但**执行时必须显式包事务**（见
+`el-chronos-store--migrate'）。
+注意：v0 / v1 / v2 老库会先跑更早的步骤再跑本脚本（迁移链按版本变量逐级推进），
+因此本脚本不能假设库里已有 v2 / v3 的表 —— 它只负责自己这一步。")
 (defconst el-chronos-store--sql-insert-command
   "INSERT INTO commands (ts, session_id, name, duration_ms, gc_ms, mode, project, outcome, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 (defconst el-chronos-store--sql-insert-slow-event
@@ -168,6 +201,30 @@ CREATE TABLE IF NOT EXISTS hourly_stacks (hour_ts INTEGER NOT NULL, session_id I
 
 `hourly_drift' 与 `hourly_gc' 一样是两段键（hour_ts + session_id），会话片段由记录函数
 写进缓冲键，落库时用 `--split-gc-key' 拆分（同格式）。")
+(defconst el-chronos-store--sql-upsert-resources
+  "INSERT INTO hourly_resources (hour_ts, session_id, cpu_ms, wall_ms, rss_kb_max, rss_kb_sum, threads_max, load1_sum, load5_sum, load15_sum, load_n) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(hour_ts, session_id) DO UPDATE SET cpu_ms = cpu_ms + excluded.cpu_ms, wall_ms = wall_ms + excluded.wall_ms, rss_kb_max = MAX(COALESCE(rss_kb_max, excluded.rss_kb_max), COALESCE(excluded.rss_kb_max, rss_kb_max)), rss_kb_sum = COALESCE(rss_kb_sum + excluded.rss_kb_sum, rss_kb_sum, excluded.rss_kb_sum), threads_max = MAX(COALESCE(threads_max, excluded.threads_max), COALESCE(excluded.threads_max, threads_max)), load1_sum = COALESCE(load1_sum + excluded.load1_sum, load1_sum, excluded.load1_sum), load5_sum = COALESCE(load5_sum + excluded.load5_sum, load5_sum, excluded.load5_sum), load15_sum = COALESCE(load15_sum + excluded.load15_sum, load15_sum, excluded.load15_sum), load_n = load_n + excluded.load_n"
+  "进程资源聚合的 upsert：同 (hour_ts, session_id) **部分累加、部分取最值**。
+
+三组列的语义**不同类**（与 `--sql-upsert-gc' / `--sql-upsert-drift' 同一类陷阱：
+写反不报错，只让数字错）：
+- `cpu_ms' / `wall_ms' / `load*_sum' / `load_n'：**累加**（累计量、计数）；
+- `rss_kb_max' / `threads_max'：取**标量** `MAX'（峰值，历史最大值不得被本批较小值抹小）；
+- `rss_kb_sum'：**条件累加**（见下）。
+
+**NULL 处置（本语句最容易写错的一处，与 `--sql-upsert-gc' 的 COALESCE 同源）**：
+可空列（`rss_kb_max' / `rss_kb_sum' / `threads_max' / `load*_sum'）在「本窗口没采到该指标」
+时传 NULL。天真的 `rss_kb_max = MAX(rss_kb_max, excluded.rss_kb_max)' 在任一参数为 NULL 时
+（SQLite 的两参数 MAX 是标量函数，不是聚合）**返回 NULL** —— 一个 NULL 窗口就会把该小时
+已经采到的峰值抹掉；`rss_kb_sum = rss_kb_sum + excluded.rss_kb_sum' 同理。
+故写成：
+- 取最值列：`MAX(COALESCE(<列>, excluded.<列>), COALESCE(excluded.<列>, <列>))`，
+  两侧都 NULL 才得 NULL，否则取「两边各自就近的那一个」再取大；
+- 求和列：`COALESCE(<列> + excluded.<列>, <列>, excluded.<列>)'——`a + b' 任一为 NULL
+  即为 NULL，外层 COALESCE 依次退到「本行旧值」再退到「本次新值」，
+  语义读作「有值就加，只有一边有值就取它，两边都没有才留 NULL」。
+`cpu_ms' / `wall_ms' / `load_n' 声明为 NOT NULL（DEFAULT 0），写入方必须传数字：
+向 NOT NULL 列传 NULL 会被 SQLite 直接拒（`NOT NULL constraint failed'），
+整批 flush 回滚——故 `el-chronos-store-record-resources' 在内存里就把 nil 归零。")
 (defconst el-chronos-store--sql-upsert-session-meta
   "INSERT INTO session_meta (session_id, key, value) VALUES (?, ?, ?) ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value"
   "会话级元数据 KV 的 upsert：同 (session_id, key) **覆盖**（同一键只保留当前值）。
@@ -219,6 +276,15 @@ KEY 是固定枚举字符串（`dropped-commands' / `dropped-events' / `flush-fa
 `slow_events(kind='command')'），**不进本表**。推论：`hourly_drift' 的时长与 `commands'
 的耗时**不可相加、也不该相加** —— 任何「总卡顿 = 慢命令 + block + drift」的求和式都是错的。
 会话片段为空串时不会入缓冲（记录函数先判会话可用，同 v2 三张表）。")
+(defvar el-chronos-store--resources (make-hash-table :test #'equal)
+  "进程资源聚合：键 \"hour|session\"（两段，同 `--gc'）。
+值 vector 共 9 槽：`[cpu-ms wall-ms rss-kb-max rss-kb-sum threads-max
+load1-sum load5-sum load15-sum load-n]'。
+**混合语义**（与 `el-chronos-store--sql-upsert-resources' 的列语义一一对应）：
+前两槽与后四槽累加，`rss-kb-max' / `threads-max' 取较大值，`rss-kb-sum' 在有值时才累加。
+可空槽的 nil 表示「本窗口没采到该指标」，更新时**留住旧值**（落库由 SQL 里的 COALESCE
+再保一次）—— 与 `--gc' 的 `heap-bytes' 同一类陷阱：nil 覆盖会让该小时已采到的峰值消失。
+会话片段为空串时不会入缓冲（记录函数先判会话可用）。")
 (defvar el-chronos-store--flush-timer nil "周期 flush timer；关闭时取消。")
 (defvar el-chronos-store--warned-at nil "上次告警的 `float-time'，用于限流。")
 (defvar el-chronos-store--null-session-warned nil "是否已就「会话 ID 缺失」告警过。")
@@ -334,7 +400,7 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
       (setq el-chronos-store--aggregate-skip-warned t)
       (display-warning 'el-chronos
                        (concat "会话 ID 缺失，本次已跳过 hourly_gc / hourly_health"
-                               " / startup_phases / hourly_drift 写入。")
+                               " / startup_phases / hourly_drift / hourly_resources 写入。")
                        :warning))
     nil)))
 (defun el-chronos-store--split-gc-key (key)
@@ -419,7 +485,7 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
   "读取 DB 的 `PRAGMA user_version'，缺失时返回 0。"
   (or (caar (sqlite-select db "PRAGMA user_version")) 0))
 (defun el-chronos-store--ensure-schema (db)
-  "在 DB 上建全量 11 表 + 3 索引（幂等），并把 user_version 置为当前版本。
+  "在 DB 上建全量 12 表 + 3 索引（幂等），并把 user_version 置为当前版本。
 它**无条件**把版本写成 `el-chronos-store--schema-version'：因此
 `el-chronos-store--schema-ddl' 必须始终是全量 DDL —— 否则新库（版本 0）只建成部分表却
 被标记成最新版本，之后 `--migrate' 因版本相等不再运行，缺的表永远不存在。"
@@ -441,15 +507,16 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
 ② **`--ensure-schema' 分支结束后必须把 `version' 同步为 `--schema-version'（不是 1）**：
    它建完表后**无条件**写 `user_version = --schema-version'，所以那次调用返回后库已是
    最新，而局部变量还停在 0。三种结局只有一种可接受 —— 留在 0 会让末尾 pragma 把最新库
-   标成版本 0（下次又走一遍迁移，版本号长期失真）；置成 1 版本号虽正确，但 v2 / v3 脚本
-   会被各多跑一遍（`CREATE TABLE IF NOT EXISTS' 幂等不报错，可「刚建全表又迁移两遍」让
-   失败恢复路径难以推理）；置成当前常量则后续分支自然都不触发。
+   标成版本 0（下次又走一遍迁移，版本号长期失真）；置成 1 版本号虽正确，但 v2 / v3 / v4
+   脚本会被各多跑一遍（`CREATE TABLE IF NOT EXISTS' 幂等不报错，可「刚建全表又迁移两遍」
+   让失败恢复路径难以推理）；置成当前常量则后续分支自然都不触发。
 ③ **`.bak' 复制必须在 `BEGIN' 之前** —— 备份要反映迁移前的完整状态；放进事务里会把
    未提交状态带上，回滚后 .bak 已失真。
 另外：失败时 `ROLLBACK' 必须在 `.bak' 覆盖**之前** —— 先撤事务再动文件，否则覆盖时句柄
 仍持有未回滚事务。
 每个迁移步骤各自 `BEGIN' / `COMMIT'（回滚粒度按步清楚），步骤内把版本推进到**本步目标
-版本**（将来追加 v4 时，本步仍只把版本置为 2 / 3）；末尾再统一写一次最终版本。"
+版本**（追加新版本时，既有各步仍只把版本置为本步目标值 2 / 3 / 4）；末尾再统一写一次
+最终版本。"
   (let ((bak (concat path ".bak")))
     (condition-case err
         (progn
@@ -460,8 +527,8 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
             ;; 版本 0 → 当前：建全量表并把版本置为当前版本（由 `--ensure-schema' 完成）
             (when (< version 1)
               (el-chronos-store--ensure-schema db)
-              ;; 它已把 11 张表建全并把 user_version 置为当前常量，故把局部版本同步为
-              ;; 同一个值（不是 1），否则下面的 v2 / v3 分支会对着刚建全的库再跑一遍
+              ;; 它已把 12 张表建全并把 user_version 置为当前常量，故把局部版本同步为
+              ;; 同一个值（不是 1），否则下面的 v2 / v3 / v4 分支会对着刚建全的库再跑一遍
               (setq version el-chronos-store--schema-version))
             ;; 版本 1 → 2：补建 4 张新表
             (when (= version 1)
@@ -480,6 +547,14 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
               (sqlite-pragma db "user_version=3")
               (sqlite-execute db "COMMIT")
               (setq version 3))
+            ;; 版本 3 → 4：补建 hourly_resources。v0 / v1 / v2 老库会连续走完上面各步，
+            ;; 一次到位（这正是「逐级推进」而非互斥分支的意义）
+            (when (= version 3)
+              (sqlite-execute db "BEGIN")
+              (sqlite-execute-batch db el-chronos-store--sql-migrate-v4)
+              (sqlite-pragma db "user_version=4")
+              (sqlite-execute db "COMMIT")
+              (setq version 4))
             (sqlite-pragma db (format "user_version=%d" version)))
           t)
       (error
@@ -738,14 +813,17 @@ PATH 省略时用 `el-chronos-db-path'。同路径已打开时直接返回现有
         el-chronos-store--usage (make-hash-table :test #'equal)
         el-chronos-store--functions (make-hash-table :test #'equal)
         el-chronos-store--stacks (make-hash-table :test #'equal)
-        ;; 四个新聚合 hash（v2 三张 + v3 的 drift）同样清零（I5 零残留）：close 前已 flush 过，
-        ;; 留下只会让同进程重开时把上一会话的 GC / 自监控 / 启动阶段 / 停转记到新会话名下
+        ;; 五个新聚合 hash（v2 三张 + v3 的 drift + v4 的 resources）同样清零（I5 零残留）：
+        ;; close 前已 flush 过，留下只会让同进程重开时把上一会话的 GC / 自监控 / 启动阶段 /
+        ;; 停转 / 进程资源记到新会话名下
         el-chronos-store--gc (make-hash-table :test #'equal)
         el-chronos-store--health (make-hash-table :test #'equal)
         el-chronos-store--startup (make-hash-table :test #'equal)
         ;; `hourly_drift' 聚合同样清零（与上面三个同一理由：close 前已 flush 过，留下会让
         ;; 同进程重开时把上一会话的停转记到新会话名下）
         el-chronos-store--drift (make-hash-table :test #'equal)
+        ;; `hourly_resources' 聚合同样清零（I5 零残留，理由同上）
+        el-chronos-store--resources (make-hash-table :test #'equal)
         ;; `startup_ms' 补写标量「未消费即丢弃」：close 首行已 flush 过一次，通常已消费；
         ;; 真被丢弃的只是一个标量（下次启动会重算），与 5 秒 flush 窗口的崩溃丢失同级，不告警
         el-chronos-store--pending-startup-ms nil
@@ -892,8 +970,92 @@ SESSION-ID 缺失时跳过并每进程告警一次（I6：不抛错）。"
           t))
     (error (el-chronos-store--warn "记录停转聚合失败（已跳过）：%S" err) nil)))
 
-;;; 直接写库（不走缓冲）
+(defun el-chronos-store--resource-value (value)
+  "把资源聚合的可空字段 VALUE 规整为数字或 nil。
+非数值（字符串、符号、nil）一律按「本窗口没采到该指标」处理，返回 nil —— 与
+`--sql-upsert-resources' 的 NULL 语义对齐。这样做是为了让脏输入退化成「少记一个指标」
+而不是把字符串写进 REAL 列（SQLite 会宽松地存下来，之后读出来是脏数据）或让整批
+flush 撞错回滚（I6：采集路径不得向宿主抛错，也不该因一个字段毁掉一批数据）。"
+  (and (numberp value) value))
+(defun el-chronos-store-record-resources (hour-ts plist)
+  "累加一次**进程资源**采样到 `hourly_resources'：HOUR-TS 为整点毫秒（整数），
+PLIST 为本次采样窗口的读数（每采样窗口一次，由 `el-chronos-store-flush' 的批次承载落库）。
+会话取自 `el-chronos--session-id'（与 `record-gc' / `record-drift' 同款：这三张表都是
+「每会话每小时的聚合」，会话是记录时的全局上下文而不是调用方每次都要重复传的参数）。
 
+PLIST 可含的键（全部可选，缺省或非数值一律按「本窗口没采到该指标」处理）：
+- `:cpu-ms'  本窗口进程 CPU 时间（**毫秒**，I4），累加；
+- `:wall-ms' 本窗口墙钟时间（**毫秒**，I4），累加；与 `:cpu-ms' 之比即 CPU 占用率；
+- `:rss-kb-max' / `:rss-kb-sum' 常驻集大小（**KB**，不是时间单位，不受 I4 约束）：
+  前者取历史最大值、后者累加；
+- `:threads-max' 线程数峰值，取历史最大值；
+- `:load1-sum' / `:load5-sum' / `:load15-sum' 系统负载（1/5/15 分钟）三值，累加；
+- `load_n' **不接受显式传值**：只要三值里有任意一个非空，本次记一条负载样本（计数 +1），
+  读法即「本小时平均负载 = 对应的 `load*_sum' / `load_n'」。
+
+**NULL 语义（关键，与 `hourly_gc.heap_bytes' 同一类陷阱）**：可空字段传 nil 时
+**不得**把库里 / 缓冲里已有的非 NULL 值覆盖成 NULL —— 一个 NULL 窗口会把该小时已采到的
+峰值抹掉。内存侧由本函数逐槽「有值才更新」保证，落库侧由
+`--sql-upsert-resources' 的 COALESCE / 双 COALESCE-MAX 再保一次（两道都必要：
+内存槽与库内行是两个不同的持久层）。
+
+**上一条有且只有一处例外：`:cpu-ms' / `:wall-ms' 是 `NOT NULL DEFAULT 0' 列。** 上面那句
+「缺省或非数值一律按没采到处理」对这两列**不成立**：列约束把它们兜成 **0** 而不是 NULL。
+`process-attributes' 的 `time' 字段缺失（平台不支持 / 读失败）时采集侧传 nil，落库即 0，
+于是该小时的 `cpu_pct = 0.0' —— 这个 0 必须读作「**本窗口未采集到 CPU 时间**」，**不是
+「进程空闲」**；`COALESCE' 保住上次观测值的那套机制对这两列**不生效**，而且 0 还会参与
+`cpu_ms = cpu_ms + excluded.cpu_ms' 的累加，把本小时的均值往小拉。同一行的 RSS / 线程 /
+负载可能照常有值，故「这一小时有资源行」并不等于「CPU 一定采到了」。彻底区分只能让这两列
+可空（去掉 `DEFAULT 0'）或加 `cpu_n' 采样计数列，属 schema **v5** 范畴（TD-28）；在此之前
+读 `cpu_pct = 0' 时先看该桶的 `samples' 与 RSS 是否有值，不要直接当成空闲。**口径与
+`el-chronos-collect--collect-resources' 的 docstring 一致**（那边是发现的现场，本处是落库端
+的同一句话：读 `cpu_pct = 0' 应读作未采集到 CPU 时间而非空闲）。
+
+防御与降级（I6：采集路径不得向宿主抛错）：
+- PLIST 全空（所有可空字段与 cpu / wall 都没值）→ 直接返回 nil、不建行（一行全 0 的
+  资源行没有信息量，还会让「这一小时有没有采到资源数据」不可区分）；
+- 会话 ID 缺失 → 跳过并每进程告警一次（沿 v2 三张表同款 `--aggregate-session'）；
+- 「会话行是否真的存在」不在本函数判（同 v2 三张表：记录层只判 ID 有无），
+  孤儿 session_id 由 flush 前的 `session-known' 守卫挡住。
+落库仍走 `el-chronos-store-flush' 的同一事务，故 `hourly_resources' 与
+`hourly_gc' / `hourly_drift' 等的「库里有值 ⇔ 本批已提交」严格同态。"
+  (condition-case err
+      (let* ((cpu (el-chronos-store--resource-value (plist-get plist :cpu-ms)))
+             (wall (el-chronos-store--resource-value (plist-get plist :wall-ms)))
+             (rss-max (el-chronos-store--resource-value (plist-get plist :rss-kb-max)))
+             (rss-sum (el-chronos-store--resource-value (plist-get plist :rss-kb-sum)))
+             (threads (el-chronos-store--resource-value (plist-get plist :threads-max)))
+             (load1 (el-chronos-store--resource-value (plist-get plist :load1-sum)))
+             (load5 (el-chronos-store--resource-value (plist-get plist :load5-sum)))
+             (load15 (el-chronos-store--resource-value (plist-get plist :load15-sum)))
+             (load-n (if (or load1 load5 load15) 1 0)))
+        (when (and (or cpu wall rss-max rss-sum threads (> load-n 0))
+                   (el-chronos-store--aggregate-session el-chronos--session-id))
+          (let* ((cell-key (format "%d|%s" hour-ts
+                                   (el-chronos-store--session-key-part)))
+                 (cell (gethash cell-key el-chronos-store--resources)))
+            (if cell
+                (progn
+                  ;; 累加槽：nil 按 0 计（NOT NULL 列，落库时不能是 NULL）
+                  (aset cell 0 (+ (aref cell 0) (float (or cpu 0))))
+                  (aset cell 1 (+ (aref cell 1) (float (or wall 0))))
+                  ;; 峰值槽：只在有值时才更新（nil 覆盖 = 抹掉本小时峰值）
+                  (when rss-max (aset cell 2 (max (or (aref cell 2) rss-max) rss-max)))
+                  ;; 求和槽：条件累加，两边都无值才留 nil
+                  (when rss-sum (aset cell 3 (+ (or (aref cell 3) 0) rss-sum)))
+                  (when threads (aset cell 4 (max (or (aref cell 4) threads) threads)))
+                  (when load1 (aset cell 5 (+ (or (aref cell 5) 0) load1)))
+                  (when load5 (aset cell 6 (+ (or (aref cell 6) 0) load5)))
+                  (when load15 (aset cell 7 (+ (or (aref cell 7) 0) load15)))
+                  (aset cell 8 (+ (aref cell 8) load-n)))
+              (puthash cell-key
+                       (vector (float (or cpu 0)) (float (or wall 0))
+                               rss-max rss-sum threads load1 load5 load15 load-n)
+                       el-chronos-store--resources))
+            t)))
+    (error (el-chronos-store--warn "记录进程资源聚合失败（已跳过）：%S" err) nil)))
+
+;;; 直接写库（不走缓冲）
 (defun el-chronos-store--record-session-meta-1 (db session-id key value)
   "用 DB 把 SESSION-ID / KEY / VALUE 写入 `session_meta'（VALUE 为 nil 时**不写行**）。
 内部版本：**不依赖全局 `el-chronos-store--db'**，显式接收句柄 —— `--ensure-session' 建会话行
@@ -951,7 +1113,7 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
 
 (defun el-chronos-store--pending-p ()
   "是否还有未落库的缓冲。
-四个新聚合 hash（`--gc' / `--health' / `--startup' / `--drift'）与
+五类新聚合 hash（`--gc' / `--health' / `--startup' / `--drift' / `--resources'）与
 `--pending-startup-ms' **必须**在这里逐一列出：`el-chronos-store-flush' 的第一道门是
 `(and db (--pending-p))'，漏掉任何一个都会让
 「只有该类数据待写」时 flush 直接早退 —— 数据永不落库且没有任何报错（静默丢数据）。
@@ -959,6 +1121,8 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
 它是**唯一**残留，漏了补写就永远不发生。
 `--drift' 同样容易漏：停转是**稀疏事件**（几百毫秒到几秒才可能有一条），「只有 drift 待写」
 是常态而非边缘情况，漏掉就等于 drift 全部丢光。
+`--resources' 同理：资源采样是**按窗口**的稀疏数据（默认每 N 秒一条），「只有资源待写」
+同样常见，漏掉即全丢。
 
 自监控计数器里**只列 `--dropped-commands' / `--dropped-events' / `--flush-failures'**
 三个：它们表示「有数据还没进库」（丢弃量与失败次数都是待补写的真实信息），单独残留时
@@ -976,21 +1140,23 @@ collect 侧的 `after-init-hook' 回调算出 `before-init-time' → `after-init
       (> (hash-table-count el-chronos-store--health) 0)
       (> (hash-table-count el-chronos-store--startup) 0)
       (> (hash-table-count el-chronos-store--drift) 0)
+      (> (hash-table-count el-chronos-store--resources) 0)
       el-chronos-store--pending-startup-ms
       (> el-chronos-store--dropped-commands 0)
       (> el-chronos-store--dropped-events 0)
       (> el-chronos-store--flush-failures 0)))
 (defun el-chronos-store--aggregates-pending-p ()
-  "四个新聚合 hash（gc / health / startup / drift）是否有待写数据。
+  "五类新聚合 hash（gc / health / startup / drift / resources）是否有待写数据。
 这是「自监控计数是否搭便车上报」的判据（flush 的 `session-known' 分支之外的第二条告警门）：
 漏掉任一个 hash，都会让「只有该类数据待写」时既不写行、也不告警 —— 用户以为写成功，
 实际整批跳过。"
   (or (> (hash-table-count el-chronos-store--gc) 0)
       (> (hash-table-count el-chronos-store--health) 0)
       (> (hash-table-count el-chronos-store--startup) 0)
-      (> (hash-table-count el-chronos-store--drift) 0)))
+      (> (hash-table-count el-chronos-store--drift) 0)
+      (> (hash-table-count el-chronos-store--resources) 0)))
 (defun el-chronos-store--warn-orphan-aggregates ()
-  "就「会话行不存在、跳过新聚合四表写入」告警一次（每进程一次，close 时重置标志）。
+  "就「会话行不存在、跳过新聚合五表写入」告警一次（每进程一次，close 时重置标志）。
 文案必须**逐一列出**被跳过的表（含 `hourly_drift'）：只说「已跳过聚合写入」会让用户以为
 drift / GC 写成功，而实际整批被跳过。"
   (unless el-chronos-store--aggregate-orphan-warned
@@ -998,7 +1164,7 @@ drift / GC 写成功，而实际整批被跳过。"
     (display-warning
      'el-chronos
      (concat "会话行不存在，本次已跳过 hourly_gc / hourly_health / startup_phases"
-             " / hourly_drift 写入。")
+             " / hourly_drift / hourly_resources 写入。")
      :warning)))
 
 ;;; 自监控计数的上报快照
@@ -1054,11 +1220,11 @@ PLAIN-MIDDLE-P 为 t 时中间段原样绑定（usage 的 dimension），否则�
                           (list hour session hour session
                                 (or el-chronos-store-stack-top-n 200))))))))
 (defun el-chronos-store--clear-aggregates ()
-  "清空慢事件缓冲与七个聚合 hash（命令缓冲由调用方按会话状态决定）。
+  "清空慢事件缓冲与八个聚合 hash（命令缓冲由调用方按会话状态决定）。
 把 hash 换成新表而不是 `clrhash'，避免仍在遍历旧表的 `maphash' 回调看到被清空的内容。
-七个聚合 = 既有 usage / functions / stacks + v2 的 gc / health / startup + v3 的 drift：
-它们同一批被 flush 写入同一事务，故成败路径都必须同批清空（否则成功路径会重复累加，
-失败路径会无界增长）。
+八个聚合 = 既有 usage / functions / stacks + v2 的 gc / health / startup + v3 的 drift
++ v4 的 resources：它们同一批被 flush 写入同一事务，故成败路径都必须同批清空
+（否则成功路径会重复累加，失败路径会无界增长）。
 **自监控计数器（`--dropped-commands' / `--dropped-events' / `--flush-failures' /
 `--flush-count' / `--flush-ms-total'）刻意不在这里**：本函数的两个调用点分别是
 「本批已处理」（COMMIT 成功）与「本批已丢弃」（ROLLBACK），两者都要清掉「这批数据」，
@@ -1074,7 +1240,9 @@ PLAIN-MIDDLE-P 为 t 时中间段原样绑定（usage 的 dimension），否则�
         el-chronos-store--startup (make-hash-table :test #'equal)
         ;; `hourly_drift' 与上面各表同批（同一事务），故成败路径都必须同批清空：
         ;; 成功不清 → 下次 flush 重复累加（次数与总时长翻倍）；失败不清 → 无界增长
-        el-chronos-store--drift (make-hash-table :test #'equal)))
+        el-chronos-store--drift (make-hash-table :test #'equal)
+        ;; `hourly_resources' 同理（v4）
+        el-chronos-store--resources (make-hash-table :test #'equal)))
 (defun el-chronos-store--stack-session (db session)
   "返回可写入 `hourly_stacks' 的会话 ID；不可用时返回 nil 并每进程告警一次。
 SESSION 为 nil，或 DB 的 `sessions' 表中没有对应行时视为不可用：`hourly_stacks' 的
@@ -1092,16 +1260,18 @@ session_id 语义上恒非 NULL（NULL 会让主键去重失效），故宁可�
 (defun el-chronos-store-flush ()
   "把全部缓冲批量写入数据库（单事务）。无句柄或无缓冲时直接返回。
 flush 失败按计划丢弃本批（磁盘满/锁超时时数据本就无法落库），避免内存无界增长：
-ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / gc / health / startup），
+ROLLBACK 后清空慢事件缓冲与八个聚合 hash（usage / functions / stacks / gc / health /
+startup / drift / resources），
 只保留失败计数性质的限流告警（10 分钟最多一次，I6），不向宿主抛错。
 会话不可用（ID 为 nil 或 `sessions' 表无对应行）时跳过 `hourly_stacks' 写入，
 其余表照常，保证不产生 session_id 为 NULL 的栈行。
 
-此外在同一事务内写四张新聚合表：`hourly_gc'（次数/耗时累加、堆大小 COALESCE 保旧值）、
+此外在同一事务内写五张新聚合表：`hourly_gc'（次数/耗时累加、堆大小 COALESCE 保旧值）、
 `hourly_health'（累加）、`startup_phases'（按 (session_id, phase) 覆盖）、
-`hourly_drift'（次数/总时长累加、`max_ms' 取标量 MAX）。
+`hourly_drift'（次数/总时长累加、`max_ms' 取标量 MAX）、
+`hourly_resources'（cpu / wall / load 累加，rss 峰值与线程数峰值取标量 MAX、rss 总和条件累加）。
 `session_meta' **不参与** flush —— 它由 `el-chronos-store-record-session-meta' 直接写库。
-这四张新表写入前先校验会话行存在（它们无外键，孤儿行 purge 删不掉），不存在则整批跳过并
+这五张新表写入前先校验会话行存在（它们无外键，孤儿行 purge 删不掉），不存在则整批跳过并
 每进程告警一次。
 同一事务内还会把 `el-chronos-store--pending-startup-ms' 补写进 `sessions.startup_ms'
 （`UPDATE ... WHERE id = ? AND startup_ms IS NULL'）：补写成功且 COMMIT 成功才清 pending，
@@ -1112,7 +1282,7 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
            (session el-chronos--session-id)
            (stack-session (el-chronos-store--stack-session el-chronos-store--db
                                                             el-chronos--session-id))
-           ;; 新聚合四表 + `startup_ms' 补写共用这一次存在性判定（每批只有一个会话，
+           ;; 新聚合五表 + `startup_ms' 补写共用这一次存在性判定（每批只有一个会话，
            ;; 故只需查一次）：见下方「孤儿 session_id」注释
            (session-known (and session (el-chronos-store--session-known-p
                                         el-chronos-store--db session)))
@@ -1190,7 +1360,7 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
               ;; 自监控计数快照：与上面各表**同一事务**提交，故「库里有值」与
               ;; 「本批数据确实落库」严格同态（不存在「计数写了、数据回滚了」的半态）。
               ;; 会话行存在才写（`hourly_health' 无外键，孤儿行 purge 删不掉），
-              ;; 与四张新表同一判定；会话未知时计数器**一分不减**，等下次补写。
+              ;; 与五张新表同一判定；会话未知时计数器**一分不减**，等下次补写。
               (dolist (entry health-snapshot)
                 (sqlite-execute db el-chronos-store--sql-upsert-health
                                 (list (el-chronos-store--hour-ts) session
@@ -1213,7 +1383,21 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
                             (list (nth 0 parts)
                                   (el-chronos-store--parse-session (nth 1 parts))
                                   (aref value 0) (aref value 1) (aref value 2)))))
-                       el-chronos-store--drift))
+                       el-chronos-store--drift)
+              ;; 进程资源聚合（v4）：键同样两段（hour|session），沿用 `--split-gc-key'。
+              ;; 列语义分三组（累加 / 取最值 / 条件累加），NULL 处置见
+              ;; `el-chronos-store--sql-upsert-resources' —— 写反不报错只错数。
+              ;; 三个 NOT NULL 列（cpu_ms / wall_ms / load_n）在记录层已归零，
+              ;; 这里直接传缓冲值即可。
+              (maphash (lambda (key value)
+                         (let ((parts (el-chronos-store--split-gc-key key)))
+                           (sqlite-execute
+                            db el-chronos-store--sql-upsert-resources
+                            (append (list (nth 0 parts)
+                                          (el-chronos-store--parse-session
+                                           (nth 1 parts)))
+                                    (append value nil)))))
+                       el-chronos-store--resources))
              ;; 没有待写数据时不告警（否则「只有 pending-startup-ms 且会话未知」也会噪声告警）
              ((el-chronos-store--aggregates-pending-p)
               (el-chronos-store--warn-orphan-aggregates)))
@@ -1284,7 +1468,7 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
          ;;     1) 事务已 ROLLBACK，无法区分本批新增与上一轮遗留，保留会造成重复计数；
          ;;     2) 写库失败通常是持续性故障（磁盘满、WAL 锁超时），保留只会让内存无界增长；
          ;;     3) 会话缺失是短暂且可自愈的阻塞，写库失败是这一批数据真的落不下去。
-         ;; 故命令缓冲与 `--clear-aggregates'（慢事件 + 七个聚合 hash）一并清空，
+         ;; 故命令缓冲与 `--clear-aggregates'（慢事件 + 八个聚合 hash）一并清空，
          ;; 只留下限流告警作为失败计数。
          (setq el-chronos-store--buffer nil)
          (el-chronos-store--clear-aggregates)
@@ -1295,9 +1479,9 @@ ROLLBACK 后清空六类聚合缓冲（慢事件 + usage / functions / stacks / 
 
 (defun el-chronos-store--prune ()
   "按 `el-chronos-retention-days' 清理明细表。
-只删 `commands' 与 `slow_events'；**六张** hourly_* 聚合表（`hourly_functions' /
+只删 `commands' 与 `slow_events'；**七张** hourly_* 聚合表（`hourly_functions' /
 `hourly_usage' / `hourly_stacks' / `hourly_gc' / `hourly_health' /
-`hourly_drift'）永久保留，只由 `el-chronos-purge' 清理。"
+`hourly_drift' / `hourly_resources'）永久保留，只由 `el-chronos-purge' 清理。"
   (when el-chronos-store--db
     (let ((cutoff (- (el-chronos-store--now-ms)
                      (* (or el-chronos-retention-days 30) 86400000))))
@@ -1340,8 +1524,9 @@ git-head / config-sig），「以为删了其实没删」比「少删几个会�
     ("hourly_gc" . hour-ts)
     ("hourly_health" . hour-ts)
     ("hourly_drift" . hour-ts)
+    ("hourly_resources" . hour-ts)
     ("sessions" . stale-session))
-  "`el-chronos-purge' 的删除顺序：11 张表，**顺序不可改**。
+  "`el-chronos-purge' 的删除顺序：12 张表，**顺序不可改**。
 元素是 (表名 . 删除策略)，策略决定该表用哪种条件删（`before' 为 nil 时全部退化为
 无条件 `DELETE FROM <table>'）：
 
@@ -1407,10 +1592,10 @@ git-head / config-sig），「以为删了其实没删」比「少删几个会�
       0))
 ;;;###autoload
 (defun el-chronos-purge (&optional before)
-  "删除 BEFORE（epoch 毫秒）之前的全部数据；BEFORE 为 nil 时清空全部 11 张表。
+  "删除 BEFORE（epoch 毫秒）之前的全部数据；BEFORE 为 nil 时清空全部 12 张表。
 返回按删除顺序排列的 ((表名 . 删除行数) ...)。
 与 `-prune' 的区别是连 hourly_* 聚合、会话级数据（`startup_phases' / `session_meta'）
-以及 `sessions' 行本身一起删 —— 11 张表 vs 2 张表。
+以及 `sessions' 行本身一起删 —— 12 张表 vs 2 张表。
 
 删除顺序见常量 `el-chronos-store--purge-targets'：先 `commands'（唯一有外键的表），
 再 `startup_phases' / `session_meta'（删除条件靠子查询定位会话），最后 `sessions'。
