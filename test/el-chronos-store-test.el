@@ -510,6 +510,45 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
               (should-not batches))
           (el-chronos-store-close))))))
 
+(ert-deftest el-chronos-store-test-migrate-noop-when-already-current ()
+  "FROM-VERSION 已等于当前版本时 `--migrate' 直接返回 t，且**什么都不做**：
+不 checkpoint、不复制 `.bak'、不开事务、版本与数据都不变。
+锁住函数**自身**的不变量（而不是依赖 `--open-db' 的版本门）：生产路径确实只在版本更低时
+才调用它，但误调用会无谓地跑一次 `wal_checkpoint(TRUNCATE)' 并生成一份与库同大的 `.bak'
+副本（真实库约 10 MB 量级）—— 既有隐私考量（库副本落在用户目录里），也有纯 IO 代价。"
+  (el-chronos-store-test--with-hermetic-db
+    ;; 造一行数据：迁移若真跑了，行数或版本会露馅
+    (el-chronos-test--exec
+     "INSERT INTO sessions (started_at, emacs_version, host, startup_ms, gc_threshold)\
+ VALUES (?, ?, ?, ?, ?)"
+     (list (el-chronos-test--now-ms) "31.1" "noop-host" 12.0 (float gc-cons-threshold)))
+    (let ((before (el-chronos-test--count "sessions"))
+          (bak (concat el-chronos-db-path ".bak"))
+          (statements nil)
+          (orig (symbol-function 'sqlite-execute)))
+      ;; 打开新库时 fixture 自己走过一次 v0 → v5 迁移，会留下 .bak；先删掉，
+      ;; 这样「这次调用没有生成 .bak」才是可断言的
+      (ignore-errors (delete-file bak))
+      (should-not (file-exists-p bak))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &optional params)
+                   (push sql statements)
+                   (funcall orig db sql params))))
+        ;; ① 已是最新版本 → 返回 t（幂等语义不变）
+        (should (eq t (el-chronos-store--migrate
+                       el-chronos-store--db el-chronos-db-path
+                       el-chronos-store--schema-version))))
+      ;; ② 未生成 .bak（也就没走 copy-file）
+      (should-not (file-exists-p bak))
+      ;; ③ 未 checkpoint、未开事务
+      (should-not (cl-some (lambda (sql) (string-match-p "wal_checkpoint" sql))
+                           statements))
+      (should-not (cl-some (lambda (sql) (equal "BEGIN" (upcase sql))) statements))
+      ;; ④ 版本与数据行数都不变
+      (should (= el-chronos-store--schema-version
+                 (el-chronos-test--scalar "PRAGMA user_version")))
+      (should (= before (el-chronos-test--count "sessions"))))))
+
 (ert-deftest el-chronos-store-test-migrate-v5-failure-rolls-back ()
   "v5 迁移脚本报错时整体回滚：open 返回 nil、原库仍是 v4 的 12 表（版本 4）且数据完整、
 留下 .bak；去掉注入后同一个库能正常升到 v5。

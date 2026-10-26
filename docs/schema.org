@@ -16,7 +16,7 @@ v3（=hourly_drift=，命令外停转小时聚合）见
 [[file:adr/0005-two-tier-block-detection.md][docs/adr/0005-two-tier-block-detection.md]]，
 v4（=hourly_resources=，进程资源小时聚合 + 启动探针提前到 =early-init=）见
 [[file:adr/0006-resource-observation.md][docs/adr/0006-resource-observation.md]]；
-v5（=hourly_gc_attrib=，GC 归因小时聚合）见 [[file:../openspec/active/gc-attribution.md][openspec/active/gc-attribution.md]]；
+v5（=hourly_gc_attrib=，GC 归因小时聚合）见 [[file:../openspec/completed/gc-attribution.md][openspec/completed/gc-attribution.md]]；
 接口签名见 [[file:api.org][docs/api.org]]，界面消费方式见 [[file:ui.org][docs/ui.org]]。
 尚未实测的项（行数估算、=EXPLAIN QUERY PLAN=、P95 精度）见文末「待补」。
 #+END_QUOTE
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS hourly_gc_attrib (
 | 会话元数据 | =… ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value= | 覆盖：同一键只保留当前值 |
 | Drift 聚合（v3） | =… ON CONFLICT(hour_ts, session_id) DO UPDATE SET count = count + excluded.count, total_ms = total_ms + excluded.total_ms, max_ms = MAX(max_ms, excluded.max_ms)= | 前两列**累加**；=max_ms= 取**标量** =MAX=（两参数，SQLite 支持），保留本小时最坏单次（见「七张新表」） |
 | 资源聚合（v4） | =… ON CONFLICT(hour_ts, session_id) DO UPDATE SET cpu_ms = cpu_ms + excluded.cpu_ms, wall_ms = wall_ms + excluded.wall_ms, rss_kb_max = MAX(COALESCE(…), COALESCE(…)), rss_kb_sum = COALESCE(rss_kb_sum + excluded.rss_kb_sum, rss_kb_sum, excluded.rss_kb_sum), threads_max = MAX(COALESCE(…), COALESCE(…)), load*_sum = COALESCE(load*_sum + excluded.load*_sum, load*_sum, excluded.load*_sum), load_n = load_n + excluded.load_n= | CPU / 墙钟 / 负载和 / 样本数**累加**；RSS 与线程数峰值取标量 =MAX=；可空列一律 =COALESCE= 包住（=nil= 既不覆盖既有非 NULL 值、也不把 =NULL + x= 算成 =NULL=） |
-| GC 归因聚合（v5） | =… ON CONFLICT(hour_ts, session_id, command, mode) DO UPDATE SET gc_count = gc_count + excluded.gc_count, gc_ms = gc_ms + excluded.gc_ms= | 次数与耗时**累加**（同 =hourly_gc= / =hourly_drift=）。=command= / =mode= 是主键列且 =NOT NULL=，写层把 nil 归一为哨兵字符串 =\"<none>\"=——**主键含 NULL 会让 upsert 静默失效**：SQL 的主键把 NULL 当互不相等，同一组合的多次写入会变成多行而不是累加（见「七张新表」） |
+| GC 归因聚合（v5） | =… ON CONFLICT(hour_ts, session_id, command, mode) DO UPDATE SET gc_count = gc_count + excluded.gc_count, gc_ms = gc_ms + excluded.gc_ms= | 次数与耗时**累加**（同 =hourly_gc= / =hourly_drift=）。=command= / =mode= 是主键列且 =NOT NULL=，写层把 nil 归一为哨兵字符串 ="<none>"=——**主键含 NULL 会让 upsert 静默失效**：SQL 的主键把 NULL 当互不相等，同一组合的多次写入会变成多行而不是累加（见「七张新表」） |
 
 * 13 张表
 
@@ -457,8 +457,8 @@ NULL —— 该小时最后一次写入恰好是 NULL 时，整小时采到的�
 |---|---|---|
 | =hour_ts= | INTEGER NOT NULL | 整点（epoch ms）——**是 flush 时刻的整点，不是 GC 发生时刻** |
 | =session_id= | INTEGER NOT NULL | 会话 id |
-| =command= | TEXT NOT NULL | GC 发生时（见语义限定）的 =this-command=；nil 记 =\"<none>\"= |
-| =mode= | TEXT NOT NULL | 同一时刻的 =major-mode=；nil 记 =\"<none>\"= |
+| =command= | TEXT NOT NULL | GC 发生时（见语义限定）的 =this-command=；nil 记 ="<none>"= |
+| =mode= | TEXT NOT NULL | 同一时刻的 =major-mode=；nil 记 ="<none>"= |
 | =gc_count= | INTEGER NOT NULL DEFAULT 0 | 本小时该 =(command, mode)= 组合的 GC 次数，upsert **累加** |
 | =gc_ms= | REAL NOT NULL DEFAULT 0 | 同上，GC 耗时（毫秒），upsert **累加** |
 
@@ -467,15 +467,18 @@ NULL —— 该小时最后一次写入恰好是 NULL 时，整小时采到的�
 **主键含 NULL 会让 upsert 静默失效**：SQL 的主键把 NULL 当作**互不相等**，
 =ON CONFLICT(hour_ts, session_id, command, mode)= 因此永不命中，同一组合的每次写入都会新增
 一行而不是累加 —— 表面上「在写」，实际每次都新建。故两列都是 =NOT NULL=，写层
-=el-chronos-store--gc-attrib-key= 把 nil 归一为哨兵字符串 =\"<none>\"=；=command= 是真空串
-=\"\"= 时与 =\"<none>\"= 是两个不同的键，不要混用。
+=el-chronos-store--gc-attrib-key= 把 nil 归一为哨兵字符串 ="<none>"=；=command= 是真空串
+=""= 时与 ="<none>"= 是两个不同的键，不要混用。
 
 **语义限定（不读这一段必然误读）**：
 
 - 本表记录的是「GC **发生在**哪条命令之后 / 哪个 mode 里」，**不是**「哪条命令**导致** GC」。
-  GC 可能发生在 idle timer / 进程过滤器 / redisplay 里，此时 =this-command= 仍是上一条命令，
-  存在滞后；启动期与 batch 下 =this-command= 为 nil（记 =\"<none>\"=）。**任何把它读成因果
-  归因的报告都是错的。**
+  归因键是 GC 时刻的 =this-command= × =major-mode=，**GC 时刻没有正在执行的命令时**
+  （启动期、batch、命令循环**等待输入**期间，含 idle timer / 进程过滤器回调）=this-command=
+  为 nil，一律记 ="<none>"=。本机实测 45 次归因中 **37 次（88.1%）** 落 ="<none>"=（主要在
+  交互会话：=eca-chat-mode= / =fundamental-mode= / =magit-status-mode=），因此按命令的覆盖率
+  有限 —— 本表主要给 **mode 维度**与「命令执行期 GC」用。**任何把它读成因果归因的报告都是
+  错的。**
 - =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=，**禁止写成等式**：差值 = hook 安装
   前 / 采集窗口外的 GC。两个数字只能比大小，不能做校验。
 - =hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻：跨小时边界时归因可能落到相邻小时
@@ -817,7 +820,7 @@ v4（12 表）→ v5（13 表）与前面三步**完全同款**：一条 =ALTER 
 
 **=hourly_gc_attrib= 自身只有一条陷阱必须记住：主键里不能出现 NULL**（SQL 主键把 NULL 当互不
 相等，=ON CONFLICT= 永不命中 → 每次写入都新增一行而不是累加）。两列都是 =NOT NULL=，nil 由写层
-归一为 =\"<none>\"=，详见「七张新表」的 =hourly_gc_attrib= 小节。
+归一为 ="<none>"=，详见「七张新表」的 =hourly_gc_attrib= 小节。
 
 * 手动清理与迁移回滚
 

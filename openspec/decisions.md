@@ -27,6 +27,7 @@
 | 2026-10-26 | 栈包含归因（`el-chronos-analysis-inclusive-functions`）只接入 org 报告的「热点函数」节内 `** 栈包含占比 TOP` 子小节，Web 侧不新增路由与面板 | ① 栈包含的价值依赖与 self 榜**并排阅读**（两者的差异本身就是结论），Web 现有布局做不到并排；② Web 已有 19 条路由，栈包含属「按需深查」的分析型数据，不是常看面板；③ 数据仍可由 `/api/top-functions` 导出后本地 SQL 得到，能力不丢。**推翻条件**：若 Web 侧解决「self 榜与包含榜并排」的布局问题，可重新评估 | `openspec/completed/2026-10-26-compact-observability.md` 待办 6 |
 | 2026-10-26 | 所有计划、CHANGELOG、验收报告在声称「验证通过」时必须**分别写明** `make full-check`（= check-parens + test）与 `make lint`（字节编译告警），不得合并叙述 | `Makefile:53` 的 `full-check: check-parens test` **不含** lint；历史上的「full-check 全绿、lint 零告警」并列表述会让读者以为前者覆盖后者 | TD-30、`Makefile` |
 | 2026-10-26 | GC 归因只接入 org 报告，不接入 Web | 与栈包含归因同理：该数据需与 `hourly_gc` 总量（GC 总量 / 堆大小）**对照阅读**才有意义，Web 现有布局做不到并排；且它属「按需深查」的分析型数据，不是常看面板。推翻条件：Web 侧支持对照布局后可重评。 | `hourly_gc_attrib` / `el-chronos-analysis-gc-attribution` / report 第 16 节 |
+| 2026-10-26 | `el-chronos-store--migrate` 对「已是最新版本」加**版本相等早退守卫**：`from-version >= --schema-version` 时直接返回 `t`，不 checkpoint、不生成 `.bak`、不开事务 | 把「不动已是最新的库」编码为**函数自身的不变量**，不依赖调用方 `--open-db` 先短路。误调用会白跑 `PRAGMA wal_checkpoint(TRUNCATE)` 并 `copy-file` 生成一份与库同大的 `.bak`（真实库约 10 MB）——既是 IO 代价，也是隐私代价（多一份数据副本，且失败回滚路径会把它当成「迁移前状态」）。守门用例 `el-chronos-store-test-migrate-noop-when-already-current` 锁住「返回 t / 无 `.bak` / 无 checkpoint / 无 `BEGIN` / 版本与行数均不变」 | `el-chronos-store.el`、`test/el-chronos-store-test.el`、`openspec/completed/gc-attribution.md` |
 
 ## 决策模板
 

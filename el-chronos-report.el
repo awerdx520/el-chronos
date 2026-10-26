@@ -89,10 +89,18 @@ I11：无数据时**不省略整节**，且说明「为什么没有」——归�
 把「没有归因数据」读成「这台机器从不 GC」（后者要看 `hourly_gc'）。")
 (defconst el-chronos-report--gc-attrib-caveat
   (concat "本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；"
-          "在 idle / 进程过滤器里 this-command 为上一条命令。")
+          "GC 时刻没有正在执行的命令时（启动期、batch、命令循环等待输入期间，"
+          "含 idle timer / 进程过滤器回调）this-command 取不到值，一律归 \"<none>\"，"
+          "故按命令的覆盖率有限。")
   "「GC 归因」节必须原样写出的首行说明（语义限定，不是修饰）。
-写全三个要素：① 「发生在…之后」≠「导致」；② idle / 进程过滤器里 `this-command' 滞后；
-③ 指出滞后时的具体表现（是上一条命令）。缺任何一项，读者都会把这张表读成因果归因。")
+写全三个要素：① 「发生在…之后」≠「导致」；② 归因键是 GC 时刻的 `this-command'
+× `major-mode'，**GC 时刻没有正在执行的命令时它就是 nil** —— 启动期、batch、以及命令
+循环**等待输入**期间（含 idle timer / 进程过滤器回调）都属这一档；③ nil 一律归哨兵
+\"<none>\"，因此本表「按命令归因」的覆盖率有限，它主要给 mode 维度与「命令执行期 GC」用。
+缺任何一项，读者都会把这张表读成因果归因，或把 \"<none>\" 读成采集 bug。
+**不要**写成「idle / 进程过滤器里 `this-command' 是上一条命令」式的滞后断言：命令循环在
+运行命令前才设置 `this-command'（`info' 手册），真实库实测也以 \"<none>\" 为多数（含交互
+会话），二者都与该断言的预测相反。")
 (defconst el-chronos-report--empty "（无数据）" "空数据占位文本。")
 (defconst el-chronos-report--startup-load-rows 10
   "「启动分解」里包加载 TOP 最多展示的库数。
@@ -358,8 +366,9 @@ ITEMS 为 nil 时返回 nil，由 `el-chronos-report--section-gc-attribution' �
 标题必须带限定语「（发生在哪条命令之后）」、正文首行必须原样写出
 `el-chronos-report--gc-attrib-caveat' —— 少了任一，这张表就会被读成**因果**归因
 （「save-buffer 导致 6 次 GC」），而它实际只说明「那 6 次 GC 发生在 save-buffer 之后」。
-归因键是 GC 时刻的 `this-command' × `major-mode'，在 idle timer / 进程过滤器里
-`this-command' 仍是上一条命令，因此有滞后；启动期与 batch 下为 \"<none>\"。
+归因键是 GC 时刻的 `this-command' × `major-mode'：GC 时刻没有正在执行的命令时
+`this-command' 为 nil（启动期、batch、命令循环**等待输入**期间，含 idle timer /
+进程过滤器回调），一律归 \"<none>\"，故按命令的覆盖率有限。
 
 无数据时输出 `el-chronos-report--gc-attrib-degrade' 而不是省略整节（I11）：归因表自
 schema v5 才采集，`（无数据）' 这种通用占位说不出「为什么没有」。"

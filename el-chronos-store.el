@@ -109,9 +109,11 @@
 故写层把 nil 归一为哨兵字符串 \"<none>\"（见 `el-chronos-store-record-gc-attrib'）。
 
 **语义边界（读者必读）**：本表记录的是「GC **发生在**哪条命令之后 / 哪个 mode 里」，
-**不是**「哪条命令**导致**」GC。GC 可能发生在 idle timer、进程过滤器、`post-gc-hook'
-的延迟回调里，此时 `this-command' 仍是上一条命令，存在**滞后**；启动期没有命令，
-记为 \"<none>\"。任何把它读成因果归因的报告都是错的。
+**不是**「哪条命令**导致**」GC。归因键是 GC 时刻的 `this-command' × `major-mode'：
+**GC 时刻没有正在执行的命令时**（启动期、batch、命令循环**等待输入**期间，含 idle timer /
+进程过滤器回调与 `post-gc-hook' 自身的延迟路径）它就是 nil，一律记 \"<none>\"。真实库里
+\"<none>\" 常占多数（本机实测，主要因 GC 多发生在命令循环等待输入的窗口），故按命令的
+覆盖率有限。任何把它读成因果归因的报告都是错的。
 
 与 `hourly_gc' 的关系：两表**并存、不可互相替代** —— `hourly_gc' 是总量（次数 / 耗时 /
 堆大小），本表是同一批 GC 的**分布**（按命令 × mode 拆开）。本表的 `gc_count' 之和
@@ -587,68 +589,78 @@ store 是底层，不能为了一个整点换算引入反向依赖。"
 仍持有未回滚事务。
 每个迁移步骤各自 `BEGIN' / `COMMIT'（回滚粒度按步清楚），步骤内把版本推进到**本步目标
 版本**（追加新版本时，既有各步仍只把版本置为本步目标值 2 / 3 / 4 / 5）；末尾再统一写一次
-最终版本。"
-  (let ((bak (concat path ".bak")))
-    (condition-case err
-        (progn
-          ;; WAL 未 checkpoint 时主文件不含最新数据，复制前先落盘
-          (ignore-errors (sqlite-execute db "PRAGMA wal_checkpoint(TRUNCATE)"))
-          (when (file-exists-p path) (copy-file path bak t))
-          (let ((version from-version))
-            ;; 版本 0 → 当前：建全量表并把版本置为当前版本（由 `--ensure-schema' 完成）
-            (when (< version 1)
-              (el-chronos-store--ensure-schema db)
-              ;; 它已把 13 张表建全并把 user_version 置为当前常量，故把局部版本同步为
-              ;; 同一个值（不是 1），否则下面的 v2 / v3 / v4 / v5 分支会对着刚建全的库再跑一遍
-              (setq version el-chronos-store--schema-version))
-            ;; 版本 1 → 2：补建 4 张新表
-            (when (= version 1)
-              ;; `sqlite-execute-batch' 不自带事务（实测：无显式 BEGIN 时中途报错，
-              ;; 先前已执行的语句仍留在库里），故显式包事务，保证「4 张表全有或全无」
-              ;; —— 半成品库会让分析层因缺表静默降级，外部 sqlite3 读者看到残缺 schema。
-              (sqlite-execute db "BEGIN")
-              (sqlite-execute-batch db el-chronos-store--sql-migrate-v2)
-              (sqlite-pragma db "user_version=2")
-              (sqlite-execute db "COMMIT")
-              (setq version 2))
-            ;; 版本 2 → 3：补建 hourly_drift。v1 老库会连续走完上面两步，一次到位
-            (when (= version 2)
-              (sqlite-execute db "BEGIN")
-              (sqlite-execute-batch db el-chronos-store--sql-migrate-v3)
-              (sqlite-pragma db "user_version=3")
-              (sqlite-execute db "COMMIT")
-              (setq version 3))
-            ;; 版本 3 → 4：补建 hourly_resources。v0 / v1 / v2 老库会连续走完上面各步，
-            ;; 一次到位（这正是「逐级推进」而非互斥分支的意义）
-            (when (= version 3)
-              (sqlite-execute db "BEGIN")
-              (sqlite-execute-batch db el-chronos-store--sql-migrate-v4)
-              (sqlite-pragma db "user_version=4")
-              (sqlite-execute db "COMMIT")
-              (setq version 4))
-            ;; 版本 4 → 5：补建 hourly_gc_attrib。v0 / v1 / v2 / v3 老库会连续走完上面各步，
-            ;; 一次到位（这正是「逐级推进」而非互斥分支的意义）
-            (when (= version 4)
-              (sqlite-execute db "BEGIN")
-              (sqlite-execute-batch db el-chronos-store--sql-migrate-v5)
-              (sqlite-pragma db "user_version=5")
-              (sqlite-execute db "COMMIT")
-              (setq version 5))
-            (sqlite-pragma db (format "user_version=%d" version)))
-          t)
-      (error
-       ;; 先撤事务（顺序约束 ②），再走既有回滚路径
-       (ignore-errors (sqlite-execute db "ROLLBACK"))
-       (display-warning 'el-chronos
-                        (format "schema 迁移失败（%d → %d），已回滚为迁移前状态：%S"
-                                from-version el-chronos-store--schema-version err)
-                        :warning)
-       (ignore-errors (sqlite-close db))
-       (when (file-exists-p bak)
-         (ignore-errors (copy-file bak path t))
-         (dolist (suffix '("-wal" "-shm"))
-           (ignore-errors (delete-file (concat path suffix)))))
-       nil))))
+最终版本。
+
+**版本相等直接返回**（`(>= from-version --schema-version)' → t）编码在函数**内部**，而不是
+只依赖 `--open-db' 的版本门：生产路径确实只在 `(< version --schema-version)' 分支才调用本
+函数，但「不动已是最新的库」是 `--migrate' 自身的不变量，不该由调用方保证。误调用（版本门
+写错、外部直接调用）会无谓地跑一次 `wal_checkpoint(TRUNCATE)' 并生成一份与库同大的
+`.bak' 副本（真实库约 10 MB 量级）—— 既有隐私考量（库副本落在用户目录里），也有纯 IO
+代价；且这份 `.bak' 在失败回滚路径上会被当作「迁移前状态」使用，内容却与现库相同。"
+  (if (>= from-version el-chronos-store--schema-version)
+      ;; 已是最新版本：不 checkpoint、不复制 .bak、不开事务，直接返回（保持幂等语义）
+      t
+    (let ((bak (concat path ".bak")))
+      (condition-case err
+          (progn
+            ;; WAL 未 checkpoint 时主文件不含最新数据，复制前先落盘
+            (ignore-errors (sqlite-execute db "PRAGMA wal_checkpoint(TRUNCATE)"))
+            (when (file-exists-p path) (copy-file path bak t))
+            (let ((version from-version))
+              ;; 版本 0 → 当前：建全量表并把版本置为当前版本（由 `--ensure-schema' 完成）
+              (when (< version 1)
+                (el-chronos-store--ensure-schema db)
+                ;; 它已把 13 张表建全并把 user_version 置为当前常量，故把局部版本同步为
+                ;; 同一个值（不是 1），否则下面的 v2 / v3 / v4 / v5 分支会对着刚建全的库再跑一遍
+                (setq version el-chronos-store--schema-version))
+              ;; 版本 1 → 2：补建 4 张新表
+              (when (= version 1)
+                ;; `sqlite-execute-batch' 不自带事务（实测：无显式 BEGIN 时中途报错，
+                ;; 先前已执行的语句仍留在库里），故显式包事务，保证「4 张表全有或全无」
+                ;; —— 半成品库会让分析层因缺表静默降级，外部 sqlite3 读者看到残缺 schema。
+                (sqlite-execute db "BEGIN")
+                (sqlite-execute-batch db el-chronos-store--sql-migrate-v2)
+                (sqlite-pragma db "user_version=2")
+                (sqlite-execute db "COMMIT")
+                (setq version 2))
+              ;; 版本 2 → 3：补建 hourly_drift。v1 老库会连续走完上面两步，一次到位
+              (when (= version 2)
+                (sqlite-execute db "BEGIN")
+                (sqlite-execute-batch db el-chronos-store--sql-migrate-v3)
+                (sqlite-pragma db "user_version=3")
+                (sqlite-execute db "COMMIT")
+                (setq version 3))
+              ;; 版本 3 → 4：补建 hourly_resources。v0 / v1 / v2 老库会连续走完上面各步，
+              ;; 一次到位（这正是「逐级推进」而非互斥分支的意义）
+              (when (= version 3)
+                (sqlite-execute db "BEGIN")
+                (sqlite-execute-batch db el-chronos-store--sql-migrate-v4)
+                (sqlite-pragma db "user_version=4")
+                (sqlite-execute db "COMMIT")
+                (setq version 4))
+              ;; 版本 4 → 5：补建 hourly_gc_attrib。v0 / v1 / v2 / v3 老库会连续走完上面各步，
+              ;; 一次到位（这正是「逐级推进」而非互斥分支的意义）
+              (when (= version 4)
+                (sqlite-execute db "BEGIN")
+                (sqlite-execute-batch db el-chronos-store--sql-migrate-v5)
+                (sqlite-pragma db "user_version=5")
+                (sqlite-execute db "COMMIT")
+                (setq version 5))
+              (sqlite-pragma db (format "user_version=%d" version)))
+            t)
+        (error
+         ;; 先撤事务（顺序约束 ②），再走既有回滚路径
+         (ignore-errors (sqlite-execute db "ROLLBACK"))
+         (display-warning 'el-chronos
+                          (format "schema 迁移失败（%d → %d），已回滚为迁移前状态：%S"
+                                  from-version el-chronos-store--schema-version err)
+                          :warning)
+         (ignore-errors (sqlite-close db))
+         (when (file-exists-p bak)
+           (ignore-errors (copy-file bak path t))
+           (dolist (suffix '("-wal" "-shm"))
+             (ignore-errors (delete-file (concat path suffix)))))
+         nil)))))
 (defun el-chronos-store--open-db (path)
   "打开 PATH，完成 pragma、版本检查与迁移后返回句柄；失败返回 nil（已告警）。"
   (let ((db (sqlite-open path)))
@@ -1164,8 +1176,9 @@ GC-COUNT / GC-MS 累加，与 `record-drift' 同款 upsert（落库 SQL 见
 事务内提交，故「库里有值 ⇔ 本批已提交」严格同态）。
 
 **语义**：本表记录的是「GC **发生在**哪条命令之后 / 哪个 mode 里」，不是「哪条命令
-**导致**」GC —— GC 可能发生在 idle timer / 进程过滤器里，此时 `this-command' 是
-上一条命令，存在滞后；启动期为 \"<none>\"。调用方不要把它读成因果归因。
+**导致**」GC —— 归因键是 GC 时刻的 `this-command'，**没有正在执行的命令时**（启动期、
+batch、命令循环**等待输入**期间，含 idle timer / 进程过滤器回调）为 nil，记 \"<none>\"。
+调用方不要把它读成因果归因，也不要把 \"<none>\" 读成采集缺陷。
 
 **SESSION-ID 为什么显式传参**（而 `record-gc' / `record-drift' / `record-resources' 都从
 全局 `el-chronos--session-id' 取）：本函数的采集点（`post-gc-hook'）可能在缺少当前会话

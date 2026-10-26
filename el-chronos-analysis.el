@@ -389,8 +389,11 @@ DIMENSION 取 `command'（默认）或 `mode'：按「GC 发生在哪条命令�
 command 与 mode 两种聚合的分组数量不同，两个百分比序列各自归一）。
 
 **语义限定（不要省略）**：本函数回答「GC **发生在**哪条命令之后」，**不是**「哪条命令
-**导致** GC」。GC 可能发生在 idle timer / 进程过滤器里，此时 `this-command' 是上一条命令，
-存在滞后；启动期与 batch 下为 \"<none>\"。因此 `sum(hourly_gc_attrib.gc_count)' 与
+**导致** GC」。归因键是 GC 时刻的 `this-command' × `major-mode'：**GC 时刻没有正在执行的
+命令时**（启动期、batch、命令循环**等待输入**期间，含 idle timer / 进程过滤器回调）
+`this-command' 为 nil，一律归 \"<none>\"。因此 \"<none>\" 在真实库里常占多数（本机实测，
+主要因 GC 多发生在命令循环等待输入的窗口），按命令维度的覆盖率有限 —— 本函数主要给
+mode 维度与「命令执行期 GC」用。另：`sum(hourly_gc_attrib.gc_count)' 与
 `hourly_gc.gc_count' 只能比大小（≤），**不能**做等式校验：差值 = hook 安装前 /
 采集窗口外的 GC。
 

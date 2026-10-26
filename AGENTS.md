@@ -31,10 +31,16 @@ GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-s
 `resource-summary` 与 **GC 归因 `gc-attribution`**）/ Web **19** 条路由（新增 `/api/resources`）/ org 报告 **16 节**
 （新增「资源（CPU / 内存 / 负载）」与「**GC 归因（发生在哪条命令之后）**」两节；「栈包含占比 TOP」是
 「热点函数」节内的 `**` 子小节，**不增节**；drift 摘要仍嵌在「阻塞事件」节内）。
-**GC 归因已落地**（`openspec/active/gc-attribution.md`）：schema **v5 增 `hourly_gc_attrib`（共 13 表）**——
+**GC 归因已完成并归档**（`openspec/completed/gc-attribution.md`，2026-10-26 归档）：schema **v5 增 `hourly_gc_attrib`（共 13 表）**——
 `post-gc-hook` 把每次 GC 按 `this-command` × `major-mode` 归因（hook 热路径**零分配**，字符串转换推迟到
 10 秒窗口 flush）；表回答「GC **发生在**哪条命令之后」而非「哪条命令**导致** GC」，且
 `sum(gc_attrib.gc_count) ≤ hourly_gc.gc_count`（差值 = hook 安装前 / 采集窗口外的 GC，**禁做等式校验**）。
+**归因键的实测边界**：GC 时刻没有正在执行的命令时（启动期、batch、命令循环**等待输入**期间，含 idle timer /
+进程过滤器回调）`this-command` 为 `nil` → 一律归 `"<none>"`；本机真实库实测 **37/45（88.1%）落 `<none>`**，且集中
+在交互会话（`eca-chat-mode` / `fundamental-mode` / `magit-status-mode`）——故命令维度覆盖率有限，只对「命令执行期
+GC」有效，mode 维度更稳。真实库副本迁移实测：v4 → v5 后 `user_version=5`、12 → 13 表、既有 12 表一行不变、
+`sqlite_master` 与真实库逐字相同；`--migrate` 新增「版本相等即早退」守卫（不 checkpoint、不生成 `.bak`），其守门
+用例让总数到 **336**。
 8 个源码模块 + 9 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
 剩余项是仍待实测的性能/覆盖率数字与 D1 的 GUI 实机验证（见 `openspec/tech-debt.md`）。
 计划见 `openspec/completed/el-chronos-core.md`（2026-10-24 归档）；
@@ -44,29 +50,29 @@ use-package 适配计划见 `openspec/completed/add-use-package-support.md`（T1
 启动探针 + 资源观测计划见 `openspec/completed/startup-probe-and-resources.md`（T1–T9 全部完成，ADR-0006，2026-10-26 归档）；
 观测能力收敛计划见 `openspec/completed/2026-10-26-compact-observability.md`（栈包含归因 + `kind='command'` 的
 `stack_json` 不再记自身栈，T1–T5 全部完成，2026-10-26 归档）。
-**当前 `openspec/active/` 有 1 个计划**：`openspec/active/gc-attribution.md`（GC 归因，schema v5；
-C1a / C1b 已完成，C1c 收尾中，待全量验证后归档），详见「文档治理」段。
+**当前 `openspec/active/` 为空**（只剩 `.gitkeep`）；GC 归因计划已归档为
+`openspec/completed/gc-attribution.md`（C1a / C1b / C1c / 全量验证全部完成，2026-10-26 归档），详见「文档治理」段。
 
 ## 目录结构
 
 | 路径 | 用途 | 行数 / 状态 |
 |---|---|---|
 | `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 421 行 / 21 defcustom（项目合计 23） |
-| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、**`post-gc-hook` GC 归因（内存二级 hash + 零分配热路径）**、**资源采集（CPU / RSS / 线程 / 系统负载）**、启动打点（**含探针交接**）、自监控计数 | 1687 行 |
+| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、**`post-gc-hook` GC 归因（内存二级 hash + 零分配热路径）**、**资源采集（CPU / RSS / 线程 / 系统负载）**、启动打点（**含探针交接**）、自监控计数 | 1699 行 |
 | `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 343 行 |
-| `el-chronos-store.el` | SQLite schema（v5，13 表 + 3 索引）、批量 flush、drift 小时聚合、**资源小时聚合**、**GC 归因小时聚合**、保留策略、top-N 淘汰、purge 13 表 | 1828 行 |
-| `el-chronos-analysis.el` | 22 个只读分析函数（另有 `names` 作为补全辅助，不计入）（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/**栈包含归因**/会话/回归/GC/**GC 归因**/启动/健康/配置变更/**资源趋势与汇总**） | 1254 行 |
-| `el-chronos-report.el` | org 报告（16 节，含「阻塞事件」节内的 drift 汇总行、「热点函数」节内的 `** 栈包含占比 TOP` 子小节、「资源」与「**GC 归因**」节）、周报、CSV/JSON 导出（10 个区块）、按需高精度剖析、报告期间自观测抑制 | 1401 行 |
+| `el-chronos-store.el` | SQLite schema（v5，13 表 + 3 索引）、批量 flush、drift 小时聚合、**资源小时聚合**、**GC 归因小时聚合**、保留策略、top-N 淘汰、purge 13 表 | 1867 行 |
+| `el-chronos-analysis.el` | 22 个只读分析函数（另有 `names` 作为补全辅助，不计入）（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/**栈包含归因**/会话/回归/GC/**GC 归因**/启动/健康/配置变更/**资源趋势与汇总**） | 1257 行 |
+| `el-chronos-report.el` | org 报告（16 节，含「阻塞事件」节内的 drift 汇总行、「热点函数」节内的 `** 栈包含占比 TOP` 子小节、「资源」与「**GC 归因**」节）、周报、CSV/JSON 导出（10 个区块）、按需高精度剖析、报告期间自观测抑制 | 1410 行 |
 | `el-chronos-web.el` | 最小 HTTP server（19 条路由 = 1 页 + 17 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1267 行 |
 | `el-chronos-startup-probe.el` | **零依赖**启动探针：`early-init` / `after-init` / `startup` 三锚点 + 按库累计的 `after-load-functions` 时间差；只写内存、不开库不写库；三条自证收尾路径（`emacs-startup-hook` / `load-count` 800 / `after-init` 30 秒兜底 timer） | 318 行 |
 | `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 198 行 |
 | `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史 / drift 趋势 / **栈包含归因 / 资源趋势与汇总 / GC 归因（command 与 mode 两维度）**） | 1277 行 / 57 用例 |
 | `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 371 行 / 28 用例 |
 | `test/el-chronos-autoload-test.el` | autoload 契约：cookie 覆盖 16 个 interactive 命令（计数不变量）、生成物让命令 `autoloadp`、库名等于定义文件 | 295 行 / 3 用例 |
-| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控、**探针交接与资源采集降级**、**`post-gc-hook` 归因（差值 / 零分配 / 装配拆除）** | 2195 行 / 87 用例 |
-| `test/el-chronos-report-test.el` | org 报告 16 节、阻塞事件节内的 drift 汇总行、热点函数节内的栈包含子小节、**资源节与 GC 归因节**、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 927 行 / 39 用例 |
+| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控、**探针交接与资源采集降级**、**`post-gc-hook` 归因（差值 / 零分配 / 装配拆除）** | 2204 行 / 87 用例 |
+| `test/el-chronos-report-test.el` | org 报告 16 节、阻塞事件节内的 drift 汇总行、热点函数节内的栈包含子小节、**资源节与 GC 归因节**、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 932 行 / 39 用例 |
 | `test/el-chronos-startup-probe-test.el` | 探针：三锚点记录、`after-load` 差值、`take` 增量语义（`anchors` 只读、`loads` 取走即清空）、无 `before-init-time` 不崩、异常吞掉 | 342 行 / 16 用例 |
-| `test/el-chronos-store-test.el` | schema/迁移（v0→v5、v1→v5、v2→v5、v3→v5、v4→v5 五条守门与回滚）/批量写入/drift、**资源**与 **GC 归因**聚合/保留策略/top-N 淘汰/purge 13 表/`note-startup-ms` 补写 | 2290 行 / 80 用例 |
+| `test/el-chronos-store-test.el` | schema/迁移（v0→v5、v1→v5、v2→v5、v3→v5、v4→v5 五条守门与回滚）/批量写入/drift、**资源**与 **GC 归因**聚合/保留策略/top-N 淘汰/purge 13 表/`note-startup-ms` 补写 | 2329 行 / 81 用例 |
 | `test/el-chronos-web-test.el` | 内嵌 Web server（启停/路由/边界/loopback/自观测抑制/四个 v2 端点 + `/api/drift` + **`/api/resources`**/浏览器自动打开三形态） | 694 行 / 25 用例 |
 | `docs/architecture.org` | 分层、七条采集路径（路径 3 = 心跳两档判定 + 三处调用点）、**启动探针（early-init 路径）**、**资源采集（路径 6 扩展）**、**GC 归因支路（post-gc-hook）**、可视化数据流、**实测结论**、已知偏差 | 817 行 |
 | `docs/schema.org` | 最终 DDL（**13 表 + 3 索引**）、迁移链 v0/v1/v2/v3/v4 → v5（含迁移链陷阱）、top-N 淘汰 SQL、保留分类、purge 13 表删除顺序、**`hourly_resources` 的 `cpu_pct = 0` 两义（TD-28）**、**`hourly_gc_attrib` 的四元主键与「主键含 NULL 让 upsert 静默失效」** | 848 行 |
@@ -195,10 +201,10 @@ make full-check     # check-parens + test
 全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。`make autoloads` 在 Emacs 29.1+ 走
 `loaddefs-generate`，更早版本回退 `make-directory-autoloads`（ERT 用例同源守卫，不硬编码单一实现）。
 
-**当前基线**（实测 2026-10-26，C1c 收尾时重测）：`make test` = **335 用例**（`Ran 335 tests, 335 results as expected, 0 unexpected`，约 5.1 秒，**0 skipped**）；
-分布：collect 87 / store 80 / analysis 57 / report 39 / attrib 28 / web 25 / startup-probe 16 / autoload 3 用例；
-行数：store 1828 / collect 1687 / report 1401 / web 1267 / analysis 1254 / 入口 421 / attrib 343 / startup-probe 318（源码 8 模块 **8519 行**）；
-测试：store 2290 / collect 2195 / analysis 1277 / report 927 / web 694 / attrib 371 / startup-probe 342 / autoload 295 / helper 198（测试 9 文件 **8589 行**）；源码 + 测试合计 **17108 行**。
+**当前基线**（实测 2026-10-26，GC 归因归档时重测）：`make test` = **336 用例**（`Ran 336 tests, 336 results as expected, 0 unexpected`，**0 skipped**；耗时 **约 5–15 秒**，视机器负载——同日两次实测 4.7 秒 / 14.9 秒）；
+分布：collect 87 / store 81 / analysis 57 / report 39 / attrib 28 / web 25 / startup-probe 16 / autoload 3 用例（合计 336）；
+行数：store 1867 / collect 1699 / report 1410 / web 1267 / analysis 1257 / 入口 421 / attrib 343 / startup-probe 318（源码 8 模块 **8582 行**）；
+测试：store 2329 / collect 2204 / analysis 1277 / report 932 / web 694 / attrib 371 / startup-probe 342 / autoload 295 / helper 198（测试 9 文件 **8642 行**）；源码 + 测试合计 **17224 行**。
 `make lint` **零告警**（17 个文件逐个字节编译，含 `test/*.el`；`el-chronos-autoloads.el` 由 `EL_FILES` 排除，不在检查范围）。
 新增或修改行为时基线只准上升，改测试要说明原因。
 
@@ -247,6 +253,7 @@ ss -lntH "sport = :8787"
 | **连续命令流中的累计卡顿不可见** | 卡顿分散在几十条 20–50 ms 的连续命令里（总 1.5 s、**单条都不慢**）时：单条都进不了 `slow_events`（<200 ms 阈值）、命令时间又被基线重置切掉 → **block / drift 与 `slow_events` 都看不到** | 方案 B（重置换判据）的结构性能力损失（ADR-0005 备选⑧/⑩ 的取舍）：只能查 `commands` 的时间戳密度人工解读。**不是采集器坏了**，见 `docs/architecture.org`「已知偏差」 |
 | **自观测抑制（report / Web，三层 + 心跳侧感知）** | 观测者会观测到自己的重查询，必须抑制。**机制**：`el-chronos-collect--heartbeat-check` 用 `bound-and-true-p` 读取 `el-chronos-collect--suppress-block-p`——抑制期间**推进 `--last-heartbeat` 基线并跳过判定**（**block 与 drift 两档共用这个门**）；report（`el-chronos-report--without-block-events`）与 Web（`el-chronos-web--without-block-events`）在渲染 / 请求处理前各自绑定该抑制变量、把 `el-chronos-block-threshold-ms` 临时抬到 60s，并在 `unwind-protect` 清理段**再重置基线**（这一层不可省：渲染期间没有命令结算，`--finish` 的重置替代不了它）。**结论**：抑制期间不产生 block / drift，解除绑定后也不补记整段 gap。**取舍**：抑制期间若真发生阻塞同样不记（有意接受——用户主动触发的重查询耗时不属待排查卡顿）。**覆盖面**：report 与 Web 均抑制，两份为**内联重复实现**（web 刻意不 require report / collect，保持零额外依赖），改动需同步两处；TD-12 已关闭 | `docs/architecture.org`「自观测抑制（report / Web）」 |
 | **内存 / GC 观测口径** | `heap_bytes` 来自 `(garbage-collect-heapsize)`（Emacs **31.1+** 才有，29/30 恒 NULL）；`gc_count` / `gc_ms` 来自 `gcs-done` / `gc-elapsed` 的**增量**（只读全局计数器，**零副作用、不触发 GC**；采集路径**禁止**调 `garbage-collect`，也禁止用 `memory-info`——那是系统内存）；首个采样窗口只建基线（丢 ≤1 窗口增量，故首桶计数可能为 0 而非「没发生 GC」）；`hourly_gc.heap_bytes` 用 `COALESCE` 保留本行最后一次非 NULL 观测值（同会话同小时的稀疏写入，非跨版本问题）；跨 Emacs 版本共用同一库时曲线会空洞，阅读时按 `sessions.emacs_version` 分组（TD-15） | `docs/architecture.org`「路径 6：GC 与自监控」/「已知偏差」、TD-15 |
+| **GC 归因的 command 维度覆盖率有限** | 归因键是 GC 时刻的 `this-command`：**GC 时刻没有正在执行的命令**时它是 `nil` → 记 `"<none>"`——启动期、batch、命令循环**等待输入**期间，含 idle timer / 进程过滤器回调。本机真实库实测 **45 次归因中 37 次（88.1%）落 `<none>`**，且集中在交互会话（`eca-chat-mode` / `fundamental-mode` / `magit-status-mode`），**不是**启动期或 batch。故本表主要给 **mode 维度**与「命令执行期 GC」用；**不要**把 `<none>` 读成采集 bug，也不要写「idle / 进程过滤器里 `this-command` 是上一条命令」（命令循环只在运行命令前才设置它）。`sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count` 是设计上的不等关系，**禁做等式校验** | `docs/architecture.org`「路径 6：GC 与自监控」、`docs/schema.org`「hourly_gc_attrib」、TD-31 / TD-32 / TD-33 |
 | **启动分解覆盖范围（现状路径：未装探针）** | `startup_phases` 的包加载明细基于 `after-load-functions` **相邻两次回调的时间差**（**近似归因**，差值含前一文件的收尾逻辑与它触发的钩子）；**mode 在 `after-init-hook` 之前启用**才记明细，启动已结束时只有 `mode-start` 一个锚点、且**根本不挂** `after-load-functions`（否则启动后的交互式 load 会被记成「启动耗时」）——观测器无法观测自己被加载之前的事；不装探针时这条物理边界与既有行为一致 | `docs/architecture.org`「路径 5：启动打点」/「已知偏差」、`docs/operations.org`「启动分解的物理边界」、TD-16、ADR-0006 |
 | **启动分解覆盖范围（探针路径：装了 early-init 探针）** | 在 `early-init.el` 里 `(load "el-chronos-startup-probe" t t t)` 之后，`load:*` 明细覆盖**从 `early-init` 起的完整加载**，并给出 `early-init` / `after-init` / `startup` 三锚点；探针的自摘发生在 `startup` 锚点后 **0 秒 timer** 里，故 load 明细只覆盖到「**最后一次 `take` 时刻**」——`startup` 锚点之后到事件循环之间的少量加载（如用户 `emacs-startup-hook` 里的惰性 require）可能缺失。这是「探针提前到 early-init 也不覆盖最后一毫秒」的残留边界，不是 bug | ADR-0006「决策 / D1」、TD-16、`docs/architecture.org`「路径 5：启动打点」 |
 | **探针路径是硬编码的（静默降级）** | `thomas-emacs/early-init.el` 里写死 el-chronos 仓库的**绝对路径**；仓库改名 / 搬迁后 `(load … t)` 按 NOERROR 语义**静默失败**，表现为 `startup_phases` 的 `load:*` 明细又变回 0 条，而其余观测照常工作。**排障口诀**：`load:*` 为 0 → 先确认 `early-init.el` 里那条路径存在、且 `THOMAS_EMACS_INSTANCE` 守卫没跳过它 | ADR-0006 D4、`docs/operations.org`「启动分解的物理边界」 |
@@ -266,28 +273,30 @@ ss -lntH "sport = :8787"
 | 用户文档 | `Readme.org`；变更日志 `CHANGELOG.md`（Keep a Changelog 格式） |
 | 技术文档 | `docs/architecture.org`（时序、数据流、实测结论）、`docs/schema.org`（DDL 与查询示例）、`docs/ui.org`（两形态界面、Web dashboard 路由与降级规则）、`docs/api.org`（接口索引）、`docs/operations.org`（装卸、清理、排障）、`docs/adr/0001`–`0006`（架构决策：0004 = 观测面扩展、0005 = 两档阈值、0006 = 启动探针 + 资源观测） |
 
-> **当前 `openspec/active/` 为空**（只剩 `.gitkeep`）——本批把最后两个计划全部归档：
-> - `openspec/completed/startup-probe-and-resources.md`：启动探针 + 资源观测（ADR-0006），**T1–T9 全部完成**
->   （schema v4 `hourly_resources` / 零依赖探针 / collect 交接与资源采集 / analysis 2 查询 / Web `/api/resources`
->   / org 报告资源节 / 五份 `docs/*.org` + `AGENTS.md` + `CHANGELOG.md` + `tech-debt.md` 同步 / 归档）。一句话结论：
->   **观测面从「时间」扩到「时间 + 资源」，且启动分解的物理边界被 early-init 探针正面处置**（残留见 TD-16）。
-> - `openspec/completed/2026-10-26-compact-observability.md`：观测能力收敛（栈包含归因 + `kind='command'` 的
->   `stack_json` 不再记自身栈 + 数据诚实性），**T1–T5 全部完成**（T3/T4/T5 由本仓 v4 流程结清）。一句话结论：
->   **self 口径之外补上栈包含口径**，回答「谁在调度」而非只答「谁在吃 CPU」；「命令窗口内的采样栈未按命令切分」
->   作为后续候选留在 TD-26，「GC 归因」明确排除在 v4 之后。
+> **当前 `openspec/active/` 为空**（只剩 `.gitkeep`）——本批（第 10 份）归档 GC 归因计划：
+> - `openspec/completed/gc-attribution.md`：GC 归因（schema v5 新增 `hourly_gc_attrib`），**C1a / C1b / C1c / 全量验证
+>   全部完成**（store 表 + 写入 + purge / `post-gc-hook` 采集 + 零分配热路径 + 窗口 flush / `analysis-gc-attribution`
+>   + 报告第 16 节 / 五份 `docs/*.org` + `AGENTS.md` + `CHANGELOG.md` 同步 / 真实库副本迁移复核 / 归档）。一句话结论：
+>   **回答「GC 发生在哪条命令之后」**——同桶同会话覆盖 100%、真实库副本 v4 → v5 迁移零丢失；但**命令维度覆盖率
+>   有限**（实测 **37/45 = 88.1% 落 `<none>`**，因为 GC 多发生在命令循环**等待输入**的窗口，不是启动期 / batch），
+>   故本表主要给 mode 维度与「命令执行期 GC」用。目标里「用 29.6% 的 `Automatic GC` 栈样本对照解释」只部分达成：
+>   全库实测 **38.28%** 且口径不可换算（栈样本数 vs GC 事件计数），三层原因记在计划与 `tech-debt.md`。
 >
 > 归档纪律：计划在 Phase 4 完成后移入 `completed/`（文件名不变，便于 cross-reference），并同步更新本段与
 > `Readme.org`「当前状态」。
 >
-> 全部计划均已归档（`openspec/completed/` 共 **9** 份）：`el-chronos-core.md`、`expand-observation-surface.md`、
+> 全部计划均已归档（`openspec/completed/` 共 **10** 份）：`el-chronos-core.md`、`expand-observation-surface.md`、
 > `add-drift-detection.md`、`add-use-package-support.md`、`remove-dashboard-web-only.md`、
 > `fix-web-block-suppression.md`、`fix-sampling-attribution.md`、`startup-probe-and-resources.md`、
-> `2026-10-26-compact-observability.md`（2026-10-24 / 2026-10-25 / 2026-10-26）。
+> `2026-10-26-compact-observability.md`、`gc-attribution.md`（2026-10-24 / 2026-10-25 / 2026-10-26）。
 >
-> **技术债现状**：`openspec/tech-debt.md` 编号已到 **TD-28**，本批新增 / 改写四条 —— **TD-25**（`make test` 在仓库根
-> 泄漏临时目录）、**TD-26**（命令执行窗口内的采样栈未按命令边界切分）、**TD-27**（`hourly_resources` 缺独立 `rss_n`，
-> RSS 均值分母复用 `load_n`）、**TD-28**（`cpu_ms` / `wall_ms` 是 `NOT NULL DEFAULT 0`，`cpu_pct = 0` 有「未采集 /
-> 真空闲」两义，彻底区分需 schema v5）；TD-16 已改为「已由 early-init 探针正面处置」（**是改写，不是删除**）。
+> **技术债现状**：`openspec/tech-debt.md` 编号已到 **TD-35**。本批结清与新增四条 —— **TD-32 改写**（GC 归因 command
+> 维度覆盖率有限：`<none>` 的成因是「GC 时刻没有正在执行的命令」，含命令循环**等待输入** / idle timer / 进程过滤器，
+> 实测 37/45 = 88.1%，**不再**主张「此时 `this-command` 是上一条命令」）、**TD-33**（归因键用 `this-command`，与
+> `commands.name` 的 `real-this-command` 口径不一致；低优先，不会降低 `<none>` 占比）、**TD-34**（Org 里 `="…"=` 被写成
+> `=\"…\"=`：`docs/architecture.org` 已修，`docs/schema.org` 仍有 6 行同类待下批处理）、**TD-35**（`--post-gc`
+> docstring 的「唯一分配」措辞不精确，实为 1–2 个中间 float；低优先）；GC 归因的其余口径见 **TD-31**（`sum ≤ total`，
+> 禁做等式校验；**是改写，不是删除**）。
 
 
 文档与代码同步：改接口/改 schema 必须同时更新 `docs/schema.org` 与 ADR 相关条目；

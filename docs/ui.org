@@ -183,11 +183,14 @@
 ** 「GC 归因」节的标题与首行为什么必须带限定语（v5）
 
 节标题是 **「GC 归因（发生在哪条命令之后）」**，正文首行固定为
-=本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；在 idle / 进程过滤器里
-this-command 为上一条命令。= —— 这两处限定**不可删改**：归因键是 GC 时刻的
-=this-command= × =major-mode=，在 idle timer / 进程过滤器 / redisplay 里 =this-command=
-仍是上一条命令（滞后），启动期与 batch 下是 ="<none>"=。缺了限定，读者会把「save-buffer
-之后发生了 6 次 GC」读成「save-buffer 导致 6 次 GC」。
+=本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；GC 时刻没有正在执行的命令时
+（启动期、batch、命令循环等待输入期间，含 idle timer / 进程过滤器回调）this-command
+取不到值，一律归 "<none>"，故按命令的覆盖率有限。=—— 这两处限定**不可删改**：归因键是 GC 时刻的
+=this-command= × =major-mode=，**GC 时刻没有正在执行的命令时**它就是 nil（启动期、batch、
+以及命令循环**等待输入**期间，含 idle timer / 进程过滤器回调），一律归哨兵 ="<none>"=。
+本机实测 45 次归因中 **37 次（88.1%）** 落 ="<none>"=（主要是交互会话），故按命令的覆盖率
+有限。缺了限定，读者会把「save-buffer 之后发生了 6 次 GC」读成「save-buffer 导致 6 次 GC」；
+反过来把 ="<none>"= 读成采集 bug 也是误读。
 
 配套的两条口径：① =hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻（跨小时误差 ≤1 个
 采样窗口）；② =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=，差值 = hook 安装前 /

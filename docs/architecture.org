@@ -182,7 +182,7 @@ after a full GC cycle」——即它**只读、不做**。**禁止调 =garbage-c
    =symbol-name= / =prin1-to-string=。=post-gc-hook= 在 GC 刚清空堆之后执行，任何分配都会
    把**下一次** GC 提前，形成自我加速 —— 观测器反过来制造它要观测的东西。
 4. **字符串转换与落库都在 10 秒采样 tick 的 flush 路径**（=--flush-gc-attrib= →
-   =el-chronos-store-record-gc-attrib=）：symbol → 字符串、nil → =\"<none>\"=、=hour_ts= 取
+   =el-chronos-store-record-gc-attrib=）：symbol → 字符串、nil → ="<none>"=、=hour_ts= 取
    **flush 时刻**的整点，最后经批量缓冲与其余 =hourly_*= 同事务提交（故「库里有值 ⇔ 本批已
    提交」严格同态）。
 5. **重入守卫** =--gc-attrib-busy=：hook 自身若被间接再触发（例如误在 hook 里分配导致新
@@ -190,9 +190,11 @@ after a full GC cycle」——即它**只读、不做**。**禁止调 =garbage-c
 
 **三条已知边界（不得含糊，报告与 API 文档同口径）**：
 
-1. 「GC **发生在**哪条命令之后」≠「哪条命令**导致** GC」：GC 可能发生在 idle timer /
-   进程过滤器 / redisplay 里，此时 =this-command= 是**上一条**命令，存在滞后；启动期与 batch
-   下 =this-command= 为 nil，记 =\"<none>\"=。
+1. 「GC **发生在**哪条命令之后」≠「哪条命令**导致** GC」：归因键是 GC 时刻的
+   =this-command= × =major-mode=，**GC 时刻没有正在执行的命令时**（启动期、batch、命令循环
+   **等待输入**期间，含 idle timer / 进程过滤器回调）=this-command= 为 nil，一律记
+   ="<none>"=。本机实测 45 次归因中 **37 次（88.1%）** 落该哨兵（主要在交互会话，不是启动期
+   / batch），因此**按命令的覆盖率有限** —— 命令维度主要给「命令执行期 GC」用，mode 维度更稳。
 2. =hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻：跨小时边界时归因可能落到相邻小时，
    误差 ≤1 个采样窗口（默认 10 秒）。
 3. =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=：差值 = hook 安装前 / 采集窗口外的

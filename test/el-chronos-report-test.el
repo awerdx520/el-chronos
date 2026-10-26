@@ -349,11 +349,16 @@
         (should (string-match-p "^\\* GC 归因（发生在哪条命令之后）$" empty))
         (should (string-match-p "尚无 GC 归因数据（schema v5 起采集，需运行一段时间）" empty))
         (should-not (string-match-p "| 命令 | 次数 | GC 耗时(ms) | 占比 |" empty))
-        ;; 语义限定首行必须原样出现：三要素（发生在之后≠导致 / idle 滞后 / this-command）
+        ;; 语义限定首行必须原样出现：三要素（发生在之后≠导致 / 无命令时 this-command
+        ;; 取不到值 / 归 <none> 故按命令覆盖率有限）
         (should (string-match-p
                  (concat "本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；"
-                         "在 idle / 进程过滤器里 this-command 为上一条命令。")
+                         "GC 时刻没有正在执行的命令时（启动期、batch、命令循环等待输入期间，"
+                         "含 idle timer / 进程过滤器回调）this-command 取不到值，"
+                         "一律归 \"<none>\"，故按命令的覆盖率有限。")
                  empty))
+        ;; 反向守门：不得再出现「idle 里 this-command 是上一条命令」式滞后断言
+        (should-not (string-match-p "上一条命令" empty))
         ;; 位置：GC 与内存 → GC 归因 → 资源
         (let ((gc (string-match-p "^\\* GC 与内存$" empty))
               (attrib (string-match-p "^\\* GC 归因（发生在哪条命令之后）$" empty))
