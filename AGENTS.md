@@ -26,9 +26,15 @@ GC 次数/耗时与堆大小趋势、启动阶段分解、`git-head` / `config-s
 **启动探针 + 资源观测已落地**（ADR-0006）：schema **v4 增 `hourly_resources`（共 12 表）**——进程 CPU / RSS /
 线程数 / 系统负载按小时桶累积；启动探针独立成**零依赖**文件 `el-chronos-startup-probe.el`（由用户在
 `early-init.el` 显式 `(load … t)`，因此能测到 init 主体）、资源采集复用既有 10 秒采样 timer（TRAMP 守卫、
-逐字段降级）；analysis **21** 个查询（新增栈包含归因 `inclusive-functions` 与 `resource-trend` /
-`resource-summary`）/ Web **19** 条路由（新增 `/api/resources`）/ org 报告 **15 节**（新增「资源（CPU / 内存 /
-负载）」节；「栈包含占比 TOP」是「热点函数」节内的 `**` 子小节，**不增节**；drift 摘要仍嵌在「阻塞事件」节内）。
+逐字段降级）；analysis **22** 个只读分析函数（另有 `names` 作为补全辅助，不计入；口径：
+22 = 23 个 public defun 减去 `names` 补全辅助）（新增栈包含归因 `inclusive-functions`、`resource-trend` /
+`resource-summary` 与 **GC 归因 `gc-attribution`**）/ Web **19** 条路由（新增 `/api/resources`）/ org 报告 **16 节**
+（新增「资源（CPU / 内存 / 负载）」与「**GC 归因（发生在哪条命令之后）**」两节；「栈包含占比 TOP」是
+「热点函数」节内的 `**` 子小节，**不增节**；drift 摘要仍嵌在「阻塞事件」节内）。
+**GC 归因已落地**（`openspec/active/gc-attribution.md`）：schema **v5 增 `hourly_gc_attrib`（共 13 表）**——
+`post-gc-hook` 把每次 GC 按 `this-command` × `major-mode` 归因（hook 热路径**零分配**，字符串转换推迟到
+10 秒窗口 flush）；表回答「GC **发生在**哪条命令之后」而非「哪条命令**导致** GC」，且
+`sum(gc_attrib.gc_count) ≤ hourly_gc.gc_count`（差值 = hook 安装前 / 采集窗口外的 GC，**禁做等式校验**）。
 8 个源码模块 + 9 个测试文件 + 5 份技术文档齐备；可视化已收敛为浏览器 Web dashboard + org 报告两形态（ADR-0003）。
 剩余项是仍待实测的性能/覆盖率数字与 D1 的 GUI 实机验证（见 `openspec/tech-debt.md`）。
 计划见 `openspec/completed/el-chronos-core.md`（2026-10-24 归档）；
@@ -38,33 +44,34 @@ use-package 适配计划见 `openspec/completed/add-use-package-support.md`（T1
 启动探针 + 资源观测计划见 `openspec/completed/startup-probe-and-resources.md`（T1–T9 全部完成，ADR-0006，2026-10-26 归档）；
 观测能力收敛计划见 `openspec/completed/2026-10-26-compact-observability.md`（栈包含归因 + `kind='command'` 的
 `stack_json` 不再记自身栈，T1–T5 全部完成，2026-10-26 归档）。
-**当前 `openspec/active/` 为空**（只剩 `.gitkeep`）——两个计划均已归档，详见「文档治理」段。
+**当前 `openspec/active/` 有 1 个计划**：`openspec/active/gc-attribution.md`（GC 归因，schema v5；
+C1a / C1b 已完成，C1c 收尾中，待全量验证后归档），详见「文档治理」段。
 
 ## 目录结构
 
 | 路径 | 用途 | 行数 / 状态 |
 |---|---|---|
 | `el-chronos.el` | 自定义组、minor mode、启停编排、错误降级 | 421 行 / 21 defcustom（项目合计 23） |
-| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、**资源采集（CPU / RSS / 线程 / 系统负载）**、启动打点（**含探针交接**）、自监控计数 | 1541 行 |
+| `el-chronos-collect.el` | 命令计时、心跳「命令外停转」两档判定（含 D1 双跑去重、`--heartbeat-check` 单一判定入口）、profiler 窗口聚合、GC / 堆采样、**`post-gc-hook` GC 归因（内存二级 hash + 零分配热路径）**、**资源采集（CPU / RSS / 线程 / 系统负载）**、启动打点（**含探针交接**）、自监控计数 | 1687 行 |
 | `el-chronos-attrib.el` | 符号→文件→包/模块；命令上下文 | 343 行 |
-| `el-chronos-store.el` | SQLite schema（v4，12 表 + 3 索引）、批量 flush、drift 小时聚合、**资源小时聚合**、保留策略、top-N 淘汰、purge 12 表 | 1665 行 |
-| `el-chronos-analysis.el` | 21 个只读聚合查询（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/**栈包含归因**/会话/回归/GC/启动/健康/配置变更/**资源趋势与汇总**） | 1112 行 |
-| `el-chronos-report.el` | org 报告（15 节，含「阻塞事件」节内的 drift 汇总行、「热点函数」节内的 `** 栈包含占比 TOP` 子小节、「资源」节）、周报、CSV/JSON 导出（10 个区块）、按需高精度剖析、报告期间自观测抑制 | 1347 行 |
+| `el-chronos-store.el` | SQLite schema（v5，13 表 + 3 索引）、批量 flush、drift 小时聚合、**资源小时聚合**、**GC 归因小时聚合**、保留策略、top-N 淘汰、purge 13 表 | 1828 行 |
+| `el-chronos-analysis.el` | 22 个只读分析函数（另有 `names` 作为补全辅助，不计入）（热点/慢命令/阻塞/命令外停转/包归因/趋势/热力/栈/**栈包含归因**/会话/回归/GC/**GC 归因**/启动/健康/配置变更/**资源趋势与汇总**） | 1254 行 |
+| `el-chronos-report.el` | org 报告（16 节，含「阻塞事件」节内的 drift 汇总行、「热点函数」节内的 `** 栈包含占比 TOP` 子小节、「资源」与「**GC 归因**」节）、周报、CSV/JSON 导出（10 个区块）、按需高精度剖析、报告期间自观测抑制 | 1401 行 |
 | `el-chronos-web.el` | 最小 HTTP server（19 条路由 = 1 页 + 17 条只读 GET API + 1 CSV）+ 内嵌 Web dashboard（HTML/CSS/JS 字符串） | 1267 行 |
 | `el-chronos-startup-probe.el` | **零依赖**启动探针：`early-init` / `after-init` / `startup` 三锚点 + 按库累计的 `after-load-functions` 时间差；只写内存、不开库不写库；三条自证收尾路径（`emacs-startup-hook` / `load-count` 800 / `after-init` 30 秒兜底 timer） | 318 行 |
 | `test/el-chronos-test-helper.el` | ERT 公共夹具（临时库、fixture 数据、断言辅助） | 198 行 |
-| `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史 / drift 趋势 / **栈包含归因 / 资源趋势与汇总**） | 1087 行 / 47 用例 |
+| `test/el-chronos-analysis-test.el` | analysis 查询与回归判定 fixture 断言（含 GC 趋势 / 启动分解 / 健康 / 配置历史 / drift 趋势 / **栈包含归因 / 资源趋势与汇总 / GC 归因（command 与 mode 两维度）**） | 1277 行 / 57 用例 |
 | `test/el-chronos-attrib-test.el` | 归因链与上下文（basename 不出现 `/` 断言） | 371 行 / 28 用例 |
 | `test/el-chronos-autoload-test.el` | autoload 契约：cookie 覆盖 16 个 interactive 命令（计数不变量）、生成物让命令 `autoloadp`、库名等于定义文件 | 295 行 / 3 用例 |
-| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控、**探针交接与资源采集降级** | 1947 行 / 79 用例 |
-| `test/el-chronos-report-test.el` | org 报告 15 节、阻塞事件节内的 drift 汇总行、热点函数节内的栈包含子小节、**资源节**、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 884 行 / 38 用例 |
+| `test/el-chronos-collect-test.el` | 命令三态、心跳阻塞、抑制期间心跳不判定、阻塞提示三取值（nil / `messages` / t）、**命令外两档阈值（block / drift）与 `--finish` 重置基线**、`--pre-command` 补判、采样聚合、TD-9 局部 hook、D1 双跑去重、nil 帧与 C 原语归因、GC / 启动打点 / 自监控、**探针交接与资源采集降级**、**`post-gc-hook` 归因（差值 / 零分配 / 装配拆除）** | 2195 行 / 87 用例 |
+| `test/el-chronos-report-test.el` | org 报告 16 节、阻塞事件节内的 drift 汇总行、热点函数节内的栈包含子小节、**资源节与 GC 归因节**、周报、CSV/JSON 导出、单命令剖析 `--invoke` 三形态、`el-chronos-show-event` 交互命令、Web 500 与端口 0、CSV 区块与 Web 输出一致 | 927 行 / 39 用例 |
 | `test/el-chronos-startup-probe-test.el` | 探针：三锚点记录、`after-load` 差值、`take` 增量语义（`anchors` 只读、`loads` 取走即清空）、无 `before-init-time` 不崩、异常吞掉 | 342 行 / 16 用例 |
-| `test/el-chronos-store-test.el` | schema/迁移（v0→v4、v1→v4、v2→v4、v3→v4 四条守门与回滚）/批量写入/drift 与**资源**聚合/保留策略/top-N 淘汰/purge 12 表/`note-startup-ms` 补写 | 1904 行 / 68 用例 |
+| `test/el-chronos-store-test.el` | schema/迁移（v0→v5、v1→v5、v2→v5、v3→v5、v4→v5 五条守门与回滚）/批量写入/drift、**资源**与 **GC 归因**聚合/保留策略/top-N 淘汰/purge 13 表/`note-startup-ms` 补写 | 2290 行 / 80 用例 |
 | `test/el-chronos-web-test.el` | 内嵌 Web server（启停/路由/边界/loopback/自观测抑制/四个 v2 端点 + `/api/drift` + **`/api/resources`**/浏览器自动打开三形态） | 694 行 / 25 用例 |
-| `docs/architecture.org` | 分层、六条采集路径（路径 3 = 心跳两档判定 + 三处调用点）、**启动探针（early-init 路径）**、**资源采集（路径 6 扩展）**、可视化数据流、**实测结论**、已知偏差 | 781 行 |
-| `docs/schema.org` | 最终 DDL（**12 表 + 3 索引**）、迁移链 v0/v1/v2/v3 → v4（含迁移链陷阱）、top-N 淘汰 SQL、保留分类、purge 12 表删除顺序、**`hourly_resources` 的 `cpu_pct = 0` 两义（TD-28）** | 761 行 |
-| `docs/ui.org` | 两形态总览（浏览器 Web dashboard + org 报告）、**19 条 Web 路由**、org 报告 **15 节**、性能注意与降级规则 | 261 行 |
-| `docs/api.org` | elisp 对外接口索引（**8 个模块 / 23 个 defcustom** 清单）、签名单、内部函数约定 | 404 行 |
+| `docs/architecture.org` | 分层、七条采集路径（路径 3 = 心跳两档判定 + 三处调用点）、**启动探针（early-init 路径）**、**资源采集（路径 6 扩展）**、**GC 归因支路（post-gc-hook）**、可视化数据流、**实测结论**、已知偏差 | 817 行 |
+| `docs/schema.org` | 最终 DDL（**13 表 + 3 索引**）、迁移链 v0/v1/v2/v3/v4 → v5（含迁移链陷阱）、top-N 淘汰 SQL、保留分类、purge 13 表删除顺序、**`hourly_resources` 的 `cpu_pct = 0` 两义（TD-28）**、**`hourly_gc_attrib` 的四元主键与「主键含 NULL 让 upsert 静默失效」** | 848 行 |
+| `docs/ui.org` | 两形态总览（浏览器 Web dashboard + org 报告）、**19 条 Web 路由**、org 报告 **16 节**、性能注意与降级规则 | 277 行 |
+| `docs/api.org` | elisp 对外接口索引（**8 个模块 / 23 个 defcustom** 清单）、签名单、内部函数约定 | 406 行 |
 | `docs/operations.org` | 安装/卸载/数据清理/排障/**drift 调档指引**/验证步骤/隐私与保留表 | 581 行 |
 | `docs/adr/` | `0001-observer-architecture.md`、`0002-dual-visualization.md`（**已被 0003 取代**）、`0003-web-only-visualization.md`（可视化收敛为 Web dashboard + org 报告两形态）、`0004-observation-surface-expansion.md`（观测面扩展到内存/GC/启动/配置变更）、`0005-two-tier-block-detection.md`（两档阈值：block 明细 + drift 聚合，v3 schema）、`0006-resource-observation.md`（启动探针提前到 early-init + 资源维度观测，v4 schema） | 已完成 |
 | `openspec/` | 计划与决策工件（`active/`、`completed/`、`decisions.md`、`tech-debt.md`） | 已建 |
@@ -188,10 +195,10 @@ make full-check     # check-parens + test
 全部目标用 `emacs -Q --batch`，不依赖运行中的 daemon。`make autoloads` 在 Emacs 29.1+ 走
 `loaddefs-generate`，更早版本回退 `make-directory-autoloads`（ERT 用例同源守卫，不硬编码单一实现）。
 
-**当前基线**（实测 2026-10-26，T9 归档时重测）：`make test` = **304 用例**（`Ran 304 tests, 304 results as expected, 0 unexpected`，约 5.0 秒，**0 skipped**）；
-分布：collect 79 / store 68 / analysis 47 / report 38 / attrib 28 / web 25 / startup-probe 16 / autoload 3 用例；
-行数：store 1665 / collect 1541 / report 1347 / web 1267 / analysis 1112 / 入口 421 / attrib 343 / startup-probe 318（源码 8 模块 **8014 行**）；
-测试：collect 1947 / store 1904 / analysis 1087 / report 884 / web 694 / attrib 371 / startup-probe 342 / autoload 295 / helper 198（测试 9 文件 **7722 行**）；源码 + 测试合计 **15736 行**。
+**当前基线**（实测 2026-10-26，C1c 收尾时重测）：`make test` = **335 用例**（`Ran 335 tests, 335 results as expected, 0 unexpected`，约 5.1 秒，**0 skipped**）；
+分布：collect 87 / store 80 / analysis 57 / report 39 / attrib 28 / web 25 / startup-probe 16 / autoload 3 用例；
+行数：store 1828 / collect 1687 / report 1401 / web 1267 / analysis 1254 / 入口 421 / attrib 343 / startup-probe 318（源码 8 模块 **8519 行**）；
+测试：store 2290 / collect 2195 / analysis 1277 / report 927 / web 694 / attrib 371 / startup-probe 342 / autoload 295 / helper 198（测试 9 文件 **8589 行**）；源码 + 测试合计 **17108 行**。
 `make lint` **零告警**（17 个文件逐个字节编译，含 `test/*.el`；`el-chronos-autoloads.el` 由 `EL_FILES` 排除，不在检查范围）。
 新增或修改行为时基线只准上升，改测试要说明原因。
 

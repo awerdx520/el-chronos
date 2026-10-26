@@ -4,7 +4,8 @@
 
 - 阶段：Phase 4（Review & Document）· **已完成并归档**（2026-10-26）
 - 已确认：方案 ✅（用户 2026-10-26 确认）、计划 ✅（用户 2026-10-26 确认）、独立审查 ✅（复审通过：首轮 2 项 blocking 全部实质解决，未引入新矛盾）
-- **范围排除**（保持）：GC 归因（`post-gc-hook` + 新表 + schema 迁移）不在本计划内——本计划**不改 schema、不加表、不做迁移**，已由 v4 改造独立完成资源维度
+- **范围排除**（保持）：GC 归因（`post-gc-hook` + 新表 + schema 迁移）不在本计划内——本计划**不改 schema、不加表、不做迁移**。
+  - **更正（2026-10-26）**：原措辞「已由 v4 改造独立完成资源维度」会被误读为「GC 归因已交付」。事实上 v4 完成的是**进程级资源维度**（`hourly_resources`：CPU / RSS / 负载），与「谁触发 GC」**正交**，不构成对 GC 归因的交付。GC 归因已由用户另行决定实施，见 `openspec/active/gc-attribution.md`。
 - 结果：**T1–T5 全部完成**（T1 / T2 由本移交落盘，T3 / T4 / T5 由本仓 v4 改造流程结清，见下「任务」段与「移交说明」）
 - 最终基线：**304 用例全绿、lint 零告警、check-parens 通过**（`make full-check` 实测 `Ran 304 tests, 304 results as expected, 0 unexpected`）
 - 归档时已知残留：**TD-26**（命令执行窗口内的采样栈未按命令边界切分——`slow_events.stack_json` 对 `kind='command'` 恒 NULL，`--current-stack` 保留但无生产调用者）、**TD-28**（`cpu_pct = 0` 的两义问题，与本计划的「数据诚实性」主题同源，需 schema v5）
@@ -194,7 +195,7 @@ GROUP BY function HAVING s = 0 ORDER BY function LIMIT 30;
 
 ### 待办（由本仓 v4 流程处理）
 
-> **以上待办已于 2026-10-26 全部完成**（下列条目保留为历史记录，完成情况逐条标注）。
+> 以上待办已于 2026-10-26 完成；唯一仍开放的是第 6 条决策项，现已于同日决出（见下）。
 
 1. **report 小节**：`el-chronos-report.el` 增加「栈包含占比 TOP N」，消费新函数
 2. **文档同步**：
@@ -205,7 +206,9 @@ GROUP BY function HAVING s = 0 ORDER BY function LIMIT 30;
 3. **CHANGELOG**：标注 `stack_json` 行为变更（从「有值但无意义」→「恒 NULL」）；任何消费该字段的外部脚本会看到差异
 4. **tech-debt 登记**：「命令执行窗口内的采样栈未按命令切分」为后续候选（当前 `--current-stack` 保留但无生产调用者，理由见其 docstring）
 5. **`make full-check`**：必须在并发改动稳定后跑一次全量
-6. **决策项**：新函数是否接入 Web 路由 / org 报告（当前仅 analysis 层可用）
+6. **决策项 —— 已决（2026-10-26）**：新函数**只接入 org 报告，不接入 Web**。
+   - org：`el-chronos-report.el` 的「热点函数」节内以 `** 栈包含占比 TOP` 子小节呈现（刻意不增节：self 榜与包含榜的差异本身就是结论）。
+   - Web：**不接入**。理由：Web 面板已 19 条路由，栈包含属「按需深查」的分析型数据，其价值依赖与 self 榜并排阅读（Web 侧布局做不到并排），且该数据本身可由 `/api/top-functions` + 本地 SQL 得到。若将来要接入，须先解决「self 榜与包含榜并排」的布局问题。
 
 ### 交接时的环境事实（接手方必读）
 

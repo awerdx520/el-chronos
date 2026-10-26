@@ -1,4 +1,4 @@
-;;; el-chronos-collect.el --- 命令计时、心跳阻塞与采样聚合  -*- lexical-binding: t; -*-
+;;; el-chronos-collect.el --- 命令计时、心跳阻塞、采样聚合与 GC 归因  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Thomas
 
@@ -24,6 +24,12 @@
 ;;       （近似归因），加 3 个确定性阶段锚点（`mode-start' / `after-init' / `startup'）
 ;;       与 1 个可选锚点（`first-idle'）；摘钩用确定性三元，且**启动已结束时一个钩子都不挂**
 ;;       （否则日常加载会被冒充成启动耗时）。
+;;   T6b GC 归因：`post-gc-hook' 把每次 GC 归到「**发生在**哪条命令之后 / 哪个 mode 里」
+;;       （不是「哪条命令**导致**」），累积进二级 `eq' 哈希
+;;       （command → mode → `[gc-count gc-ms]'），随采样窗口交给 store 累加到
+;;       `hourly_gc_attrib'。hook 热路径**禁止字符串分配**（GC 刚清空堆，任何分配都会把
+;;       下一次 GC 提前）；与 `hourly_gc' 的关系只是 `sum(attrib) ≤ gc_count'，
+;;       差值来自 hook 安装前的 GC 与最后一次 flush 之后未结算的 GC。
 ;;
 ;; 采集路径上的一切异常都必须吞掉（I6）：子步骤失败只 `display-warning'（10 分钟限流），
 ;; 不得中断命令循环、不得终止 timer。
@@ -155,6 +161,8 @@
 (declare-function el-chronos-store-record-startup-phase "el-chronos-store"
                   (session-id phase ms))
 (declare-function el-chronos-store-record-drift "el-chronos-store" (hour-ts gap-ms))
+(declare-function el-chronos-store-record-gc-attrib "el-chronos-store"
+                  (hour-ts session-id command mode gc-count gc-ms))
 (declare-function el-chronos-store-note-startup-ms "el-chronos-store" (ms))
 (declare-function el-chronos-store-record-resources "el-chronos-store" (hour-ts plist))
 ;; 启动探针是**可选**的零依赖侧文件（用户在 `early-init.el' 里显式 load）：
@@ -280,6 +288,27 @@ TOTAL 统计「该函数在某条栈里出现过」的样本数（同一栈内�
 
 (defvar el-chronos-collect--window-stacks (make-hash-table :test #'equal)
   "本窗口的调用栈累计表：栈的 JSON 字符串 → 样本数。")
+
+(defvar el-chronos-collect--gc-attrib-last-done nil
+  "上次记录的 `gcs-done' 值；nil 表示尚未建立基线。用两个独立整数而非 cons，
+避免在 `post-gc-hook' 里分配 cons。")
+
+(defvar el-chronos-collect--gc-attrib-last-elapsed nil
+  "上次记录的 `gc-elapsed' 值（秒，float）。")
+
+(defvar el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq :size 64)
+  "GC 归因缓冲：**二级** `eq' 哈希 —— 外层 key 是 command symbol，内层 hash 的 key
+是 mode symbol，value 是 `[gc-count gc-ms]' 向量。
+用二级表而非 `(cons command mode)' 作键：`post-gc-hook' 里每次分配 cons 都会让
+下一次 GC 提前。内层表与向量只在**首次**遇到某个 command/mode 组合时分配。
+
+内层表数量 = 10 秒窗口内出现过的不同 command 数，flush 时随外层一起清空；
+不设显式上限——窗口只有 10 秒，正常负载下为数个到数十个。若不设上限仍担心
+异常场景（插件生成海量匿名命令符号），可改为在 `--post-gc' 里对 `hash-table-count'
+超过阈值时直接跳过记录（当前未做，属已知残余风险）。")
+
+(defvar el-chronos-collect--gc-attrib-busy nil
+  "递归/重入守卫：hook 执行期间置 t。")
 
 ;;; 小工具
 
@@ -968,7 +997,12 @@ GC 与内存趋势会一起陪葬，而它正是「是不是越用越胖」的�
 
 入口第一件事是 `--check-sample-window'：判定「上一个窗口是否整窗丢失」（主线程被占住期间
 timer 不触发，那段时间没有任何采样数据），丢则把 `sample-misses' 记进 `hourly_health'。
-它与 profiler、GC 都无关，故同样放在 `sampling-p' 之外。"
+它与 profiler、GC 都无关，故同样放在 `sampling-p' 之外。
+
+GC 归因缓冲（`--gc-attrib-buffer'，由 `post-gc-hook' 在内存里累积）也在这里交给 store
+（`--flush-gc-attrib'）：归因的采集点是全局 hook，与 profiler 毫无关系，故同样在
+`sampling-p' 之外。**不新开 timer** —— 复用本窗口的 10 秒节奏，归因粒度天然是「一个
+采样窗口聚合一次」。"
   (condition-case err
       (progn
         ;; 先判定「上一个窗口是否整窗丢失」（自监控，与 profiler / GC 都无关）
@@ -977,6 +1011,9 @@ timer 不触发，那段时间没有任何采样数据），丢则把 `sample-mi
         (el-chronos-collect--collect-gc)
         ;; 进程资源（CPU / RSS / 线程 / 负载）：同样不依赖 profiler，理由同上
         (el-chronos-collect--collect-resources)
+        ;; GC 归因（`post-gc-hook' 累积的内存缓冲）：同样不依赖 profiler —— hook 是否被
+        ;; 触发与 profiler 无关，绑在 `sampling-p' 内会让 profiler 失败时归因永远不落库
+        (el-chronos-collect--flush-gc-attrib)
         (when el-chronos-collect--sampling-p
           (el-chronos-collect--accumulate (profiler-cpu-log))
           (el-chronos-collect--flush-window)))
@@ -984,7 +1021,106 @@ timer 不触发，那段时间没有任何采样数据），丢则把 `sample-mi
      ;; 异常时也要清空窗口，避免脏数据滚进下一个窗口
      (ignore-errors (clrhash el-chronos-collect--window-self))
      (ignore-errors (clrhash el-chronos-collect--window-stacks))
+     (ignore-errors (clrhash el-chronos-collect--gc-attrib-buffer))
      (el-chronos-collect--warn "采样窗口聚合失败：%S" err)))
+  nil)
+
+;;; GC 归因（post-gc-hook）
+
+(defun el-chronos-collect--post-gc ()
+  "记录本次 GC 的归因（`post-gc-hook'）。
+**分配约束（硬）**：本函数体内禁止字符串类分配 —— 不得出现 `format' / `concat' /
+`number-to-string' / `symbol-name' / `prin1-to-string'。原因：`post-gc-hook' 在 GC
+之后立即运行，此时堆刚清空，任何分配都会直接计入下一次 GC 的阈值，形成自我加速。
+`gc_ms' 的差值计算不可避免会产生一个 float，这是本函数唯一的分配（每次 GC ≤1 个），
+已在测试中以「允许 float、禁止字符串」的口径锁定。
+
+首次调用只建立基线、不记录 —— 否则会把「启动至今的全部 GC」算给当时那条命令。
+归因键取 `this-command' 与 `major-mode'，两者都可能为 nil（启动期 / idle timer /
+进程过滤器），store 层会把 nil 归一为 \"<none>\"。
+
+语义：记录的是「GC **发生在**哪条命令之后」，不是「哪条命令**导致**」GC —— GC 可能
+发生在 idle timer / 进程过滤器里，此时 `this-command' 是**上一条**命令，存在滞后；
+启动期归因为 \"<none>\"。调用方不得把它读成因果归因，也不得写
+`sum(hourly_gc_attrib.gc_count) = hourly_gc.gc_count' 这样的等式：归因只覆盖
+「hook 已安装且落在某个采样窗口内」的那部分 GC，差值是 hook 安装前的 GC 与
+「最后一次 flush 之后未结算」的 GC，故只成立 ≤ 关系。
+
+累积形态是**二级 `eq' 哈希**（command → mode → `[gc-count gc-ms]' 向量）：
+hook 热路径上只在首次遇到某个组合时分配内层表与向量，之后只做 `aset' 原地累加，
+不产生 cons（用 `(cons command mode)' 作键的话每次 GC 都要分配一个 cons）。
+异常一律 `ignore-errors' 静默吞掉 —— 此处**不得**调 `el-chronos-collect--warn'
+（它会 `format'），这是 I6 的降级要求与分配约束的交集。
+
+重入时（`--gc-attrib-busy' 为 t）直接返回且**不推进基线**——那一次 GC 不会丢失，
+它会被并入下一次正常触发的差值里，归因到下一次的 `this-command'。放弃记录比在
+重入路径里承担分配风险更安全。"
+  (unless el-chronos-collect--gc-attrib-busy
+    ;; 重入守卫：hook 内若又触发 GC（理论上被 `gc-cons-threshold' 抑制，但不赌），
+    ;; 直接放弃本次记录，避免递归。
+    (let ((el-chronos-collect--gc-attrib-busy t))
+      (ignore-errors
+        (let ((done gcs-done) (elapsed gc-elapsed)
+              (last-done el-chronos-collect--gc-attrib-last-done)
+              (last-elapsed el-chronos-collect--gc-attrib-last-elapsed))
+          (cond
+           ((or (null last-done) (null last-elapsed))
+            (setq el-chronos-collect--gc-attrib-last-done done
+                  el-chronos-collect--gc-attrib-last-elapsed elapsed))
+           (t
+            ;; `gcs-done' / `gc-elapsed' 正常单调递增；若被外部重置（`gcs-done' 变小），
+            ;; 差值为负会被下面的 `(> count 0)' 挡掉，但基线已推进到新值——理论上会少算
+            ;; 一段 GC。属极端场景，不额外处理。
+            (let ((count (- done last-done))
+                  (ms (* 1000.0 (- elapsed last-elapsed))))
+              (setq el-chronos-collect--gc-attrib-last-done done
+                    el-chronos-collect--gc-attrib-last-elapsed elapsed)
+              (when (> count 0)
+                (let* ((cmd this-command)
+                       (md major-mode)
+                       (inner (gethash cmd el-chronos-collect--gc-attrib-buffer)))
+                  (unless inner
+                    (setq inner (make-hash-table :test #'eq :size 8))
+                    (puthash cmd inner el-chronos-collect--gc-attrib-buffer))
+                  (let ((cell (gethash md inner)))
+                    (cond (cell (aset cell 0 (+ (aref cell 0) count))
+                                (aset cell 1 (+ (aref cell 1) ms)))
+                          (t (puthash md (vector count ms) inner)))))))))))))
+  nil)
+
+(defun el-chronos-collect--flush-gc-attrib ()
+  "把 GC 归因缓冲交给 store 落库，然后清空。
+**不在 `post-gc-hook' 内调用**：这里可以分配（`symbol-name' 由 store 层做），
+只是不要污染 hook 的热路径。由采样窗口 tick 调用。
+
+键的归一交给 store（`el-chronos-store-record-gc-attrib' 把 symbol / nil 统一成字符串，
+nil → \"<none>\"）：采集层只做「原样搬运」，不在热路径或此处提前转字符串，
+否则同一组合会在归因表里出现 `foo' 与 \"foo\" 两行之外的额外分类负担。
+
+会话 ID 取**当前**会话（`el-chronos--session-id'，与 `--startup-finish' 同源）：
+store 的「会话行存在」校验是批次级的，键里的会话与之不符的归因行会在落库时被丢弃，
+故绝不能在这里缓存旧会话 ID。会话未建立时 store 侧自己跳过（每进程告警一次）。
+
+失败降级（I6）：逐条写库经 `el-chronos-collect--safe-apply'，单条失败不牵连其余；
+整体异常限流告警并清空缓冲（与本窗口聚合的「异常时清空、不滚进下一窗口」同口径）。"
+  (condition-case err
+      (let ((hour-ts (el-chronos-collect--hour-ts))
+            (session-id el-chronos--session-id))
+        (when (> (hash-table-count el-chronos-collect--gc-attrib-buffer) 0)
+          (maphash
+           (lambda (command inner)
+             (maphash
+              (lambda (mode cell)
+                (el-chronos-collect--safe-apply
+                 #'el-chronos-store-record-gc-attrib
+                 (list hour-ts session-id command mode
+                       (aref cell 0) (aref cell 1))))
+              inner))
+           el-chronos-collect--gc-attrib-buffer))
+        (clrhash el-chronos-collect--gc-attrib-buffer))
+    (error
+     (ignore-errors (clrhash el-chronos-collect--gc-attrib-buffer))
+     (el-chronos-collect--warn "GC 归因聚合失败（已丢弃本窗口）：%S" err)))
   nil)
 
 ;;; TD-9 buffer 局部 hook 补挂
@@ -1423,7 +1559,11 @@ mode 之后的加载（观测器无法观测自己被加载之前的事，TD-16�
 auto-buffer-local，只装默认值会被已有的局部绑定遮蔽（TD-9），而给「局部值含 `t'」的
 buffer 也补挂则会让同一命令双跑（D1）。
 幂等：已在运行时直接返回 t。各子步骤互不牵连——采样启动失败不影响命令计时与心跳，
-任何异常都不向宿主抛错（I6）。"
+任何异常都不向宿主抛错（I6）。
+
+GC 归因挂 `post-gc-hook'（**全局** hook，与 buffer 无关）；三个 `--gc-attrib-*' 变量
+在启动时归零 / 清空，保证首次 hook 只重建基线（否则会把「启动至今的全部 GC」算给当时
+那条命令）—— 与 `--gc-baseline' 同口径。"
   (interactive)
   (unless el-chronos-collect--running-p
     (add-hook 'pre-command-hook #'el-chronos-collect--pre-command)
@@ -1458,6 +1598,14 @@ buffer 也补挂则会让同一命令双跑（D1）。
           el-chronos-collect--heap-tick-counter 0)
     ;; 资源基线：同上，首个窗口只建基线（见 `--collect-resources'）
     (setq el-chronos-collect--resource-baseline nil)
+    ;; GC 归因：`post-gc-hook' 是**全局** hook（与 buffer 无关），安装/移除必须严格配对
+    ;; （I5 零残留）；两个 baseline 置 nil 保证下一次 hook 只重建基线、不把「启动至今的
+    ;; 全部 GC」算给当时那条命令
+    (add-hook 'post-gc-hook #'el-chronos-collect--post-gc)
+    (setq el-chronos-collect--gc-attrib-last-done nil
+          el-chronos-collect--gc-attrib-last-elapsed nil
+          el-chronos-collect--gc-attrib-busy nil)
+    (clrhash el-chronos-collect--gc-attrib-buffer)
     (el-chronos-collect--start-sampling)
     ;; 启动打点（T6a）：先记 `mode-start' 锚点；启动已结束则一个钩子都不挂
     ;; （判据与理由见 `el-chronos-collect--startup-instrument'）
@@ -1472,6 +1620,9 @@ buffer 也补挂则会让同一命令双跑（D1）。
 **各 buffer 的局部值也不含**（`--hooked-buffers' 清空、`buffer-list-update-hook' 不含补挂函数）、
 `(profiler-cpu-running-p)' 为 nil、窗口 hash 为空、pending 清空、
 GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）、
+GC 归因归零（`post-gc-hook' 不含本模块函数、`--gc-attrib-buffer' 为空、
+`--gc-attrib-last-done' / `--gc-attrib-last-elapsed' /
+`--gc-attrib-busy' 均为 nil）、
 资源采集基线归零（`--resource-baseline' 为 nil）、
 采样窗口基线归零（`--last-sample-tick' 为 nil）、
 启动打点全部摘净（`after-load-functions' / `after-init-hook' / `emacs-startup-hook'
@@ -1511,6 +1662,10 @@ GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）
   (remove-hook 'buffer-list-update-hook #'el-chronos-collect--ensure-buffer-hooks)
   (remove-hook 'pre-command-hook #'el-chronos-collect--pre-command)
   (remove-hook 'post-command-hook #'el-chronos-collect--post-command)
+  ;; `post-gc-hook' 是全局 hook：摘函数与清缓冲必须同批（I5 零残留）；未 flush 的归因
+  ;; （≤1 个窗口）在这里丢弃 —— 此时会话正在关闭，写库只会得到孤儿行或被批次校验丢弃
+  (remove-hook 'post-gc-hook #'el-chronos-collect--post-gc)
+  (clrhash el-chronos-collect--gc-attrib-buffer)
   (el-chronos-collect--clean-buffer-hooks)
   (when (fboundp 'command-error-default-function)
     (ignore-errors
@@ -1525,6 +1680,9 @@ GC 采集状态归零（`--gc-baseline' 为 nil、`--heap-tick-counter' 为 0）
         el-chronos-collect--gc-baseline nil
         el-chronos-collect--heap-tick-counter 0
         el-chronos-collect--resource-baseline nil
+        el-chronos-collect--gc-attrib-last-done nil
+        el-chronos-collect--gc-attrib-last-elapsed nil
+        el-chronos-collect--gc-attrib-busy nil
         el-chronos-collect--pending-p nil
         el-chronos-collect--command-start nil
         el-chronos-collect--command-name nil

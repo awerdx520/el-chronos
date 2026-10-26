@@ -19,9 +19,9 @@
 |---|---|---|---|
 | 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 21 defcustom |
 | 归因 | =el-chronos-attrib.el= | 符号 → 源码文件 → 包 / 模块；命令上下文 | 4 |
-| 存储 | =el-chronos-store.el= | SQLite schema（v4，12 表）、批量 flush、保留与 purge | 17 |
+| 存储 | =el-chronos-store.el= | SQLite schema（v5，13 表）、批量 flush、保留与 purge | 17 |
 | 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合、GC / 资源 / 启动打点 | 2 + 1 defcustom |
-| 分析 | =el-chronos-analysis.el= | 21 个只读聚合查询 | 21 |
+| 分析 | =el-chronos-analysis.el= | 22 个只读分析函数（另有 =names= 作为补全辅助，不计入）；22 = 23 个 public defun 减去 =names= | 22 |
 | 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
 | Web | =el-chronos-web.el= | 最小 HTTP server（19 条只读 GET 路由）+ 内嵌 Web dashboard | 4（**零 defcustom**；=el-chronos-web-open-browser= 物理落位在 =el-chronos.el=，已计入入口模块的 21 个） |
 | 启动探针 | =el-chronos-startup-probe.el= | **零依赖**：early-init 起的加载打点 + 三个启动锚点（只写内存，不开库不写库） | 2 |
@@ -123,7 +123,7 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 | =el-chronos-store-record-session-meta= | =(SESSION-ID KEY VALUE)= | 无 | 写会话级元数据（v2，=git-head= / =config-sig=）。**直接 =sqlite-execute= 写入、不走缓冲**（每会话一次的冷路径，立即可见、不占缓冲、失败可独立告警）；=VALUE= 为 nil 时**不写行**。 |
 | =el-chronos-store-note-startup-ms= | =(MS)= | 无 | 登记待补写的 =sessions.startup_ms=，落库并入**下一次 flush 的既有事务**。**纯内存、零 IO**：不碰 sqlite、不告警、不登记 timer（见「内部函数约定」）。 |
 | =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 / v3 / v4 新表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
-| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含七张 =hourly_*= 与两张会话级表）：**共 12 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 12 表删除顺序」）。=BEFORE= 为 nil 时清空全部 12 张表。与自动 retention 的区别是连聚合一起删。 |
+| =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含七张 =hourly_*= 与两张会话级表）：**共 13 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 13 表删除顺序」）。=BEFORE= 为 nil 时清空全部 13 张表。与自动 retention 的区别是连聚合一起删。 |
 | =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
 
 #+BEGIN_SRC elisp
@@ -146,7 +146,7 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 一般**不直接调用**：由 =el-chronos-mode= 编排（=--start= / =--stop=）。单独加载 collect 时对
 store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
-* 分析模块（=el-chronos-analysis.el=，21 个查询）
+* 分析模块（=el-chronos-analysis.el=，22 个只读分析函数；另有 =names= 作为补全辅助，不计入）
 
 =RANGE= 取 ='1d= / ='7d= / ='30d=（按当前时刻倒推，上界含当前毫秒 +1 毫秒避免漏行），
 或显式半开区间 ='(START . END)=（epoch 毫秒）。全部只读，返回 plist 或 list of plist；
@@ -163,6 +163,8 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 | =el-chronos-analysis-gc-trend= | =(RANGE &optional BUCKETS)= | plist | **GC 与内存趋势（v2）**。=:range= =:bucket-span= =:buckets= =:gc-total= =:heap-latest=；=:buckets= 元素 =(:bucket :gc-count :gc-ms :heap-bytes)=。三条关键约定：① =:heap-bytes= 取桶内**按 =hour_ts= 升序最后一个非 NULL 值**（瞬时量：求和没意义、平均会被采样间隔拉偏），桶内全 NULL 时为 nil；② 只在 Emacs 31.1+ 有值（更低版本恒 nil，不是数据丢失）；③ 会话首个采样窗口只建基线，可能出现 =gc-count= / =gc-ms= 全 0 的桶（那是基线桶，不等于「没有发生 GC」）。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**，避免调用方判空分支分叉。 |
 | =el-chronos-analysis-resource-trend= | =(RANGE &optional BUCKETS)= | plist | **进程资源趋势（v4）**。=:range= =:bucket-span= =:buckets=，窗口级汇总 =:cpu-ms-total= =:wall-ms-total= =:cpu-pct-avg= =:rss-kb-max= =:rss-kb-avg= =:threads-max= =:load1-avg= =:load5-avg= =:load15-avg= =:samples=；=:buckets= 元素 =(:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max :load1-avg :load5-avg :load15-avg)=，按桶起点升序。三条口径：① =:cpu-pct= 必须先 =SUM(cpu_ms) / SUM(wall_ms)= 再算比值（各桶窗口总时长不同，不能对单窗比率取平均）；② RSS / 负载的均值分母是 **=load_n=**，为 0 时是 **NULL（渲染 =-=）而不是 0**（I11）；③ 均值为 NULL 时渲染 =-=，不造假象。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**。 |
 | =el-chronos-analysis-resource-summary= | =(RANGE)= | plist 或 =nil= | **进程资源汇总（v4，供概览卡片）**：=(:cpu-pct :cpu-ms :wall-ms :rss-kb-max :rss-kb-avg :threads-max :load1-avg :load5-avg :load15-avg :samples)=。各键口径与 =resource-trend= 的窗口级汇总字段**完全一致**（改动须两处同步，否则报告与 Web 给出两个数）。与 trend 的唯一差别：**无数据时返回 =nil=**（「窗口汇总类」查询的一致形态），因为概览卡片需要区分「无数据」与「有数据但全 0」；实现走一条 SQL 聚合，不把窗口内全部行搬进 Elisp。 |
+| =el-chronos-analysis-sampling-coverage= | =(RANGE)= | plist 或 =nil= | **采样覆盖率（v5）**：=`Σsamples × 采样间隔 / cpu_ms`=。只在 =hourly_functions= 与 =hourly_resources= **两侧都有数据的 =(hour_ts, session_id)= 桶**上计算——两张表覆盖时段可能差两个数量级，直接相除会得出荒谬结论。返回同时含 =:hours-covered=（实际参与计算的桶数）与 =:hours-requested=（窗口内有采样数据的桶数），**两者差得多即说明分母不齐、结论不可用**。=:cpu-pct= 取 =cpu_ms / wall_ms=（占单核，两种读法见 TD-28），分母为 0 时为 0.0。见 TD-29。 |
+| =el-chronos-analysis-gc-attribution= | =(RANGE &optional LIMIT DIMENSION)= | list of plist 或 =nil= | **GC 归因排行（v5）**：元素 =(:name :gc-count :gc-ms :pct)=。=DIMENSION= 取 =command=（默认）或 =mode=，即按「GC 发生在哪条命令之后」或「哪个 major-mode 里」聚合；=LIMIT= 默认 15，在 SQL 内截断。=:pct= 是该 name 的 =gc_count= 占**同维度** =gc_count= 总和的百分比，**分母取自截断前**（不受 LIMIT 影响，与 =inclusive-functions= 同款不变量）；两个维度的分组数不同，各自的百分比序列分别归一、不可互比。**语义限定（不得省略）**：本函数回答「GC **发生在**哪条命令之后」，**不是**「哪条命令**导致** GC」——GC 可能发生在 idle timer / 进程过滤器里，此时 =this-command= 是上一条命令，存在滞后；启动期与 batch 下为 ="<none>"=。因此 =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=，**只能比大小、禁做等式校验**（差值 = hook 安装前 / 采集窗口外的 GC）。另：=hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻（跨小时误差 ≤1 个采样窗口）。**新表无数据时返回 =nil=**（窗口排行类查询的一致形态）。 |
 | =el-chronos-analysis-heatmap= | =(RANGE &optional LIMIT)= | list of plist | 命令 × 时间桶热力；=(:bucket :command :count :duration-ms)= |
 | =el-chronos-analysis-stacks= | =(RANGE &optional LIMIT)= | list of plist | 调用栈排行；=(:stack :samples :pct)=，=:stack= 第 0 帧是 leaf；默认 50 |
 | =el-chronos-analysis-sessions= | =(RANGE)= | list of plist | 会话列表，按启动时间降序；=(:id :started-at :startup-ms :emacs-version :host)= |
@@ -186,7 +188,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
-| =el-chronos-report= | =(&optional RANGE)=，interactive | 报告 buffer | 生成（或刷新）=*el-chronos-report*= 只读 org 报告；默认 =7d=，**15 节**内容见 [[file:ui.org][docs/ui.org]]（「热点函数」节内的 =** 栈包含占比 TOP= 是**子小节、不增节**）。 |
+| =el-chronos-report= | =(&optional RANGE)=，interactive | 报告 buffer | 生成（或刷新）=*el-chronos-report*= 只读 org 报告；默认 =7d=，**16 节**内容见 [[file:ui.org][docs/ui.org]]（「热点函数」节内的 =** 栈包含占比 TOP= 是**子小节、不增节**）。 |
 | =el-chronos-weekly-report= | =(&optional FILE)=，interactive | 文件名 | 把近 7 天报告写入 =FILE=（默认 =chronos-weekly.org=，落运行时状态目录）。 |
 | =el-chronos-export= | =(FORMAT FILE &optional RANGE)=，interactive | 文件名 | =FORMAT= 取 ='csv= / ='json=；CSV 用 =# section:= 分块。 |
 | =el-chronos-show-event= | =(ID)=，interactive | 事件 buffer | 在 =*el-chronos-event*= 展示慢事件完整栈与 context。 |

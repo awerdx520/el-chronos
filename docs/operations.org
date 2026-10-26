@@ -441,10 +441,10 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | 操作 | 入口 | 作用范围 | 备注 |
 |---|---|---|---|
 | 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 七张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理 |
-| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含七张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **12 张表** |
-| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 12 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
+| 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含七张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **13 张表** |
+| 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 13 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
 | 回收空间 | =M-x el-chronos-store-vacuum= | =VACUUM=（重写库文件） | 不能在事务内执行；purge 后跑一次可显著缩小文件 |
-| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库（=user_version= 4、12 表 + 3 索引） |
+| 直接删文件 | 关闭 Emacs 后 =rm chronos.sqlite*= | 全部 | 下次启动自动重建空库（=user_version= 5、13 表 + 3 索引） |
 
 #+BEGIN_SRC elisp
 (el-chronos-purge (truncate (* 1000 (float-time (date-to-time "2026-09-01 00:00:00")))))

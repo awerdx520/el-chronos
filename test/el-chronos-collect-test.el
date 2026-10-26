@@ -1944,4 +1944,261 @@ profiler 启动失败会让资源趋势跟着陪葬。"
       (el-chronos-collect-stop))
     (should-not el-chronos-collect--resource-baseline)))
 
+;;; GC 归因（`post-gc-hook'）
+;; 归因的采集端在 hook 里只做内存累积（禁止字符串分配），落库由采样窗口 flush 完成；
+;; 故本组用例分三段守门：①hook 装配/拆除（全局 hook，I5 零残留）、②hook 语义（基线 /
+;; 差值 / 二级聚合维度 / 重入守卫）、③flush 与零分配文本断言（守门「别在热路径加 format」）。
+
+(defun el-chronos-collect-test--gc-command-count ()
+  "返回 `post-gc-hook' 中本模块归因函数的出现次数（1 = 装好且未重复）。"
+  (cl-count-if (lambda (function) (eq function #'el-chronos-collect--post-gc))
+               post-gc-hook))
+
+(defun el-chronos-collect-test--source-text ()
+  "返回 `el-chronos-collect.el' 源文件全文。
+测试须带 `-L .' 运行（`make test' / `make lint' 均如此），否则报错而非静默跳过。"
+  (let ((lib (locate-library "el-chronos-collect")))
+    (unless lib
+      (error "load-path 中找不到 el-chronos-collect，请用 -L . 运行测试"))
+    (with-temp-buffer
+      (insert-file-contents (expand-file-name lib))
+      (buffer-string))))
+
+(defun el-chronos-collect-test--defun-text (name)
+  "返回源文件中以 NAME 命名的 `defun' 的完整文本（到下一个顶层定义前）。
+「下一个顶层定义」按行首 `(defun' / `(defvar' / `(defcustom' / `(defconst' /
+`(define-minor-mode' 判定 —— 本模块的顶层 form 一律顶格，够用且不必引入解析器。"
+  (let* ((text (el-chronos-collect-test--source-text))
+         (start (string-match (concat "^(defun " (regexp-quote name) " ") text)))
+    (unless start
+      (error "源文件中找不到 defun %s" name))
+    (let* ((body (substring text start))
+           (end (or (string-match
+                     "\n(\\(defun\\|defvar\\|defcustom\\|defconst\\|define-minor-mode\\) "
+                     body)
+                    (length body))))
+      (substring body 0 end))))
+
+(defun el-chronos-collect-test--code-only (text)
+  "返回 TEXT 中**代码**部分的文本（注释与字符串内的内容剔除）。
+判据用 `syntax-ppss' 的字符串 / 注释状态，而不是把 docstring 一起算进去 ——
+`--post-gc' 的 docstring **必须**写清「不得出现字符串分配」并列出那几个函数名，
+字面断言会把它自己的说明文字当成违规（逼人删掉最重要的约束说明）。"
+  (with-temp-buffer
+    (insert text)
+    (emacs-lisp-mode)
+    (let (chars)
+      (dotimes (i (buffer-size))
+        (let ((position (1+ i)))
+          (unless (let ((state (syntax-ppss position)))
+                    (or (nth 3 state) (nth 4 state)))
+            (push (char-to-string (char-after position)) chars))))
+      (apply #'concat (nreverse chars)))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-hook-wiring ()
+  "`collect-start' 装 `post-gc-hook'、`collect-stop' 摘净并清空状态（I5 零残留）。
+重复 start 不得重复安装（`add-hook' 幂等 + `--running-p' 门），stop→start 再一轮仍只有一项。"
+  (let ((el-chronos-heartbeat-seconds 3600)
+        (el-chronos-sample-window-seconds 3600))
+    (unwind-protect
+        (progn
+          (el-chronos-collect-start)
+          (should (memq #'el-chronos-collect--post-gc post-gc-hook))
+          (should (= 1 (el-chronos-collect-test--gc-command-count)))
+          ;; 幂等：重复 start 不重复安装
+          (el-chronos-collect-start)
+          (should (= 1 (el-chronos-collect-test--gc-command-count)))
+          (el-chronos-collect-stop)
+          (should-not (memq #'el-chronos-collect--post-gc post-gc-hook))
+          ;; 第二轮 start→stop 同样只留一项、摘干净
+          (el-chronos-collect-start)
+          (should (= 1 (el-chronos-collect-test--gc-command-count)))
+          ;; 脏状态必须被 stop 清掉
+          (puthash 'dirty-command
+                   (let ((inner (make-hash-table :test #'eq)))
+                     (puthash 'emacs-lisp-mode (vector 7 12.5) inner)
+                     inner)
+                   el-chronos-collect--gc-attrib-buffer)
+          (setq el-chronos-collect--gc-attrib-last-done 99
+                el-chronos-collect--gc-attrib-last-elapsed 5.5
+                el-chronos-collect--gc-attrib-busy t))
+      (el-chronos-collect-stop))
+    (should-not (memq #'el-chronos-collect--post-gc post-gc-hook))
+    (should (= 0 (el-chronos-collect-test--gc-command-count)))
+    (should (= 0 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    (should-not el-chronos-collect--gc-attrib-last-done)
+    (should-not el-chronos-collect--gc-attrib-last-elapsed)
+    (should-not el-chronos-collect--gc-attrib-busy)))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-first-call-only-baseline ()
+  "baseline 为 nil 时首次调用只建立基线、不写入任何计数。
+否则会把「启动至今的全部 GC」算给当时那条命令（与 `--collect-gc' 首窗口同口径）。"
+  (let ((el-chronos-collect--gc-attrib-last-done nil)
+        (el-chronos-collect--gc-attrib-last-elapsed nil)
+        (el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq))
+        (this-command 'first-command)
+        (major-mode 'fundamental-mode))
+    (cl-letf (((symbol-value 'gcs-done) 42)
+              ((symbol-value 'gc-elapsed) 3.0))
+      (should-not (el-chronos-collect--post-gc)))
+    (should (= 0 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    (should (= 42 el-chronos-collect--gc-attrib-last-done))
+    (should (= 3.0 el-chronos-collect--gc-attrib-last-elapsed))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-computes-deltas ()
+  "`gcs-done' 10→13、`gc-elapsed' 1.0→1.75 → 记 3 次 / 750 ms，键是 (command, mode)。"
+  (let ((el-chronos-collect--gc-attrib-last-done 10)
+        (el-chronos-collect--gc-attrib-last-elapsed 1.0)
+        (el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq))
+        (this-command 'test-cmd)
+        (major-mode 'emacs-lisp-mode))
+    (cl-letf (((symbol-value 'gcs-done) 13)
+              ((symbol-value 'gc-elapsed) 1.75))
+      (el-chronos-collect--post-gc))
+    (let* ((inner (gethash 'test-cmd el-chronos-collect--gc-attrib-buffer))
+           (cell (and (hash-table-p inner) (gethash 'emacs-lisp-mode inner))))
+      (should (equal [3 750.0] cell)))
+    ;; 基线同时推进到当前值（下一次只算增量）
+    (should (= 13 el-chronos-collect--gc-attrib-last-done))
+    (should (= 1.75 el-chronos-collect--gc-attrib-last-elapsed))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-accumulates ()
+  "同一 (command, mode) 连续两次（3 次/750ms + 2 次/500ms）→ 单条目 `[5 1250.0]'。"
+  (let ((el-chronos-collect--gc-attrib-last-done 0)
+        (el-chronos-collect--gc-attrib-last-elapsed 0.0)
+        (el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq))
+        (this-command 'same-cmd)
+        (major-mode 'org-mode))
+    (cl-letf (((symbol-value 'gcs-done) 3)
+              ((symbol-value 'gc-elapsed) 0.75))
+      (el-chronos-collect--post-gc))
+    (cl-letf (((symbol-value 'gcs-done) 5)
+              ((symbol-value 'gc-elapsed) 1.25))
+      (el-chronos-collect--post-gc))
+    (should (= 1 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    (let* ((inner (gethash 'same-cmd el-chronos-collect--gc-attrib-buffer))
+           (cell (gethash 'org-mode inner)))
+      (should (= 1 (hash-table-count inner)))
+      (should (= 5 (aref cell 0)))
+      (should (= 1250.0 (aref cell 1))))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-two-level-keys ()
+  "分维：不同 command 各成一个外层条目；同 command 不同 mode 各成一个内层条目。"
+  (let ((el-chronos-collect--gc-attrib-last-done 0)
+        (el-chronos-collect--gc-attrib-last-elapsed 0.0)
+        (el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq)))
+    ;; 每次 GC 的 `gcs-done' 必然递增，故三段分别推进计数器（否则第二、三段差值为 0）
+    (cl-letf (((symbol-value 'gcs-done) 1)
+              ((symbol-value 'gc-elapsed) 0.1))
+      (let ((this-command 'cmd-a)
+            (major-mode 'emacs-lisp-mode))
+        (el-chronos-collect--post-gc)))
+    (cl-letf (((symbol-value 'gcs-done) 2)
+              ((symbol-value 'gc-elapsed) 0.2))
+      (let ((this-command 'cmd-a)
+            (major-mode 'org-mode))
+        (el-chronos-collect--post-gc)))
+    ;; command 为 nil（启动期 / idle timer / 进程过滤器）也是一条正常维度
+    (cl-letf (((symbol-value 'gcs-done) 3)
+              ((symbol-value 'gc-elapsed) 0.3))
+      (let ((this-command 'cmd-b)
+            (major-mode nil))
+        (el-chronos-collect--post-gc)))
+    (should (= 2 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    (let ((inner-a (gethash 'cmd-a el-chronos-collect--gc-attrib-buffer))
+          (inner-b (gethash 'cmd-b el-chronos-collect--gc-attrib-buffer)))
+      (should (= 2 (hash-table-count inner-a)))
+      (should (gethash 'emacs-lisp-mode inner-a))
+      (should (gethash 'org-mode inner-a))
+      (should (= 1 (hash-table-count inner-b)))
+      (should (gethash nil inner-b)))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-flush-records-and-clears ()
+  "`--flush-gc-attrib' 逐条交给 store（hour-ts 整点毫秒 + 当前会话）后清空缓冲；
+且它由采样窗口 tick 调用（不新开 timer）。"
+  (let ((el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq))
+        (el-chronos--session-id "sess-gc")
+        (rows nil))
+    (let ((inner (make-hash-table :test #'eq)))
+      (puthash 'cmd-a (vector 3 750.0) inner)
+      (puthash 'org-mode (vector 2 250.0) inner)
+      (puthash 'cmd-a inner el-chronos-collect--gc-attrib-buffer))
+    (cl-letf (((symbol-function 'el-chronos-store-record-gc-attrib)
+               (lambda (&rest args) (push args rows))))
+      (should-not (el-chronos-collect--flush-gc-attrib)))
+    (should (= 2 (length rows)))
+    (dolist (row rows)
+      ;; (HOUR-TS SESSION-ID COMMAND MODE GC-COUNT GC-MS)
+      (should (= 6 (length row)))
+      (should (integerp (nth 0 row)))
+      (should (= 0 (mod (nth 0 row) 3600000)))
+      (should (equal "sess-gc" (nth 1 row)))
+      (should (eq 'cmd-a (nth 2 row))))
+    (should (equal '((3 750.0) (2 250.0))
+                   (sort (mapcar (lambda (row) (list (nth 4 row) (nth 5 row))) rows)
+                         (lambda (a b) (> (car a) (car b))))))
+    (should (= 0 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    ;; 空缓冲再 flush：不产生任何 store 调用（不写空批次）
+    (cl-letf (((symbol-function 'el-chronos-store-record-gc-attrib)
+               (lambda (&rest args) (push args rows))))
+      (el-chronos-collect--flush-gc-attrib))
+    (should (= 2 (length rows)))
+    ;; 接线：`--sample-tick' 会 flush 归因（profiler 未采样时同样，理由同 `--collect-gc'）
+    (let ((el-chronos-collect--sampling-p nil)
+          (el-chronos-collect--gc-baseline (cons gcs-done gc-elapsed))
+          (el-chronos-collect--heap-tick-counter 0)
+          (el-chronos-collect--last-sample-tick nil)
+          (flushes 0))
+      (cl-letf (((symbol-function 'el-chronos-collect--flush-gc-attrib)
+                 (lambda () (cl-incf flushes)))
+                ((symbol-function 'el-chronos-store-record-gc)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'el-chronos-collect--collect-resources)
+                 (lambda () nil)))
+        (el-chronos-collect--sample-tick))
+      (should (= 1 flushes)))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-reentry-guard ()
+  "`--gc-attrib-busy' 为 t 时 hook 直接放弃：不记录、不改基线（防重入）。"
+  (let ((el-chronos-collect--gc-attrib-last-done 10)
+        (el-chronos-collect--gc-attrib-last-elapsed 1.0)
+        (el-chronos-collect--gc-attrib-buffer (make-hash-table :test #'eq))
+        (el-chronos-collect--gc-attrib-busy t)
+        (this-command 'test-cmd)
+        (major-mode 'emacs-lisp-mode))
+    (cl-letf (((symbol-value 'gcs-done) 13)
+              ((symbol-value 'gc-elapsed) 1.75))
+      (should-not (el-chronos-collect--post-gc)))
+    (should (= 0 (hash-table-count el-chronos-collect--gc-attrib-buffer)))
+    (should (= 10 el-chronos-collect--gc-attrib-last-done))
+    (should (= 1.0 el-chronos-collect--gc-attrib-last-elapsed))))
+
+(ert-deftest el-chronos-collect-test-gc-attrib-hook-body-is-allocation-free ()
+  "守门：`--post-gc' 的**代码**里不得出现字符串类分配与临时 cons。
+`post-gc-hook' 在 GC 之后立即运行，此时堆刚清空 —— 任何分配都直接计入下一次 GC 的
+阈值、形成自我加速。故禁止 `format' / `concat' / `number-to-string' / `symbol-name' /
+`prin1-to-string' / `format-message' / `int-to-string' / `substring' / `mapconcat' /
+`replace-regexp-in-string' / `prin1' / `upcase' / `downcase' / `(string `（字符串与序列
+类）与 `(cons ` / `(list `（临时结构）；唯一允许的分配是
+`gc_ms' 差值产生的那个 float。
+两份清单的取舍标准是「**确定会分配**」：`string=' / `stringp' 之类只读比较不分配，故
+**不进词表**；`(string ` 连带空格一起匹配，避免误伤 `stringp' / `string-match'。
+只查代码区（`syntax-ppss' 剔除 docstring 与注释）：docstring 里必须列出这些函数名说明
+约束，字面扫全文会把它自己的说明判成违规。"
+  (let ((code (el-chronos-collect-test--code-only
+               (el-chronos-collect-test--defun-text
+                "el-chronos-collect--post-gc"))))
+    (dolist (forbidden '("format" "concat" "number-to-string"
+                         "symbol-name" "prin1-to-string" "(cons " "(list "
+                         ;; 同样会分配字符串 / 序列的补充项（只在 hook 体里逐个实测确认
+                         ;; 确实不存在后才加；`string=' / `stringp' 不分配，故不加）
+                         "int-to-string" "substring" "mapconcat" "format-message"
+                         "replace-regexp-in-string" "(string " "prin1"
+                         "upcase" "downcase"))
+      (should-not (string-match-p (regexp-quote forbidden) code)))
+    ;; 反向确认抽取成功：钩子骨架的关键符号必须在代码区里
+    (should (string-match-p "gcs-done" code))
+    (should (string-match-p "el-chronos-collect--gc-attrib-buffer" code))
+    (should (string-match-p "ignore-errors" code))))
+
 ;;; el-chronos-collect-test.el ends here

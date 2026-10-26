@@ -25,9 +25,9 @@ v4 见 [[file:adr/0006-resource-observation.md][docs/adr/0006-resource-observati
 |-----------------+-------------------------+-----------------------------+---------------------------------------+----------------------------------|
 | 采集 collect     | =el-chronos-collect.el=   | hook / timer / profiler 回调、=after-load-functions=、=gcs-done= / =gc-elapsed= / =garbage-collect-heapsize= | 内存中的事件与小时聚合桶（含 GC / 健康计数 / 启动阶段与 load 明细 / **命令外停转 drift 判定**） | 只读环境、写内存                    |
 | 归因 attrib      | =el-chronos-attrib.el=    | 符号名、buffer               | file / package / mode / project 字符串 | 无（缓存 hash table）              |
-| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v4 共 12 表：v2 新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=，v3 新增 =hourly_drift=，v4 新增 =hourly_resources=） | 唯一允许写盘的一层（I3）             |
-| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（21 个查询）               | 只读数据库                         |
-| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（15 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
+| 存储 store       | =el-chronos-store.el=     | 聚合结果与事件行               | SQLite 行（v5 共 13 表：v2 新增 =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=，v3 新增 =hourly_drift=，v4 新增 =hourly_resources=，v5 新增 =hourly_gc_attrib=） | 唯一允许写盘的一层（I3）             |
+| 分析 analysis    | =el-chronos-analysis.el=  | SQL 查询                     | plist 结果集（22 个只读分析函数；另有 =names= 补全辅助不计入）               | 只读数据库                         |
+| 呈现 report      | =el-chronos-report.el=    | plist 结果集                 | org buffer（16 节）/ 导出文件           | 创建 buffer、按需写导出文件         |
 | 可视化 web       | =el-chronos-web.el=       | =analysis= 结果集              | HTTP / JSON（19 条只读路由）→ 内嵌 HTML / JS | 仅监听 =127.0.0.1= （默认关闭、只读） |
 | 启动探针 probe   | =el-chronos-startup-probe.el= | =after-load-functions= / 三个启动钩子 | 内存中的锚点与按库累计耗时（不开库、不写库） | **零依赖**：不 require 任何 el-chronos 模块，也不 require =cl-lib= / =subr-x= |
 
@@ -165,6 +165,42 @@ after a full GC cycle」——即它**只读、不做**。**禁止调 =garbage-c
 等于观测器替用户改变运行时行为，还污染自己刚记录的数据），**禁止用 =memory-info=**（那是**系统
 内存** =TOTAL-RAM FREE-RAM TOTAL-SWAP FREE-SWAP=，不是 Emacs 堆；remote =default-directory= 下
 还有触发 TRAMP 远端查询的风险）。
+
+** GC 归因支路（v5）：=post-gc-hook= → 内存二级 hash → 10 秒窗口 flush → =hourly_gc_attrib=
+
+与上面四步同属「GC」话题，但**触发点完全不同**：上面的四步在采样 tick 上读「窗口内的 GC
+总量」，这一支路在**每次 GC 之后**同步读「这次 GC 发生在谁之后」。
+
+1. **挂载点** =post-gc-hook=：=el-chronos-mode= 开启时 =add-hook=，关闭时 =remove-hook=
+   并清空内存 hash（I5 零残留）。
+2. **hook 体内只做差值与累加**：=gcs-done= / =gc-elapsed= 与上次基线相减得到本次次数与耗时
+   （=gc-elapsed= 是**累计值**，不减基线等于把开机以来的总耗时记到每一次 GC 上）；键取
+   =this-command= × =major-mode=（两个 symbol），累加进**二级 hash**（外层 command、内层
+   mode，value 为 =[count ms]= 向量）。二级 hash 而不用 =(cons command mode)= 作键，是为了
+   不在热路径上分配 cons。
+3. **零分配是硬约束**：hook 体内禁止 =format= / =concat= / =number-to-string= /
+   =symbol-name= / =prin1-to-string=。=post-gc-hook= 在 GC 刚清空堆之后执行，任何分配都会
+   把**下一次** GC 提前，形成自我加速 —— 观测器反过来制造它要观测的东西。
+4. **字符串转换与落库都在 10 秒采样 tick 的 flush 路径**（=--flush-gc-attrib= →
+   =el-chronos-store-record-gc-attrib=）：symbol → 字符串、nil → =\"<none>\"=、=hour_ts= 取
+   **flush 时刻**的整点，最后经批量缓冲与其余 =hourly_*= 同事务提交（故「库里有值 ⇔ 本批已
+   提交」严格同态）。
+5. **重入守卫** =--gc-attrib-busy=：hook 自身若被间接再触发（例如误在 hook 里分配导致新
+   GC），标志位挡住递归，避免「GC 里再记 GC」。
+
+**三条已知边界（不得含糊，报告与 API 文档同口径）**：
+
+1. 「GC **发生在**哪条命令之后」≠「哪条命令**导致** GC」：GC 可能发生在 idle timer /
+   进程过滤器 / redisplay 里，此时 =this-command= 是**上一条**命令，存在滞后；启动期与 batch
+   下 =this-command= 为 nil，记 =\"<none>\"=。
+2. =hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻：跨小时边界时归因可能落到相邻小时，
+   误差 ≤1 个采样窗口（默认 10 秒）。
+3. =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=：差值 = hook 安装前 / 采集窗口外的
+   GC。**禁止写成等式**，也不要用它校验采集完整性 —— 两个数字只能比大小。
+
+消费面：org 报告的「GC 归因（发生在哪条命令之后）」节
+（=el-chronos-report--section-gc-attribution=）经 =el-chronos-analysis-gc-attribution= 取数；
+**不接 Web**（分析型数据、需与 =hourly_gc= 总量对照阅读，理由见 =openspec/decisions.md=）。
 
 ** 路径 7：进程资源采集（每个采样 tick，与路径 4 / 6 同一回调，但独立于 =sampling-p=）
 

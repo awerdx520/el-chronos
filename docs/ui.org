@@ -159,7 +159,7 @@
 
 * org 报告（=M-x el-chronos-report=）
 
-15 节，按 =el-chronos-report--content= 的输出顺序：
+16 节，按 =el-chronos-report--content= 的输出顺序：
 
 | # | 节 | 数据来源 | 展示上限 |
 |---|---|---|---|
@@ -169,15 +169,30 @@
 | 4 | 包归因 | =el-chronos-analysis-package-breakdown= | 不限（unknown 与 GC 恒排末尾） |
 | 5 | 趋势 | =el-chronos-analysis-trend= | 最近 48 桶；列：小时/样本/慢命令/阻塞 |
 | 6 | GC 与内存 | =el-chronos-analysis-gc-trend= → =--section-gc= | 最近 48 桶；列：小时/GC 次数/GC 耗时/堆大小 |
-| 7 | **资源（CPU / 内存 / 负载）**（v4） | =el-chronos-analysis-resource-trend= / =resource-summary= → =--section-resource= | 最近 48 桶；列：小时/CPU%/RSS 峰值/线程/负载 1m；无数据走 =--resource-degrade= |
-| 8 | 启动分解 | =el-chronos-analysis-startup-breakdown= → =--section-startup= | 阶段锚点全列 + 包加载 TOP 10 行 |
-| 9 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 六个指标 + flush 平均耗时 |
-| 10 | 配置变更 | =el-chronos-analysis-config-history= → =--section-config= | 会话全列（哈希各显示前 8 字符） |
-| 11 | 阻塞事件 | =el-chronos-analysis-drift-trend= → =--drift-line=；=el-chronos-analysis-blocking-events= | 节内**先给一行 drift 汇总**，再列 block 明细 20 行（列：时间/时长/命令/mode/project）。drift 汇总**不新开节**（见下） |
-| 12 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
-| 13 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
-| 14 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
-| 15 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+| 7 | **GC 归因（发生在哪条命令之后）**（v5） | =el-chronos-analysis-gc-attribution= → =--section-gc-attribution= | TOP 15 行；列：命令/次数/GC 耗时(ms)/占比；首行固定写明语义限定，无数据走 =--gc-attrib-degrade= |
+| 8 | **资源（CPU / 内存 / 负载）**（v4） | =el-chronos-analysis-resource-trend= / =resource-summary= → =--section-resource= | 最近 48 桶；列：小时/CPU%/RSS 峰值/线程/负载 1m；无数据走 =--resource-degrade= |
+| 9 | 启动分解 | =el-chronos-analysis-startup-breakdown= → =--section-startup= | 阶段锚点全列 + 包加载 TOP 10 行 |
+| 10 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 六个指标 + flush 平均耗时 |
+| 11 | 配置变更 | =el-chronos-analysis-config-history= → =--section-config= | 会话全列（哈希各显示前 8 字符） |
+| 12 | 阻塞事件 | =el-chronos-analysis-drift-trend= → =--drift-line=；=el-chronos-analysis-blocking-events= | 节内**先给一行 drift 汇总**，再列 block 明细 20 行（列：时间/时长/命令/mode/project）。drift 汇总**不新开节**（见下） |
+| 13 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
+| 14 | 用法 TOP | =el-chronos-analysis-heatmap= 按命令聚合（=--usage-rows=） | 见实现 |
+| 15 | 会话 | =el-chronos-analysis-sessions= | 20 行；列：开始时间/启动耗时/版本/主机 |
+| 16 | 调用栈 TOP | =el-chronos-analysis-stacks= | 10 行；栈自 leaf 起最多 8 帧 |
+
+** 「GC 归因」节的标题与首行为什么必须带限定语（v5）
+
+节标题是 **「GC 归因（发生在哪条命令之后）」**，正文首行固定为
+=本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；在 idle / 进程过滤器里
+this-command 为上一条命令。= —— 这两处限定**不可删改**：归因键是 GC 时刻的
+=this-command= × =major-mode=，在 idle timer / 进程过滤器 / redisplay 里 =this-command=
+仍是上一条命令（滞后），启动期与 batch 下是 ="<none>"=。缺了限定，读者会把「save-buffer
+之后发生了 6 次 GC」读成「save-buffer 导致 6 次 GC」。
+
+配套的两条口径：① =hour_ts= 是 **flush 时刻**的整点，不是 GC 发生时刻（跨小时误差 ≤1 个
+采样窗口）；② =sum(hourly_gc_attrib.gc_count) ≤ hourly_gc.gc_count=，差值 = hook 安装前 /
+采集窗口外的 GC，**只能比大小、禁做等式校验**。因此本节紧接「GC 与内存」之后 —— 总量与
+归因必须相邻才能对照阅读。
 
 ** 「热点函数」节内的「栈包含占比 TOP」子小节（v4，**不增节**）
 
@@ -188,7 +203,7 @@
 
 ** 「阻塞事件」节内的 drift 汇总行（v3）
 
-**节数现为 15（v4 新增了「资源」节），但 drift 汇总仍**刻意不新增节**：drift 与 block 同属
+**节数现为 16（v4 新增「资源」节、v5 新增「GC 归因」节），但 drift 汇总仍**刻意不新增节**：drift 与 block 同属
 「命令之外的停转」，只有放在一起读者才看得到完整图景（drift 覆盖 [500ms, 2000ms) 区间，
 block 覆盖 ≥2000ms）。抽成独立节会让「命令外停转」被拆到两处，还得连带改一堆按节数断言的
 老用例。
@@ -210,6 +225,7 @@ block 覆盖 ≥2000ms）。抽成独立节会让「命令外停转」被拆到�
 | 节 | 触发条件 | 降级文案（与 =el-chronos-report.el= 的常量逐字一致） |
 |---|---|---|
 | GC 与内存 | 无桶数据，或全部桶的 =gc-count= / =gc-ms= 都是 0（会话首窗口只建基线） | =--gc-degrade=：「本期无 GC 采样数据（Emacs 31.1 以下不采集堆大小）。」整节不省略 |
+| GC 归因（发生在哪条命令之后） | =hourly_gc_attrib= 无行（schema v5 起才采集；老库、刚升级、本次会话尚未跨过一个 flush 窗口） | =--gc-attrib-degrade=：「尚无 GC 归因数据（schema v5 起采集，需运行一段时间）。」整节不省略；首行的语义限定**照常出现**（降级时也要读者知道这张表本来回答什么问题） |
 | 资源（CPU / 内存 / 负载） | 无 =hourly_resources= 行（=:samples= 为 0 / 查询失败），或用户关了 =el-chronos-resource-sampling= | =--resource-degrade=：「本期无进程资源数据（=hourly_resources= 为空；=el-chronos-resource-sampling= 关闭时不采集）。」整节不省略；**两条成因都是真的**（资源采样默认**开启**，用户可关闭） |
 | 资源（CPU / 内存 / 负载） | 有数据但部分桶 =load_n= 为 0 | CPU% / RSS 峰值照常显示；=RSS 均值= / =负载 1m= 渲染 =−=（**不是 0**，0 表示「观测到 0」）。口径注写在节内 =--resource-caveats= |
 | 启动分解 | 无任何启动数据（=:session-id= 为 nil） | 节标题退化为「启动分解」，正文 =--startup-degrade=：「本期无启动分解数据（需在启动结束前启用 =el-chronos-mode=，最早可在 early-init.el 里启用）。」**整节不省略** |

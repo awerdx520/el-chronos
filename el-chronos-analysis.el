@@ -381,6 +381,61 @@ NULL 值**（代表该时段末的 Emacs 堆大小；桶内全为 NULL 时 nil�
                                                             (plist-get i :heap-bytes))
                                                           items))))))))))
 
+(defun el-chronos-analysis-gc-attribution (range &optional limit dimension)
+  "窗口 RANGE 内的 GC 归因排行。
+DIMENSION 取 `command'（默认）或 `mode'：按「GC 发生在哪条命令之后」或「哪个 major-mode
+里」聚合。元素 `(:name NAME :gc-count N :gc-ms X :pct P)'，`:pct' 是该 NAME 的 `gc_count'
+占**同维度** `gc_count' 总和的百分比（分母取自截断前，不受 LIMIT 影响；跨维度不可比 ——
+command 与 mode 两种聚合的分组数量不同，两个百分比序列各自归一）。
+
+**语义限定（不要省略）**：本函数回答「GC **发生在**哪条命令之后」，**不是**「哪条命令
+**导致** GC」。GC 可能发生在 idle timer / 进程过滤器里，此时 `this-command' 是上一条命令，
+存在滞后；启动期与 batch 下为 \"<none>\"。因此 `sum(hourly_gc_attrib.gc_count)' 与
+`hourly_gc.gc_count' 只能比大小（≤），**不能**做等式校验：差值 = hook 安装前 /
+采集窗口外的 GC。
+
+三条口径（与采集侧一字不差，见 `el-chronos-store-record-gc-attrib'）：
+① `hour_ts' 是 **flush 时刻**的整点，不是 GC 发生时刻（跨小时边界时误差 ≤1 个采样窗口，
+默认 10 秒）；② 归因键为 `this-command' × `major-mode'，两者为 nil 时写 \"<none>\" ——
+\"<none>\" 是唯一哨兵，与真空串 \"\" 不是一回事；③ 数据自 schema v5 起才采集，老库该表为空，
+本函数返回 nil（那不是「没有 GC」，是「没有归因数据」）。
+
+LIMIT 默认 15，在 SQL 内截断（排序按 `gc_count' 降序，同分再比 `gc_ms' 降序、名字升序，
+保证输出可复现）。无数据、数据库打不开或查询失败时返回 nil。"
+  (el-chronos-analysis--guard 'gc-attribution
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((window (list start end))
+             ;; 维度只能取白名单里的两列之一：列名不能用 `?' 占位（SQL 里那是值不是
+             ;; 标识符），因此用 pcase 选**两个固定字符串**，绝不把参数拼进 SQL
+             (column (pcase dimension ('mode "mode") (_ "command")))
+             ;; 分母单独取一条标量：SQL 的 LIMIT 作用于分组结果，截断后 sum 出来的只是
+             ;; 榜单内部的合计，拿它当分母会让 `:pct' 随 LIMIT 变化（同一 name 两次查询
+             ;; 给出两个占比，等于不可比）
+             (total (or (caar (el-chronos-analysis--select
+                               db
+                               "SELECT coalesce(sum(gc_count), 0) FROM hourly_gc_attrib\
+ WHERE hour_ts >= ? AND hour_ts < ?"
+                               window))
+                        0))
+             (rows (el-chronos-analysis--select
+                    db
+                    (concat "SELECT " column ", sum(gc_count), sum(gc_ms)"
+                            " FROM hourly_gc_attrib"
+                            " WHERE hour_ts >= ? AND hour_ts < ?"
+                            " GROUP BY " column
+                            " ORDER BY sum(gc_count) DESC, sum(gc_ms) DESC, "
+                            column " ASC LIMIT ?")
+                    (append window (list (max 1 (or limit 15)))))))
+        ;; 新表尚无数据（老库 / 刚升级）时 ROWS 为 nil —— 返回 nil 而不是空列表，与
+        ;; `top-functions' / `slow-commands' 这些「窗口排行类」查询同形
+        (when rows
+          (cl-loop for (name count ms) in rows
+                   collect (list :name name
+                                 :gc-count (or count 0)
+                                 :gc-ms (float (or ms 0))
+                                 :pct (el-chronos-analysis--pct count total))))))))
+
 ;;; 进程资源趋势
 (defun el-chronos-analysis--avg (total n)
   "TOTAL 除以 N 的均值；N 非正或非数字时返回 nil。
@@ -562,6 +617,93 @@ I4 约束，改动时不要顺手「统一成毫秒」。
                   :load5-avg (el-chronos-analysis--avg load5 load-n)
                   :load15-avg (el-chronos-analysis--avg load15 load-n)
                   :samples (or load-n 0))))))))
+
+;;; 采样覆盖率
+(defun el-chronos-analysis--sampling-interval-ms ()
+  "profiler 采样间隔的毫秒数，取自 `el-chronos-sampling-interval-ns'。
+不要硬编码 10：该 defcustom 可被用户改写，硬编码会让覆盖率的分子恒按 10 ms 折算，
+在改过采样间隔的配置上给出错误结论。"
+  (/ (float el-chronos-sampling-interval-ns) 1000000.0))
+
+(defun el-chronos-analysis-sampling-coverage (range)
+  "窗口 RANGE 内 profiler 采样对真实 CPU 的覆盖率（判断采样结论是否可信）。
+返回 plist：
+  :sampling-interval-ms  采样间隔（毫秒，取自 `el-chronos-sampling-interval-ns'）
+  :samples-total         参与计算的样本总数
+  :samples-cpu-ms        `:samples-total' × `:sampling-interval-ms'
+  :cpu-ms                参与计算的进程 CPU 总时间（毫秒）
+  :wall-ms               参与计算的墙钟总时间（毫秒）
+  :coverage-pct          `:samples-cpu-ms' / `:cpu-ms' × 100
+  :cpu-pct               `:cpu-ms' / `:wall-ms' × 100
+  :hours-covered         参与计算的 (hour_ts, session_id) 桶数
+  :hours-requested       窗口内有采样数据的桶数
+无可用数据时返回 nil。
+
+只在**两侧都有数据**的桶上计算：`hourly_functions'（样本）与 `hourly_resources'
+（cpu_ms / wall_ms）按 (hour_ts, session_id) 做 INNER JOIN。两张表的覆盖时段可能
+差两个数量级（实测某库 `hourly_resources' 只有 9 分钟数据而 `hourly_functions'
+覆盖 24 小时），把两侧总和直接相除会得出荒谬结论（覆盖率百分之几千）。
+
+因此**必须同时读 `:hours-covered' 与 `:hours-requested'**：前者是 JOIN 后的桶数、
+后者是 `hourly_functions' 在窗口内的桶数。两者差得多即说明分母不齐、结论不可用 ——
+只报百分比而不报这两个数等于隐藏了这个前提。
+
+多桶一律**加权**：各桶分子（样本数 × 采样间隔）与分母（cpu_ms）分别求和后再相除，
+不是各桶比率的算术平均（各桶分子分母都不同，平均会失真）。
+
+`:coverage-pct' 明显低于 100 说明采样折算出的 CPU 时间被系统性低估，此时
+`el-chronos-analysis-top-functions' 一类的占比**结构**仍可用，但绝对耗时不可信。
+分母为 0 时 `:coverage-pct' / `:cpu-pct' 均为 0.0（不除零）；「窗口内有桶」
+与「窗口内无桶」由返回值是否为 nil 区分。
+
+`:cpu-pct' 的口径与 TD-28 呼应：`cpu_ms / wall_ms' 有两种读法 —— 占**单核**
+（本函数取这个，与 `docs/schema.org' 的既有示例一致）或占**全部核心**（再除以
+`(num-processors)'）。多线程进程的 CPU 时间可超过墙钟，按前者读数会大于 100%，
+按后者才是「机器算力占用」。本函数只给原始比率，不做归一化。"
+  (el-chronos-analysis--guard 'sampling-coverage
+    (when-let* ((ctx (el-chronos-analysis--bounds range))
+                (db (car ctx)) (start (nth 1 ctx)) (end (nth 2 ctx)))
+      (let* ((row (car (el-chronos-analysis--select
+                        db
+                        (concat "SELECT coalesce(sum(f.samples), 0),"
+                                " coalesce(sum(r.cpu_ms), 0),"
+                                " coalesce(sum(r.wall_ms), 0), count(*)"
+                                " FROM (SELECT hour_ts, session_id,"
+                                " sum(samples) samples FROM hourly_functions"
+                                " WHERE hour_ts >= ? AND hour_ts < ?"
+                                " GROUP BY hour_ts, session_id) f"
+                                " JOIN hourly_resources r"
+                                " ON r.hour_ts = f.hour_ts"
+                                " AND r.session_id = f.session_id")
+                        (list start end))))
+             (covered (or (nth 3 row) 0)))
+        ;; count(*) = 0 → 两侧没有交集（含「只有一侧有数据」），分子分母都无意义
+        (when (> covered 0)
+          (let ((requested (or (caar (el-chronos-analysis--select
+                                      db
+                                      (concat "SELECT count(*) FROM"
+                                              " (SELECT hour_ts, session_id"
+                                              " FROM hourly_functions"
+                                              " WHERE hour_ts >= ? AND hour_ts < ?"
+                                              " GROUP BY hour_ts, session_id)")
+                                      (list start end)))
+                               0)))
+            (cl-destructuring-bind (samples cpu wall _covered) row
+              (let* ((interval (el-chronos-analysis--sampling-interval-ms))
+                     (samples-ms (* (float samples) interval))
+                     (cpu-ms (float cpu))
+                     (wall-ms (float wall)))
+                (list :sampling-interval-ms interval
+                      :samples-total samples
+                      :samples-cpu-ms samples-ms
+                      :cpu-ms cpu-ms
+                      :wall-ms wall-ms
+                      :coverage-pct (el-chronos-analysis--pct samples-ms cpu-ms)
+                      :cpu-pct (el-chronos-analysis--pct cpu-ms wall-ms)
+                      :hours-covered covered
+                      ;; requested 查询异常（返回 nil）时退回 covered：否则会读出
+                      ;; 「参与桶数 > 窗口内桶数」这种自相矛盾的组合
+                      :hours-requested (max requested covered))))))))))
 
 ;;; 用法热力图
 (defun el-chronos-analysis-heatmap (range &optional limit)

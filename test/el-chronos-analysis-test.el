@@ -319,6 +319,89 @@
         (should-not (plist-get trend :heap-latest))
         (should (= 3 (plist-get trend :gc-total)))))))
 
+;;; GC 归因（hourly_gc_attrib，schema v5）
+
+(defun el-chronos-analysis-test--insert-gc-attrib (hour-ts command mode gc-count gc-ms
+                                                           &optional session-id)
+  "插入一条 `hourly_gc_attrib' 归因行：HOUR-TS / COMMAND / MODE / GC-COUNT / GC-MS。
+COMMAND / MODE 传 nil 时按写层语义落 \"<none>\"（主键列 NOT NULL，NULL 会让 upsert 静默
+失效）。SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键含 session_id）。"
+  (el-chronos-test--exec
+   "INSERT INTO hourly_gc_attrib (hour_ts, session_id, command, mode, gc_count, gc_ms)\
+ VALUES (?, ?, ?, ?, ?, ?)"
+   (list hour-ts (or session-id 0) (or command "<none>") (or mode "<none>")
+         (or gc-count 0) (float (or gc-ms 0)))))
+
+(ert-deftest el-chronos-analysis-test-gc-attribution-command ()
+  "按 command 聚合：次数降序、`:pct' 是占**同维度**总次数的百分比（分母 10）。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-gc-attrib hour "save-buffer" "emacs-lisp-mode"
+                                                  6 60.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour "magit-status" "magit-mode" 3 30.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour nil nil 1 5.0)
+      (let* ((items (el-chronos-analysis-gc-attribution window))
+             (names (mapcar (lambda (i) (plist-get i :name)) items)))
+        (should (equal '("save-buffer" "magit-status" "<none>") names))
+        (should (= 6 (plist-get (nth 0 items) :gc-count)))
+        (should (= 60.0 (plist-get (nth 0 items) :gc-ms)))
+        (should (= 60.0 (plist-get (nth 0 items) :pct)))
+        (should (= 30.0 (plist-get (nth 1 items) :pct)))
+        ;; nil 命令落 \"<none>\" 哨兵（不是真空串），且同样参与分母
+        (should (= 10.0 (plist-get (nth 2 items) :pct)))
+        (should (< 99.9 (cl-loop for i in items sum (plist-get i :pct)) 100.1))))))
+
+(ert-deftest el-chronos-analysis-test-gc-attribution-mode ()
+  "按 mode 聚合：同一批数据换维度后按 mode 分组，`:pct' 分母仍是总次数（不是命令数）。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      ;; 三条命令里两条同 mode：按 command 是三条，按 mode 应合并成两条 + 一条 <none>
+      (el-chronos-analysis-test--insert-gc-attrib hour "save-buffer" "emacs-lisp-mode"
+                                                  4 40.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour "eval-buffer" "emacs-lisp-mode"
+                                                  2 20.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour "magit-status" "magit-mode" 4 30.0)
+      (let* ((by-mode (el-chronos-analysis-gc-attribution window nil 'mode))
+             (modes (mapcar (lambda (i) (plist-get i :name)) by-mode))
+             (lisp-mode (cl-find "emacs-lisp-mode" by-mode
+                                 :key (lambda (i) (plist-get i :name)) :test #'equal)))
+        (should (equal '("emacs-lisp-mode" "magit-mode") modes))
+        (should (= 6 (plist-get lisp-mode :gc-count)))
+        (should (= 60.0 (plist-get lisp-mode :gc-ms)))
+        (should (= 60.0 (plist-get lisp-mode :pct)))
+        ;; 同一批数据在 command 维度是三条（不合并）
+        (should (= 3 (length (el-chronos-analysis-gc-attribution window))))))))
+
+(ert-deftest el-chronos-analysis-test-gc-attribution-limit-invariant ()
+  "LIMIT 只截断返回条数，不改变 `:pct'（分母取自截断前，与 inclusive 同款不变量）。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window))
+          (hour (el-chronos-test--hour-ts)))
+      (el-chronos-analysis-test--insert-gc-attrib hour "cmd-a" "prog-mode" 6 6.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour "cmd-b" "prog-mode" 3 3.0)
+      (el-chronos-analysis-test--insert-gc-attrib hour "cmd-c" "prog-mode" 1 1.0)
+      (let ((all (el-chronos-analysis-gc-attribution window 100))
+            (single (el-chronos-analysis-gc-attribution window 1)))
+        (should (= 3 (length all)))
+        (should (= 1 (length single)))
+        ;; 截断后留下的确实是次数最高的那条
+        (should (equal "cmd-a" (plist-get (car single) :name)))
+        ;; 同一条在 LIMIT 1 与 LIMIT 100 下 pct 相同（分母都是 10）
+        (should (= 60.0 (plist-get (car single) :pct)))
+        (should (= 60.0 (plist-get (nth 0 all) :pct)))
+        ;; 被截掉的两条在完整列表里仍按全窗口分母算（30% / 10%）
+        (should (= 30.0 (plist-get (nth 1 all) :pct)))
+        (should (= 10.0 (plist-get (nth 2 all) :pct)))))))
+
+(ert-deftest el-chronos-analysis-test-gc-attribution-empty ()
+  "新表尚无数据（老库 / 刚升级）时返回 nil，两个维度都是。"
+  (el-chronos-test-with-db
+    (let ((window (el-chronos-analysis-test--window)))
+      (should-not (el-chronos-analysis-gc-attribution window))
+      (should-not (el-chronos-analysis-gc-attribution window nil 'mode)))))
+
 ;;; 命令外停转（drift）趋势
 
 (defun el-chronos-analysis-test--insert-drift (hour-ts count total-ms max-ms
@@ -1035,6 +1118,113 @@ SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键�
     (let ((el-chronos-store--db nil))
       (should-not (el-chronos-analysis-resource-trend '1d))
       (should-not (el-chronos-analysis-resource-summary '1d)))))
+
+;;; 采样覆盖率（hourly_functions × hourly_resources）
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-single-bucket ()
+  "单桶单会话：分子是「样本数 × 采样间隔」，覆盖率与 CPU 占用率取各自比值。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (sid (or el-chronos--session-id 0)))
+      (el-chronos-test--insert-function hour "fn" "/tmp/a.el" "magit" 50.0 50.0 100)
+      (el-chronos-analysis-test--insert-resource
+       hour 1000 2000 10 10 1 0.1 0.1 0.1 1 sid)
+      (let ((cov (el-chronos-analysis-sampling-coverage window)))
+        (should (= 10.0 (plist-get cov :sampling-interval-ms)))
+        (should (= 100 (plist-get cov :samples-total)))
+        (should (= 1000.0 (plist-get cov :samples-cpu-ms)))   ; 100 × 10ms
+        (should (= 1000.0 (plist-get cov :cpu-ms)))
+        (should (= 2000.0 (plist-get cov :wall-ms)))
+        (should (< (abs (- 100.0 (plist-get cov :coverage-pct))) 1e-9))
+        (should (< (abs (- 50.0 (plist-get cov :cpu-pct))) 1e-9))
+        (should (= 1 (plist-get cov :hours-covered)))
+        (should (= 1 (plist-get cov :hours-requested)))))))
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-ragged-span ()
+  "两侧覆盖时段不齐：只在 JOIN 后的桶上算，且 covered / requested 必须都报。
+回归守门：若把 `hourly_functions' 的 3 个桶全算进来，覆盖率会得 1100% 这类荒谬值。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (sid (or el-chronos--session-id 0)))
+      ;; functions 覆盖 3 个桶（另两个桶各有 500 样本），resources 只有当前桶
+      (el-chronos-test--insert-function hour "fn" nil "pkg" 1.0 1.0 100)
+      (el-chronos-test--insert-function (- hour 3600000) "fn" nil "pkg" 1.0 1.0 500)
+      (el-chronos-test--insert-function (- hour (* 2 3600000)) "fn" nil "pkg" 1.0 1.0 500)
+      (el-chronos-analysis-test--insert-resource
+       hour 1000 2000 nil nil nil nil nil nil 0 sid)
+      (let ((cov (el-chronos-analysis-sampling-coverage window)))
+        (should (= 1 (plist-get cov :hours-covered)))
+        (should (= 3 (plist-get cov :hours-requested)))
+        ;; 分子分母都只来自那 1 个桶：1100 样本全算会得 11000ms → 1100%
+        (should (= 100 (plist-get cov :samples-total)))
+        (should (= 1000.0 (plist-get cov :samples-cpu-ms)))
+        (should (= 1000.0 (plist-get cov :cpu-ms)))
+        (should (< (abs (- 100.0 (plist-get cov :coverage-pct))) 1e-9))))))
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-weighted-buckets ()
+  "多桶必须加权求和再相除；对单桶比率取算术平均会得 66.7%，本函数应得 50%。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (prev (- hour 3600000))
+           (sid (or el-chronos--session-id 0)))
+      ;; 桶 A：100 样本 / 1000ms → 100%；桶 B：100 样本 / 3000ms → 33.3%
+      (el-chronos-test--insert-function hour "fn" nil "pkg" 1.0 1.0 100)
+      (el-chronos-test--insert-function prev "fn" nil "pkg" 1.0 1.0 100)
+      (el-chronos-analysis-test--insert-resource
+       hour 1000 2000 nil nil nil nil nil nil 0 sid)
+      (el-chronos-analysis-test--insert-resource
+       prev 3000 4000 nil nil nil nil nil nil 0 sid)
+      (let ((cov (el-chronos-analysis-sampling-coverage window)))
+        (should (= 2 (plist-get cov :hours-covered)))
+        (should (= 2 (plist-get cov :hours-requested)))
+        (should (= 200 (plist-get cov :samples-total)))
+        (should (= 2000.0 (plist-get cov :samples-cpu-ms)))   ; 200 × 10ms
+        (should (= 4000.0 (plist-get cov :cpu-ms)))           ; 1000 + 3000
+        (should (= 6000.0 (plist-get cov :wall-ms)))
+        ;; 加权 2000/4000 = 50%；算术平均 (100+33.3)/2 = 66.7%
+        (should (< (abs (- 50.0 (plist-get cov :coverage-pct))) 1e-9))
+        (should (> (abs (- 66.6667 (plist-get cov :coverage-pct))) 1.0))))))
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-empty-db ()
+  "空库返回 nil（「无数据」用 nil 表达，与窗口汇总类查询一致）。"
+  (el-chronos-test-with-db
+    (should-not (el-chronos-analysis-sampling-coverage
+                 (el-chronos-analysis-test--window)))))
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-one-sided ()
+  "只有一侧有数据时 INNER JOIN 无行 → 返回 nil（不做「有样本就算」的猜测）。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (sid (or el-chronos--session-id 0)))
+      ;; 只有 functions，没有 resources：样本是真的，但没有可比的分母
+      (el-chronos-test--insert-function hour "fn" nil "pkg" 1.0 1.0 10)
+      (should-not (el-chronos-analysis-sampling-coverage window))
+      ;; 反过来：只有 resources，没有 functions → 同样无行
+      (el-chronos-test--exec "DELETE FROM hourly_functions")
+      (el-chronos-analysis-test--insert-resource
+       hour 100 200 nil nil nil nil nil nil 0 sid)
+      (should-not (el-chronos-analysis-sampling-coverage window)))))
+
+(ert-deftest el-chronos-analysis-test-sampling-coverage-zero-denominator ()
+  "cpu_ms 为 0 时覆盖率与 CPU 占用率都是 0.0，不除零、不抛错。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts))
+           (sid (or el-chronos--session-id 0)))
+      (el-chronos-test--insert-function hour "fn" nil "pkg" 0.0 0.0 100)
+      (el-chronos-analysis-test--insert-resource
+       hour 0 1000 nil nil nil nil nil nil 0 sid)
+      (let ((cov (el-chronos-analysis-sampling-coverage window)))
+        (should cov)                                     ; 有桶 → 不是 nil
+        (should (= 1000.0 (plist-get cov :samples-cpu-ms)))
+        (should (= 0.0 (plist-get cov :cpu-ms)))
+        (should (= 0.0 (plist-get cov :coverage-pct)))
+        (should (= 0.0 (plist-get cov :cpu-pct)))
+        (should (= 1 (plist-get cov :hours-covered)))))))
 
 ;;; 桶数与桶宽：`--range' 的 +1ms 上界不得渗进桶计算
 

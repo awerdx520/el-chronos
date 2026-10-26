@@ -77,6 +77,22 @@ I11：无数据时**不省略整节**，并给出两个真实成因 —— 窗�
   "本期无栈包含数据（`hourly_stacks' 为空）"
   "「栈包含占比 TOP」子小节无数据时的降级说明。
 I11：无数据时不能静默省略整个子小节 —— 读者必须能区分「没有包含数据」与「这个功能不存在」。")
+(defconst el-chronos-report--gc-attrib-rows 15
+  "「GC 归因（发生在哪条命令之后）」最多展示的行数。
+取 TOP N 而非「最近若干桶」：归因是排行而非时序（与 `el-chronos-report--inclusive-rows'
+同方向），15 条足够覆盖「谁经常触发 GC」的主力命令，再长只会埋掉头部。")
+(defconst el-chronos-report--gc-attrib-degrade
+  "尚无 GC 归因数据（schema v5 起采集，需运行一段时间）。"
+  "「GC 归因」节无数据时的降级说明。
+I11：无数据时**不省略整节**，且说明「为什么没有」——归因表自 schema v5 才开始采集，
+老库、刚升级的库、以及本次会话尚未跨过一个 flush 窗口时它都是空的。这句话同时防止读者
+把「没有归因数据」读成「这台机器从不 GC」（后者要看 `hourly_gc'）。")
+(defconst el-chronos-report--gc-attrib-caveat
+  (concat "本表回答「GC 发生在哪条命令之后」，不是「哪条命令导致 GC」；"
+          "在 idle / 进程过滤器里 this-command 为上一条命令。")
+  "「GC 归因」节必须原样写出的首行说明（语义限定，不是修饰）。
+写全三个要素：① 「发生在…之后」≠「导致」；② idle / 进程过滤器里 `this-command' 滞后；
+③ 指出滞后时的具体表现（是上一条命令）。缺任何一项，读者都会把这张表读成因果归因。")
 (defconst el-chronos-report--empty "（无数据）" "空数据占位文本。")
 (defconst el-chronos-report--startup-load-rows 10
   "「启动分解」里包加载 TOP 最多展示的库数。
@@ -321,6 +337,40 @@ KIND 取 `str' `num' `ms' `pct' `time' `stack' `bytes' `kb' `load' `raw'。"
       (el-chronos-report--table-section
        "GC 与内存" '("时间" "GC 次数" "GC 耗时" "内存") rows)
     (concat "* GC 与内存\n" el-chronos-report--gc-degrade "\n\n")))
+
+(defun el-chronos-report--gc-attrib-rows (items)
+  "把 `el-chronos-analysis-gc-attribution' 的结果 ITEMS 转成「GC 归因」表格行。
+取**前** `el-chronos-report--gc-attrib-rows' 条：该查询按 GC 次数降序，与
+`el-chronos-report--gc-rows' 那种「取最近若干桶」的方向相反，因此用 `cl-subseq' 而非
+`last'。列 `命令 / 次数 / GC 耗时(ms) / 占比'；GC 耗时用整数毫秒（表头已写明 ms，
+故不走 `ms' 那套人类可读换算），占比是该命令占**同维度**总次数的百分比。
+
+ITEMS 为 nil 时返回 nil，由 `el-chronos-report--section-gc-attribution' 渲染降级说明。"
+  (when items
+    (el-chronos-report--rows
+     (cl-subseq items 0 (min el-chronos-report--gc-attrib-rows (length items)))
+     '(:name :gc-count :gc-ms :pct) '(str num num pct))))
+
+(defun el-chronos-report--section-gc-attribution (attrib)
+  "渲染「GC 归因（发生在哪条命令之后）」节；ATTRIB 为
+`el-chronos-analysis-gc-attribution' 的结果或 nil。
+
+标题必须带限定语「（发生在哪条命令之后）」、正文首行必须原样写出
+`el-chronos-report--gc-attrib-caveat' —— 少了任一，这张表就会被读成**因果**归因
+（「save-buffer 导致 6 次 GC」），而它实际只说明「那 6 次 GC 发生在 save-buffer 之后」。
+归因键是 GC 时刻的 `this-command' × `major-mode'，在 idle timer / 进程过滤器里
+`this-command' 仍是上一条命令，因此有滞后；启动期与 batch 下为 \"<none>\"。
+
+无数据时输出 `el-chronos-report--gc-attrib-degrade' 而不是省略整节（I11）：归因表自
+schema v5 才采集，`（无数据）' 这种通用占位说不出「为什么没有」。"
+  (concat
+   "* GC 归因（发生在哪条命令之后）\n"
+   el-chronos-report--gc-attrib-caveat "\n"
+   "\n"
+   (if-let* ((rows (el-chronos-report--gc-attrib-rows attrib)))
+       (el-chronos-report--table '("命令" "次数" "GC 耗时(ms)" "占比") rows)
+     (concat el-chronos-report--gc-attrib-degrade "\n"))
+   "\n"))
 
 (defun el-chronos-report--inclusive-rows (items)
   "把 `el-chronos-analysis-inclusive-functions' 的结果 ITEMS 转成栈包含表行。
@@ -619,6 +669,10 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
        '(:bucket :samples :slow-commands :blocked) '(time num num num)))
      ;; 紧随「趋势」：同属时间桶视角，用户从「慢/阻塞」往下看自然想知道「是不是内存涨了」
      (el-chronos-report--section-gc gc-trend)
+     ;; GC 归因紧接「GC 与内存」：前者答「GC 有多少」，后者答「GC 发生在谁之后」，
+     ;; 两块必须相邻才能对照阅读（总量与归因之和只能比大小，见 tech-debt）
+     (el-chronos-report--section-gc-attribution
+      (el-chronos-analysis-gc-attribution range el-chronos-report--gc-attrib-rows))
      ;; 资源节紧接 GC：GC 看堆、资源看 CPU/RSS/负载，两者同属「本机资源画像」
      (el-chronos-report--section-resources resource-trend resource-summary)
      ;; 启动分解 → 采集健康 → 配置变更：三节都是「本期健康 / 环境」类视角，紧随趋势族
