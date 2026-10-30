@@ -689,6 +689,50 @@ CALLS / MSGS 同样是本用例 `let' 绑定的列表变量，最近一条在前
                              (car calls)))))
         (ignore-errors (el-chronos-web-stop))))))
 
+(ert-deftest el-chronos-web-test-api-health-busy-retries ()
+  "GET /api/health 响应体含撞锁重试计数，且它**不**翻转 `ok-p'。
+JSON 键沿用 analysis plist 的连字符写法（`busy-retries`，与 `dropped-commands` /
+`flush-failures` 同族；下划线只出现在 CSV 区块里）。
+中性度量：锁竞争被成功自愈也会让它上升，故 `flush-failures' 为 0 时 `ok-p' 仍是 true ——
+若把它归入坏消息键，这里会读成「采集异常」，与「自愈生效」的判读直接矛盾。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (el-chronos-test--insert-health (el-chronos-test--hour-ts) "busy-retries" 3)
+      (el-chronos-test--insert-health (el-chronos-test--hour-ts) "flush-count" 5)
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/health?range=1d"))
+             (parsed (el-chronos-web-test--json resp)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (= 3 (plist-get parsed :busy-retries)))
+        (should (= 0 (plist-get parsed :flush-failures)))
+        (should (eq t (plist-get parsed :ok-p)))))))
+
+(ert-deftest el-chronos-web-test-export-csv-health-busy-retries ()
+  "GET /api/export.csv 的 health 区块含 `busy_retries' 行（snake_case，与既有键同风格）。
+漏这一行的表现是「浏览器下载的 CSV 少一项指标」——不报错、不影响其它区块，
+只能靠断言逐项锁住（TD-19 的列头漂移面）。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--open-fixture-db)
+    (el-chronos-web-test--with-server
+      (el-chronos-test--insert-health (el-chronos-test--hour-ts) "busy-retries" 3)
+      (let* ((resp (el-chronos-web-test--http "GET" "/api/export.csv?range=1d"))
+             (body (plist-get resp :body)))
+        (should (equal 200 (plist-get resp :status)))
+        (should (string-match-p "^busy_retries,3$" body))
+        ;; 既有键不受影响、`rows' 行仍在
+        (should (string-match-p "^flush_failures," body))
+        (should (string-match-p "^rows," body))))))
+
+(ert-deftest el-chronos-web-test-index-html-health-busy-retries-panel ()
+  "内嵌 dashboard 的 health 面板列出撞锁重试（键名 `busy-retries'，与 JSON 同形）。
+该仓库对 HTML/JS 的既有测法就是断言内嵌字符串：面板字段漏一项时页面照常渲染、
+既不报错也没有控制台异常，只能靠字符串断言兜住。"
+  (el-chronos-web-test--with-temp-db
+    (el-chronos-web-test--with-server
+      (let ((body (plist-get (el-chronos-web-test--http "GET" "/") :body)))
+        (should (string-match-p "撞锁重试" body))
+        (should (string-match-p "busy-retries" body))))))
+
 (provide 'el-chronos-web-test)
 
 ;;; el-chronos-web-test.el ends here

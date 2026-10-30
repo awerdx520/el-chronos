@@ -927,6 +927,72 @@ web 侧 `/api/export.csv' 面向浏览器下载，比 report 侧的 `M-x el-chro
                         (member name el-chronos-report-test--web-only-csv-sections))
                       web-names))))))
 
+(ert-deftest el-chronos-report-test-health-busy-retries-and-ok-p-mention ()
+  "健康节在两个分支都露出撞锁重试（中性度量，两类状态下都有信息量）：
+① `:ok-p' 为 nil 的完整表 → 一行 `撞锁重试'；
+② `:ok-p' 为 t 的单行摘要 → 只在计数 > 0 时附「撞锁重试 N 次」（0 时不改文案，
+   否则「本期无采集异常（flush 7 次，平均 5 ms）」这类既有断言无谓变红）。
+为什么两处都要有：`busy-retries` 不进坏消息键，D1 路径（open 期撞锁）可以让它非 0 而
+`flush-failures' 仍为 0 —— 只放在完整表里，这种「自愈生效」的常态就永远看不见。"
+  ;; ① 有坏消息 → 完整表，含撞锁重试行
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "dropped-commands" 5)
+      (el-chronos-test--insert-health hour "busy-retries" 6)
+      (el-chronos-test--insert-health hour "flush-count" 20)
+      (el-chronos-test--insert-health hour "flush-ms" 100.0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "| 指标 | 值 |" content))
+        (should (string-match-p "| 撞锁重试 | 6 |" content)))))
+  ;; ② 无坏消息但撞锁重试 > 0 → 摘要里出现该计数（`:ok-p' 不受它影响）
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "busy-retries" 2)
+      (el-chronos-test--insert-health hour "flush-count" 4)
+      (el-chronos-test--insert-health hour "flush-ms" 8.0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "本期无采集异常" content))
+        (should (string-match-p "flush 4 次" content))
+        (should (string-match-p "撞锁重试 2 次" content))
+        (should-not (string-match-p "| 指标 | 值 |" content)))))
+  ;; ③ 撞锁重试为 0 → 摘要不多废话（既有文案逐字不变）
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      (el-chronos-test--insert-health hour "flush-count" 7)
+      (el-chronos-test--insert-health hour "flush-ms" 35.0)
+      (let ((content (el-chronos-report--content '7d)))
+        (should (string-match-p "本期无采集异常（flush 7 次，平均 5 ms）" content))
+        (should-not (string-match-p "撞锁重试" content))))))
+
+(ert-deftest el-chronos-report-test-csv-health-metrics-match-web ()
+  "两侧 CSV 的 health 区块**指标集合必须相等**（TD-19 的同一漂移面，比区块名更细一层）。
+`el-chronos-report--csv-health' 与 `el-chronos-web--csv-health' 是内联重复实现（web 刻意
+不 require report）：漏一处只表现为「某个导出件少一行指标」，不报错、两边各自的断言也都
+发现不了。断言 `busy_retries' 在两侧都在，且两侧集合 `equal'（顺序一致也算不变量）。"
+  (el-chronos-test-with-db
+    (let* ((hour (el-chronos-test--hour-ts))
+           (metrics (lambda (csv)
+                      (let ((start (string-match "^# section: health$" csv)))
+                        (when start
+                          (let* ((body (substring csv (match-end 0)))
+                                 (end (string-match "^# section: " body))
+                                 (lines (split-string
+                                         (if end (substring body 0 end) body)
+                                         "\n" t)))
+                            (delq nil
+                                  (mapcar (lambda (line)
+                                            (when (string-match
+                                                   "\\`\\([a-z0-9_]+\\)\\," line)
+                                              (match-string 1 line)))
+                                          lines))))))))
+      (el-chronos-test--insert-health hour "busy-retries" 2)
+      (el-chronos-test--insert-health hour "flush-count" 3)
+      (let ((report-metrics (funcall metrics (el-chronos-report--csv-string '7d)))
+            (web-metrics (funcall metrics (el-chronos-web--csv-string '7d))))
+        (should (member "busy_retries" report-metrics))
+        (should (member "busy_retries" web-metrics))
+        (should (equal report-metrics web-metrics))))))
+
 (provide 'el-chronos-report-test)
 
 ;;; el-chronos-report-test.el ends here

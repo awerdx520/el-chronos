@@ -985,6 +985,7 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
     (:flush-failures . "flush-failures")
     (:flush-count . "flush-count")
     (:flush-ms . "flush-ms")
+    (:busy-retries . "busy-retries")
     (:sample-misses . "sample-misses"))
   "返回 plist 键 → `hourly_health.key' 字符串的映射。
 键名在 store 层是字符串枚举（`el-chronos-store-record-health' 的 docstring），
@@ -994,13 +995,15 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
   '("dropped-commands" "dropped-events" "flush-failures" "sample-misses")
   "参与 `:ok-p' 判定的「坏消息」键。
 `:ok-p' 为 t 读作「本期没有丢失/失败」：丢弃命令、丢弃事件、flush 失败、采样窗口丢失
-全为 0。`flush-count' / `flush-ms' 是正常运转的度量，不算坏消息。")
+全为 0。`flush-count' / `flush-ms' 是正常运转的度量，不算坏消息。
+`busy-retries' 是中性度量，刻意不在此列 —— 锁竞争被自愈也会让它上升，不能作为健康
+失败判据（把它加进来会让「多实例并发被成功自愈」被读成「采集异常」）。")
 
 (defun el-chronos-analysis-health (range)
   "窗口 RANGE 内采集器自监控计数的汇总。
 返回 plist：`:dropped-commands' `:dropped-events' `:flush-failures' `:flush-count'
-`:sample-misses' 均为整数（库内 REAL，取整）；`:flush-ms' 为求和后的毫秒数（浮点）；
-`:flush-avg-ms' 为 `flush-ms / flush-count'（count 为 0 时 nil，避免除零）；
+`:busy-retries' `:sample-misses' 均为整数（库内 REAL，取整）；`:flush-ms' 为求和后的
+毫秒数（浮点）；`:flush-avg-ms' 为 `flush-ms / flush-count'（count 为 0 时 nil，避免除零）；
 `:ok-p' 为「坏消息键」全 0（见 `el-chronos-analysis--health-bad-keys'）；
 `:rows' 为窗口内 `hourly_health' 的**行数**（区分「没有坏消息」与「采集器根本没写过数据」）。
 
@@ -1040,6 +1043,7 @@ SESSION-ID 为数字时按 id 精确取；为 nil 时取**有启动数据**的�
                 :flush-count (truncate flush-count)
                 :flush-ms flush-ms
                 :flush-avg-ms (if (> flush-count 0) (/ flush-ms flush-count) nil)
+                :busy-retries (truncate (funcall value :busy-retries))
                 :sample-misses (truncate (funcall value :sample-misses))
                 :ok-p (cl-every (lambda (key)
                                   (zerop (funcall value key)))

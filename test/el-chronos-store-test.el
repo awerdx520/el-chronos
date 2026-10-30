@@ -543,7 +543,8 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       ;; ③ 未 checkpoint、未开事务
       (should-not (cl-some (lambda (sql) (string-match-p "wal_checkpoint" sql))
                            statements))
-      (should-not (cl-some (lambda (sql) (equal "BEGIN" (upcase sql))) statements))
+      (should-not (cl-some (lambda (sql) (string-prefix-p "BEGIN" (upcase sql)))
+                           statements))
       ;; ④ 版本与数据行数都不变
       (should (= el-chronos-store--schema-version
                  (el-chronos-test--scalar "PRAGMA user_version")))
@@ -746,14 +747,21 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       (should (= 300 (el-chronos-test--scalar "SELECT max(samples) FROM hourly_stacks"))))))
 
 (ert-deftest el-chronos-store-test-null-session-skips-stacks ()
-  "会话不可用时跳过 `hourly_stacks'，不写 session_id 为 NULL 的栈行。"
+  "会话不可用时跳过 `hourly_stacks'，不写 session_id 为 NULL 的栈行。
+**T1（D1）后语义收窄**：flush 批前会补建会话行，故「会话为 nil」只有在**补建也失败**
+（撞锁）时才成立 —— 本用例据此把 `--ensure-session' 注入成 `sqlite-locked-error'。
+断言本身不变（仍是「不写 NULL 会话的栈行」），变的只是构造该状态的方式：以前只需把
+`el-chronos--session-id' 绑 nil，现在那条路径已被补建救回。"
   (el-chronos-test-with-db
     (let ((el-chronos--session-id nil)
           (el-chronos-store--stack-skip-warned t)) ; 已告警过一次，避免测试输出噪声
       (el-chronos-store-record-stacks (el-chronos-test--hour-ts)
                                       (list (cons "[\"a\"]" 5)))
-      ;; flush 必须在会话为 nil 的作用域内执行，才是「会话不可用」这条路径
-      (el-chronos-store-flush))
+      (cl-letf (((symbol-function 'el-chronos-store--ensure-session)
+                 (lambda (&rest _args)
+                   (signal 'sqlite-locked-error '("database is locked")))))
+        ;; flush 必须在「补建失败、会话仍为 nil」的作用域内执行，才是「会话不可用」这条路径
+        (el-chronos-store-flush)))
     (should (= 0 (el-chronos-test--count "hourly_stacks")))))
 
 (ert-deftest el-chronos-store-test-close-flushes-buffer ()
@@ -808,9 +816,12 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       (should (= 0 (hash-table-count el-chronos-store--usage)))
       (should (= 0 (hash-table-count el-chronos-store--functions)))
       (should (= 0 (hash-table-count el-chronos-store--stacks)))
-      ;; 其余 4 个自监控计数器一分不减（丢弃量没发生、成功的 flush 次数与耗时不变）
-      (should (= 0 el-chronos-store--dropped-commands))
-      (should (= 0 el-chronos-store--dropped-events))
+      ;; **S1 起语义变化**：非锁错误整批丢弃时 `dropped-*` 必须记账（本批 1 条命令 +
+      ;; 1 条慢事件）。旧断言「丢弃量没发生」只在「丢弃量仅由缓冲上限截断产生」时成立；
+      ;; 现在它同时承载「整批写库失败被丢弃」，正是「数据真的丢了」的唯一直接信号
+      ;; （`flush-failures` 只说明失败过，保留重试与真丢弃在它上面无法区分）。
+      (should (= 1 el-chronos-store--dropped-commands))
+      (should (= 1 el-chronos-store--dropped-events))
       (should (= 0 el-chronos-store--flush-count))
       (should (= 0.0 el-chronos-store--flush-ms-total))
       ;; 失败时库中没有任何 health 行（写库本身就是失败的那件事）
@@ -818,6 +829,657 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       ;; 事务已回滚，明细表没有半批数据
       (should (= 0 (el-chronos-test--count "commands")))
       (should (= 0 (el-chronos-test--count "slow_events"))))))
+
+;;; 多实例并发写：会话行延迟补建（D1 / T1）
+
+(ert-deftest el-chronos-store-test-open-survives-locked-session ()
+  "open 期建会话行撞写锁不阻断打开（D1）：仍返回句柄、起 flush timer、会话 ID 暂为 nil。
+锁住「`--ensure-session' 抛 `sqlite-locked-error' 时 `store-open' 不得返回 nil」——
+那正是「两个实例共用同一 chronos 库时，后启动的实例完全不采集」的病灶：没有会话行
+就没有会话 ID，命令明细与九张聚合表全线停写，进程内一条数据都落不了库。
+撞锁只记一次 `--busy-retries'、**不**告警（锁竞争是瞬时且可自愈的，不是坏消息）；
+句柄拿到之后下一次 flush 负责把会话行补建起来。"
+  (el-chronos-test-with-tmp-dir dir
+    (let ((path (expand-file-name "locked-open.sqlite" dir))
+          (user-emacs-directory (file-name-as-directory dir))
+          (el-chronos-db-path nil)
+          (el-chronos--session-id nil)
+          (el-chronos-retention-days 30)
+          (el-chronos-store--warned-at nil)
+          (warnings nil))
+      (cl-letf (((symbol-function 'el-chronos-store--ensure-session)
+                 (lambda (&rest _args)
+                   (signal 'sqlite-locked-error '("database is locked"))))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings))))
+        (should (el-chronos-store-open path)))
+      (unwind-protect
+          (progn
+            (should el-chronos-store--db)
+            (should-not el-chronos--session-id)
+            (should (timerp el-chronos-store--flush-timer))
+            (should (= 1 el-chronos-store--busy-retries))
+            (should-not warnings)       ; 锁竞争静默计数，不走限流告警
+            (should (= 0 (el-chronos-test--count "sessions")))
+            ;; 句柄确实可用：注入解除后下一次 flush 把会话行补建起来并落库
+            (el-chronos-store-record-command (list :name "after-unlock" :duration-ms 1.0))
+            (should (el-chronos-store-flush))
+            (should (integerp el-chronos--session-id))
+            (should (= 1 (el-chronos-test--count "sessions")))
+            (should (= 1 (el-chronos-test--count "commands"))))
+        (el-chronos-store-close)))))
+
+(ert-deftest el-chronos-store-test-open-survives-session-error ()
+  "open 期建会话行遇到**非锁**错误：仍返回句柄，并走 `--warn' 限流告警（I6 不抛错）。
+与撞锁路径的唯一差别是可见性：锁竞争瞬时自愈，静默计数即可；其余错误（权限、
+schema 损坏、磁盘满）用户需要知道，故告警后同样降级为「会话行延迟补建」，
+而不是让整个实例停止采集。"
+  (el-chronos-test-with-tmp-dir dir
+    (let ((path (expand-file-name "error-open.sqlite" dir))
+          (user-emacs-directory (file-name-as-directory dir))
+          (el-chronos-db-path nil)
+          (el-chronos--session-id nil)
+          (el-chronos-retention-days 30)
+          (el-chronos-store--warned-at nil)
+          (warnings nil))
+      (cl-letf (((symbol-function 'el-chronos-store--ensure-session)
+                 (lambda (&rest _args) (error "mock session failure")))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings))))
+        (should (el-chronos-store-open path)))
+      (unwind-protect
+          (progn
+            (should el-chronos-store--db)
+            (should-not el-chronos--session-id)
+            (should (timerp el-chronos-store--flush-timer))
+            ;; 非锁错误不计入撞锁计数（它不描述锁竞争）
+            (should (= 0 el-chronos-store--busy-retries))
+            (should (= 1 (length warnings)))
+            (should (string-match-p "会话行" (nth 1 (car warnings)))))
+        (el-chronos-store-close)))))
+
+(ert-deftest el-chronos-store-test-flush-backfills-session-before-bindings ()
+  "会话 ID 为 nil 时 flush 在 `let*' 求值**之前**补建，本批明细与 `hourly_stacks' 同批落库。
+锁住顺序约束（计划 §D1）：补建若落在 `let*' 之后，`session' / `stack-session' /
+`session-known' 三个绑定仍是旧 nil —— 命令明细因 `session' 为 nil 不写、`hourly_stacks'
+被 `--stack-session' 静默跳过，而成功路径随后清空缓冲，数据就无声消失了。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts)))
+      ;; 记录栈样本时会话正常（键里带会话段），随后模拟「open 期撞锁未建成会话行」
+      (el-chronos-store-record-stacks hour (list (cons "[\"fn\"]" 2)))
+      (setq el-chronos--session-id nil)
+      (el-chronos-store-record-command (list :name "backfilled" :duration-ms 3.0))
+      (should (el-chronos-store-flush))
+      (should (integerp el-chronos--session-id))
+      (should (= 1 (el-chronos-test--count "commands")))
+      ;; 顺序约束的可观测后果：本批 `hourly_stacks' 未被跳过
+      (should (= 1 (el-chronos-test--count "hourly_stacks"))))))
+
+;;; 多实例并发写：flush 锁竞争保留重试（D2 / T2）
+
+(ert-deftest el-chronos-store-test-flush-locked-keeps-batch ()
+  "flush 撞写锁（`sqlite-locked-error'）时**保留**整批：明细、慢事件与九个聚合 hash
+一个都不清，只把失败与撞锁计数 +1，streak = 1，返回 nil。
+锁住「锁竞争 ≡ 瞬时且可自愈」这条判据：ROLLBACK 之后库状态与事务前完全一致，保留缓冲
+重写不会重复计数；而按旧的 `error' 分支一刀切丢弃，会让对端一次 prune / 迁移就白丢
+最多 5 秒的采集数据（实测真实库 7 次 flush-failures 全落在这条路径上）。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (session el-chronos--session-id)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "kept" :duration-ms 2.0))
+      (el-chronos-store-record-slow-event (list :duration-ms 900.0 :kind "block"))
+      (el-chronos-store-record-usage hour 'command "kept" 1 2.0)
+      (el-chronos-store-record-function-samples hour "fn" nil "pkg" 1.0 2.0 1)
+      (el-chronos-store-record-stacks hour (list (cons "[\"fn\"]" 1)))
+      (el-chronos-store-record-gc hour 1 1.5 nil)
+      (el-chronos-store-record-health hour "sample-misses" 1)
+      (el-chronos-store-record-startup-phase session "startup" 10.0)
+      (el-chronos-store-record-drift hour 800.0)
+      (el-chronos-store-record-resources hour (list :cpu-ms 10 :wall-ms 100))
+      (el-chronos-store-record-gc-attrib hour session "cmd" "emacs-lisp-mode" 1 1.5)
+      (should (el-chronos-store--pending-p))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        ;; 撞锁只降级为告警，不抛错，也不丢弃本批
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 el-chronos-store--flush-failures))
+      (should (= 1 el-chronos-store--busy-retries))
+      (should (= 1 el-chronos-store--flush-lock-streak))
+      (should el-chronos-store--buffer)
+      (should el-chronos-store--slow-events)
+      (should (= 1 (hash-table-count el-chronos-store--usage)))
+      (should (= 1 (hash-table-count el-chronos-store--functions)))
+      (should (= 1 (hash-table-count el-chronos-store--stacks)))
+      (should (= 1 (hash-table-count el-chronos-store--gc)))
+      (should (= 1 (hash-table-count el-chronos-store--health)))
+      (should (= 1 (hash-table-count el-chronos-store--startup)))
+      (should (= 1 (hash-table-count el-chronos-store--drift)))
+      (should (= 1 (hash-table-count el-chronos-store--resources)))
+      (should (= 1 (hash-table-count el-chronos-store--gc-attrib)))
+      ;; 事务已回滚：库里没有任何半批数据
+      (should (= 0 (el-chronos-test--count "commands")))
+      (should (= 0 (el-chronos-test--count "slow_events")))
+      (should (= 0 (el-chronos-test--count "hourly_stacks")))
+      ;; 成功路径的 `--flush-count' 不因失败变化
+      (should (= 0 el-chronos-store--flush-count)))))
+
+(ert-deftest el-chronos-store-test-flush-locked-retry-then-success ()
+  "撞锁一次后重试成功：库内行数 = 缓冲条数（**不翻倍**），streak 归 0。
+锁住「保留重试不会重复计数」—— 依据是 ROLLBACK 之后库状态与事务前一致，故缓冲原样
+重写只会写一次；若哪个分支漏了 ROLLBACK 或提前清了 streak 之外的容器，
+这条用例会分别以「行数 2」或「streak 不归零」失败。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "retried" :duration-ms 3.0))
+      (el-chronos-store-record-slow-event (list :duration-ms 700.0 :kind "block"))
+      (el-chronos-store-record-usage hour 'command "retried" 1 3.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 el-chronos-store--flush-lock-streak))
+      ;; **F2 起语义变化**：撞锁会置 30 秒退避，紧随其后的 flush 会早退（不碰库）。
+      ;; 本用例要验的是「退避到期后的重试不重复计数」，故把退避时刻推到过去，模拟
+      ;; 生产里「timer 在 ~35 秒后再触发」。不改这条会让用例把「退避生效」误判成「重试失效」。
+      (setq el-chronos-store--flush-backoff-until (- (float-time) 1))
+      ;; 解除注入后重试：本批原样落库
+      (should (el-chronos-store-flush))
+      (should (= 0 el-chronos-store--flush-lock-streak))
+      (should (= 1 (el-chronos-test--count "commands")))
+      (should (= 1 (el-chronos-test--count "slow_events")))
+      (should (= 1 (el-chronos-test--count "hourly_usage")))
+      ;; 缓冲已消费；撞锁计数已随本次成功 flush 上报（库内累计 1），内存计数器扣回 0
+      ;; —— 与 `flush-failures' 同一口径：内存里只留「还没上报的部分」，
+      ;; 真实总量 = 库内累计 + 内存差额。旧断言「内存仍为 1」在 T6 上报落地后不再成立。
+      (should-not el-chronos-store--buffer)
+      (should-not el-chronos-store--slow-events)
+      (should (= 0 el-chronos-store--busy-retries))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'busy-retries'"))))))
+
+(ert-deftest el-chronos-store-test-flush-locked-streak-limit-discards ()
+  "连续撞锁达到 `--max-lock-retries'（6）次后按既有语义丢弃本批，并把 streak 清零。
+锁住「保留重试必须有上限」：锁错误可能持续很久（对端长期持锁、库被占满），
+无上限保留会让明细与聚合 hash 双双无界增长（明细有 `--max-buffer-items'，
+聚合 hash 没有任何上限）。6 × 5 秒 = 30 秒是覆盖对端 prune / 迁移的界。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "doomed" :duration-ms 4.0))
+      (el-chronos-store-record-slow-event (list :duration-ms 600.0 :kind "block"))
+      (el-chronos-store-record-usage hour 'command "doomed" 1 4.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (dotimes (_ (1- el-chronos-store--max-lock-retries))
+          ;; **F2 起语义变化**：每次撞锁都置 30 秒退避，紧随其后的 flush 会早退。
+          ;; 模拟「退避到期、timer 再触发」（生产里第 N 次尝试间隔 ~35 秒），否则库里
+          ;; 永远只有 streak = 1，本用例测不到上限丢弃。
+          (setq el-chronos-store--flush-backoff-until nil)
+          (should-not (el-chronos-store-flush))
+          (should el-chronos-store--buffer))
+        ;; 第 6 次：达到上限，丢弃
+        (setq el-chronos-store--flush-backoff-until nil)
+        (should-not (el-chronos-store-flush)))
+      (should (= el-chronos-store--max-lock-retries el-chronos-store--flush-failures))
+      (should (= el-chronos-store--max-lock-retries el-chronos-store--busy-retries))
+      (should-not el-chronos-store--buffer)
+      (should-not el-chronos-store--slow-events)
+      (should (= 0 (hash-table-count el-chronos-store--usage)))
+      (should (= 0 el-chronos-store--flush-lock-streak))
+      ;; 库内仍无半批数据（每次都 ROLLBACK 了）
+      (should (= 0 (el-chronos-test--count "commands")))
+      (should (= 0 (el-chronos-test--count "slow_events"))))))
+
+(ert-deftest el-chronos-store-test-flush-non-lock-error-still-discards ()
+  "非锁错误（磁盘满 / `no such table' / 约束冲突）**仍立即丢弃**本批，且不计撞锁次数。
+锁住「按错误类型分流」的另一半：这些是**持续故障**，重试没有意义 —— 保留只会让内存
+无界增长，还会让 streak 语义失真（把磁盘满当成锁竞争）。
+streak 必须归零：否则一批磁盘满错误累积的 streak 会把后面的锁竞争提前推到上限。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "disk-full" :duration-ms 5.0))
+      (el-chronos-store-record-usage hour 'command "disk-full" 1 5.0)
+      ;; 先造一次撞锁，让 streak 非零，验证非锁错误会把它清零
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 el-chronos-store--flush-lock-streak))
+      ;; **F2 起语义变化**：撞锁置了 30 秒退避，紧随其后的 flush 会早退 —— 这里把退避
+      ;; 推到过去，模拟「退避到期后再来一次非锁错误」（否则本用例只测到退避门，测不到
+      ;; 「非锁错误丢弃本批且不计撞锁次数」这个判据）。
+      (setq el-chronos-store--flush-backoff-until nil)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'error '("disk full"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 2 el-chronos-store--flush-failures))
+      ;; 非锁错误不计撞锁次数（上一次的 1 保留）
+      (should (= 1 el-chronos-store--busy-retries))
+      (should (= 0 el-chronos-store--flush-lock-streak))
+      (should-not el-chronos-store--buffer)
+      (should (= 0 (hash-table-count el-chronos-store--usage)))
+      (should (= 0 (el-chronos-test--count "commands"))))))
+
+(ert-deftest el-chronos-store-test-flush-backfill-locked-keeps-buffer ()
+  "会话行补建撞锁时本批仍然保留明细缓冲，且撞锁计数累加到两次（补建 + COMMIT）。
+锁住 D1 与 D2 的交点：补建失败 → 事务里没有命令可写（`session' 为 nil）、随后 COMMIT
+撞锁 —— 两条路径都只能降级，绝不能顺手把明细丢掉（那正是「打开时撞锁 → 整场会话
+零数据」的最后一环）。`--ignore-error' 式的丢弃会在这里留下空缓冲。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (setq el-chronos--session-id nil)
+      (el-chronos-store-record-command (list :name "keep-me" :duration-ms 4.0))
+      (cl-letf (((symbol-function 'el-chronos-store--ensure-session)
+                 (lambda (&rest _args)
+                   (signal 'sqlite-locked-error '("database is locked"))))
+                ((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 (length el-chronos-store--buffer)))
+      (should-not el-chronos--session-id)   ; 补建失败，会话仍未建立
+      (should (= 2 el-chronos-store--busy-retries))
+      (should (= 1 el-chronos-store--flush-lock-streak))
+      (should (= 0 (el-chronos-test--count "commands"))))))
+
+;;; 多实例并发写：丢弃告警不节流（F1）+ 撞锁退避（F2）
+
+;; 这两条是 T8 双进程实测暴露的缺陷（保留重试落地之后才显现）：
+;;   F1 丢弃告警被 10 分钟限流吞掉 —— 第 1 次撞锁的「保留重试」就把 `--warned-at' 占满，
+;;      第 6 次的「本批已丢弃」永远不出现：用户只看得到过程，看不到数据真的丢了。
+;;   F2 保留重试让 `--pending-p' 恒真（失败计数非零），于是每 5 秒 flush 一次、每次撞锁
+;;      等满 8 秒，主线程被占满（实测 8 次 × 8.01 s）—— 比老的「失败即丢弃后早退」更糟。
+
+(ert-deftest el-chronos-store-test-locked-discard-warning-bypasses-throttle ()
+  "第 6 次撞锁的**丢弃**告警必须绕过节流：即使限流窗口已被前一条普通告警占满也要可见。
+锁住 F1：`--warned-at' 是一条**共享**的限流通道 —— 第 1 次撞锁的「保留重试」告警就把
+600 秒窗口占满，于是「写库连续撞锁 6 次，本批缓冲已按计划丢弃」在生产里**永远不出现**：
+用户只看得到过程（第 1/6 次），看不到结果（数据真的丢了）。"
+  (el-chronos-test-with-db
+    (let ((warnings nil)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "doomed" :duration-ms 4.0))
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (_type msg &rest _args) (push msg warnings)))
+                ((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        ;; 先占满限流窗口（第 1 次撞锁的「保留重试」告警正是同一种过程消息）
+        (el-chronos-store--warn "先来的普通告警 %d" 1)
+        (dotimes (_ el-chronos-store--max-lock-retries)
+          ;; 每次尝试前清退避：模拟「30 秒退避已过、flush timer 再触发」（F2 不参与本判据）
+          (setq el-chronos-store--flush-backoff-until nil)
+          (el-chronos-store-flush)))
+      ;; 普通告警只出现一次（限流对过程消息仍然生效）
+      (should (= 1 (length (cl-remove-if-not
+                            (lambda (m) (string-match-p "先来的普通告警" m))
+                            warnings))))
+      ;; 结果消息（本批已丢弃）必须**出现在**收集列表里 —— 改造前被限流吞掉，本行必红
+      (should (cl-some (lambda (m) (string-match-p "已按计划丢弃" m)) warnings))
+      (should-not el-chronos-store--buffer))))
+
+(ert-deftest el-chronos-store-test-locked-retry-warning-still-throttled ()
+  "「保留重试」那条（**过程**消息）仍走 10 分钟限流：窗口内只输出一次，不刷屏。
+这是 F1 的反向守门：只有「数据真的丢了」这类结果消息才绕过节流；若把 force 也用到过程
+消息上，对端持续持锁时每 5 秒一条告警，比不告警更吵（而且会淹没真正的结果消息）。"
+  (el-chronos-test-with-db
+    (let ((warnings nil)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "retry" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (_type msg &rest _args) (push msg warnings)))
+                ((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (dotimes (_ 3)
+          (setq el-chronos-store--flush-backoff-until nil)
+          (el-chronos-store-flush)))
+      ;; 撞锁了 3 次但只告警 1 次
+      (should (= 3 el-chronos-store--flush-lock-streak))
+      (should (= 1 (length (cl-remove-if-not
+                            (lambda (m) (string-match-p "保留待下次" m))
+                            warnings)))))))
+
+(ert-deftest el-chronos-store-test-flush-locked-sets-backoff ()
+  "撞锁后设置 30 秒退避：退避期内 flush 早退（一次 SQL / 一次 pragma 都不发、不阻塞主线程），
+到期后正常尝试，成功即把退避清零。
+锁住 F2：保留重试让 `--pending-p' 恒真（`--flush-failures' / `--busy-retries' 非零），
+若不退避，flush timer 每 5 秒就在撞锁后立刻再撞一次，而单次撞锁最坏等满 `busy_timeout'
+（8 秒）—— 实测「每 5 秒一次、每次 8.01 秒」共 8 次，主线程被占满，Emacs 基本无响应。"
+  (el-chronos-test-with-db
+    (let ((original-execute (symbol-function 'sqlite-execute))
+          (original-pragma (symbol-function 'sqlite-pragma))
+          (exec-calls 0)
+          (pragma-calls 0)
+          (before (float-time)))
+      (el-chronos-store-record-command (list :name "backoff" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (setq exec-calls (1+ exec-calls))
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original-execute db sql args))))
+                ((symbol-function 'sqlite-pragma)
+                 (lambda (db pragma)
+                   (when (string-prefix-p "busy_timeout" pragma)
+                     (setq pragma-calls (1+ pragma-calls)))
+                   (funcall original-pragma db pragma))))
+        (should-not (el-chronos-store-flush)))
+      ;; 退避窗口 ≈ [撞锁前, 撞锁后] + 30 秒（用区间断言，不依赖时钟精度）
+      (should el-chronos-store--flush-backoff-until)
+      (should (>= el-chronos-store--flush-backoff-until
+                  (+ before el-chronos-store--flush-backoff-seconds)))
+      (should (<= el-chronos-store--flush-backoff-until
+                  (+ (float-time) el-chronos-store--flush-backoff-seconds)))
+      ;; 退避期内：不碰库（SQL 0 次、pragma 0 次），返回 nil，缓冲原样
+      (setq exec-calls 0
+            pragma-calls 0)
+      (should-not (el-chronos-store-flush))
+      (should (= 0 exec-calls))
+      (should (= 0 pragma-calls))
+      (should (= 1 (length el-chronos-store--buffer)))
+      ;; 到期后（手工把时刻推到过去）：正常尝试并成功，成功后退避清零
+      (setq el-chronos-store--flush-backoff-until (- (float-time) 1))
+      (should (el-chronos-store-flush))
+      (should-not el-chronos-store--flush-backoff-until)
+      (should (= 1 (el-chronos-test--count "commands"))))))
+
+(ert-deftest el-chronos-store-test-flush-locked-discard-still-sets-backoff ()
+  "达到 `--max-lock-retries' 丢弃本批后**同样**退避，不因数据容器已清空就立刻再撞。
+锁住 F2 的第二半：丢弃路径清的是数据容器，`--flush-failures' / `--busy-retries' 非零
+让 `--pending-p' 仍为真 —— 不退避的话下一轮 timer 又白撞满 8 秒。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "doomed" :duration-ms 4.0))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (dotimes (_ el-chronos-store--max-lock-retries)
+          (setq el-chronos-store--flush-backoff-until nil)
+          (el-chronos-store-flush)))
+      (should-not el-chronos-store--buffer)
+      (should (= el-chronos-store--max-lock-retries el-chronos-store--flush-failures))
+      (should el-chronos-store--flush-backoff-until)
+      (should (> el-chronos-store--flush-backoff-until (float-time))))))
+
+(ert-deftest el-chronos-store-test-close-resets-flush-backoff ()
+  "`store-close' 把撞锁退避清零（I5 零残留）。
+残留的后果：同进程重开库（换路径 / 换会话）时仍处在旧库的退避窗口里，前 30 秒的 flush
+全部早退 —— 表现为「刚打开就 30 秒不落库」，而且没有任何告警解释原因。"
+  (el-chronos-test-with-db
+    (setq el-chronos-store--flush-backoff-until (+ (float-time) 30))
+    (should el-chronos-store--flush-backoff-until)
+    (el-chronos-store-close)
+    (should-not el-chronos-store--flush-backoff-until)))
+
+;;; 多实例并发写：写事务 BEGIN IMMEDIATE（D3 / T3）
+
+;; 四处写事务（flush / prune / purge / 迁移）一律用 `BEGIN IMMEDIATE'：抢锁在事务**起点**
+;; 完成，不会「干完半批活才失败」；也防御 deferred `BEGIN' 里「先读后写」在 WAL 下升级写
+;; 失败（`SQLITE_BUSY_SNAPSHOT'，实测 0 ms 失败、`busy_timeout' 完全无效）。
+;; 下面四条用例逐个锁住「事务语句确实是 IMMEDIATE」以及「没有残留裸 BEGIN」。
+
+(ert-deftest el-chronos-store-test-begin-immediate-flush ()
+  "flush 的事务语句是 `BEGIN IMMEDIATE'（不是裸 `BEGIN'）。"
+  (el-chronos-test-with-db
+    (let ((statements nil)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "immediate" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original db sql args))))
+        (should (el-chronos-store-flush)))
+      (should (member "BEGIN IMMEDIATE" statements))
+      (should-not (member "BEGIN" statements))
+      ;; 明细确实落库（事务真的执行了，而不是「没跑事务所以没报错」）
+      (should (= 1 (el-chronos-test--count "commands"))))))
+
+(ert-deftest el-chronos-store-test-begin-immediate-prune ()
+  "`--prune' 的事务语句是 `BEGIN IMMEDIATE'。"
+  (el-chronos-test-with-db
+    (let ((statements nil)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-test--insert-command 1000 "ancient" 5.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original db sql args))))
+        (should (el-chronos-store--prune t)))
+      (should (member "BEGIN IMMEDIATE" statements))
+      (should-not (member "BEGIN" statements))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'ancient'"))))))
+
+(ert-deftest el-chronos-store-test-begin-immediate-purge ()
+  "`purge' 的事务语句是 `BEGIN IMMEDIATE'。"
+  (el-chronos-test-with-db
+    (let ((statements nil)
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-test--insert-command (el-chronos-test--hour-ts) "cmd" 5.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original db sql args))))
+        (should (el-chronos-purge)))
+      (should (member "BEGIN IMMEDIATE" statements))
+      (should-not (member "BEGIN" statements))
+      (should (= 0 (el-chronos-test--count "commands"))))))
+
+(ert-deftest el-chronos-store-test-begin-immediate-migrate ()
+  "迁移步骤的事务语句是 `BEGIN IMMEDIATE'（以 v4 → v5 为例）。"
+  (el-chronos-test-with-tmp-dir dir
+    (let ((path (expand-file-name "v4-immediate.sqlite" dir)))
+      (el-chronos-store-test--make-v4-db path)
+      (let ((db (sqlite-open path))
+            (statements nil)
+            (original (symbol-function 'sqlite-execute)))
+        (unwind-protect
+            (progn
+              (cl-letf (((symbol-function 'sqlite-execute)
+                         (lambda (handle sql &rest args)
+                           (push sql statements)
+                           (apply original handle sql args))))
+                (should (el-chronos-store--migrate db path 4)))
+              (should (member "BEGIN IMMEDIATE" statements))
+              (should-not (member "BEGIN" statements))
+              (should (= 5 (caar (sqlite-select db "PRAGMA user_version")))))
+          (ignore-errors (sqlite-close db)))))))
+
+(ert-deftest el-chronos-store-test-begin-immediate-migrate-all-steps ()
+  "v1 老库一次升到 v5 时，**四个迁移步骤各自**用 `BEGIN IMMEDIATE'（共 4 次、0 次裸 BEGIN）。
+上一个用例只覆盖 v4 → v5 一步；这里逐级走完 v2 / v3 / v4 / v5，避免「只改了其中一处」漏检。"
+  (el-chronos-test-with-tmp-dir dir
+    (let ((path (expand-file-name "v1-immediate.sqlite" dir)))
+      (el-chronos-store-test--make-v1-db path)
+      (let ((db (sqlite-open path))
+            (statements nil)
+            (original (symbol-function 'sqlite-execute)))
+        (unwind-protect
+            (progn
+              (cl-letf (((symbol-function 'sqlite-execute)
+                         (lambda (handle sql &rest args)
+                           (push sql statements)
+                           (apply original handle sql args))))
+                (should (el-chronos-store--migrate db path 1)))
+              (should (= 4 (cl-count "BEGIN IMMEDIATE" statements :test #'equal)))
+              (should-not (cl-find "BEGIN" statements :test #'equal))
+              (should (= 5 (caar (sqlite-select db "PRAGMA user_version")))))
+          (ignore-errors (sqlite-close db)))))))
+
+;;; 多实例并发写：busy_timeout 分层（D4 / T4）
+
+;; 分层：启动路径（open / 建会话行）保持 2000 ms —— 拖长会拖慢 Emacs 启动；
+;; 后台批量写（flush / prune / purge）允许等到 8000 ms —— 两个实例共享一个库时，
+;; 对端一次大 prune 或迁移就可能持锁 1–3 秒。8 秒仍是**有界**等待。
+
+(ert-deftest el-chronos-store-test-busy-timeout-write-window-flush ()
+  "flush 期间句柄的 `busy_timeout' 抬到 8000 ms，结束后恢复 2000 ms。
+除了拦截 `sqlite-pragma' 校验调用序列，还**真的**读一次 `PRAGMA busy_timeout`：
+连接级 pragma 会残留，只验证「拦截层看起来调用了恢复」不足以证明恢复生效。"
+  (el-chronos-test-with-db
+    (let ((pragmas nil)
+          (original (symbol-function 'sqlite-pragma)))
+      (should (= 2000 (caar (sqlite-select el-chronos-store--db "PRAGMA busy_timeout"))))
+      (el-chronos-store-record-command (list :name "timeout" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'sqlite-pragma)
+                 (lambda (db pragma)
+                   (when (string-prefix-p "busy_timeout" pragma)
+                     (push pragma pragmas))
+                   (funcall original db pragma))))
+        (should (el-chronos-store-flush)))
+      (should (equal '("busy_timeout=8000" "busy_timeout=2000") (nreverse pragmas)))
+      ;; 恢复是真的（连接级 pragma 残留会让之后所有写入都白等 8 秒）
+      (should (= 2000 (caar (sqlite-select el-chronos-store--db "PRAGMA busy_timeout")))))))
+
+(ert-deftest el-chronos-store-test-busy-timeout-restored-on-error ()
+  "flush 在事务中途抛错时**同样**恢复 2000 ms（`unwind-protect' 语义）。
+漏恢复的后果不是「多等一次」：连接级 pragma 会残留到后续所有写入，让每次撞锁都白等 8 秒，
+直接拖慢用户正在用的 Emacs。故错误路径与成功路径必须一样。"
+  (el-chronos-test-with-db
+    (let ((pragmas nil)
+          (original-pragma (symbol-function 'sqlite-pragma))
+          (original-execute (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "doomed" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'sqlite-pragma)
+                 (lambda (db pragma)
+                   (when (string-prefix-p "busy_timeout" pragma)
+                     (push pragma pragmas))
+                   (funcall original-pragma db pragma)))
+                ((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (error "mock commit failure")
+                     (apply original-execute db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (equal '("busy_timeout=8000" "busy_timeout=2000") (nreverse pragmas)))
+      (should (= 2000 (caar (sqlite-select el-chronos-store--db "PRAGMA busy_timeout")))))))
+
+(ert-deftest el-chronos-store-test-busy-timeout-open-keeps-default ()
+  "`store-open' 全程**不出现** `busy_timeout=8000`：启动路径保持 2000 ms。
+两层含义：① `--open-db' / `--ensure-session-quiet' 不得包 write-timeout（那会把
+Emacs 启动拖长）；② 新库上 `--prune' 没有候选行，因此连写事务都不开 —— 也就不会调
+write-timeout。只出现一次 `busy_timeout=2000'（`--open-db' 的默认设置）。"
+  (el-chronos-test-with-tmp-dir dir
+    (let ((path (expand-file-name "open-timeout.sqlite" dir))
+          (user-emacs-directory (file-name-as-directory dir))
+          (el-chronos-db-path nil)
+          (el-chronos--session-id nil)
+          (el-chronos-retention-days 30)
+          (pragmas nil)
+          (original (symbol-function 'sqlite-pragma)))
+      (cl-letf (((symbol-function 'sqlite-pragma)
+                 (lambda (db pragma)
+                   (when (string-prefix-p "busy_timeout" pragma)
+                     (push pragma pragmas))
+                   (funcall original db pragma))))
+        (should (el-chronos-store-open path)))
+      (unwind-protect
+          (progn
+            (should (equal '("busy_timeout=2000") (nreverse pragmas)))
+            (should-not (member "busy_timeout=8000" pragmas))
+            (should (= 2000 (caar (sqlite-select el-chronos-store--db
+                                                 "PRAGMA busy_timeout")))))
+        (el-chronos-store-close)))))
+
+;;; 多实例并发写：prune 预检 + 节流（D5 / T5）
+
+;; `--prune' 是写操作，每次都会抢一次写锁；它唯一的调用点是 `el-chronos-store-open'，
+;; 而多实例 / 反复 open-close（隔离实例、批量脚本）会让「每次 open 都 prune」变成常态
+;; 锁竞争源。故：① 一小时一次（`--prune-interval-seconds'）；② 过门之后再预检候选行，
+;; 两表都没有过期行就**完全不开写事务**。
+
+(ert-deftest el-chronos-store-test-prune-skips-write-when-nothing-expired ()
+  "没有过期行时 `--prune' 不开写事务：既不 `BEGIN IMMEDIATE' 也不 DELETE，返回 nil。
+锁住候选预检 —— 空转的写事务是「多实例同时启动」场景里最无谓的锁竞争来源。"
+  (el-chronos-test-with-db
+    (let ((statements nil)
+          (original (symbol-function 'sqlite-execute)))
+      ;; 只留「没过期」的明细行
+      (el-chronos-test--insert-command (el-chronos-test--now-ms) "fresh" 5.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original db sql args))))
+        (should-not (el-chronos-store--prune t)))
+      (should-not (cl-some (lambda (sql) (string-match-p "BEGIN" sql)) statements))
+      (should-not (cl-some (lambda (sql) (string-match-p "DELETE" sql)) statements))
+      ;; 只做了读锁层面的预检，数据一行不少
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'fresh'"))))))
+
+(ert-deftest el-chronos-store-test-prune-throttled-within-interval ()
+  "距上次 `--prune' 未满 `--prune-interval-seconds' 时直接跳过：不查询、不开事务、不删行。
+节流门必须比预检更早 —— 否则「每分钟跑一次 count(*)」也还是浪费。"
+  (el-chronos-test-with-db
+    (let ((statements nil)
+          (el-chronos-store--last-prune-time (float-time))
+          (original-execute (symbol-function 'sqlite-execute))
+          (original-select (symbol-function 'sqlite-select)))
+      (el-chronos-test--insert-command 1000 "ancient" 5.0)
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original-execute db sql args)))
+                ((symbol-function 'sqlite-select)
+                 (lambda (db sql &rest args)
+                   (push sql statements)
+                   (apply original-select db sql args))))
+        (should-not (el-chronos-store--prune)))
+      ;; 连预检的 SELECT 都没跑
+      (should-not statements)
+      (should (= 1 (el-chronos-test--count "commands")))
+      ;; 节流跳过不更新时间戳（否则永远等不到下个窗口）
+      (should (< (- (float-time) el-chronos-store--last-prune-time) 5)))))
+
+(ert-deftest el-chronos-store-test-prune-force-bypasses-throttle ()
+  "FORCE 非 nil 时绕过节流门，即使刚 prune 过也照常清理。
+这是测试与手动排障的入口（`--prune' 唯一的生产调用点仍然是 `store-open'）。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-store--last-prune-time (float-time)))
+      (el-chronos-test--insert-command 1000 "ancient" 5.0)
+      (should (el-chronos-store--prune t))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'ancient'"))))))
+
+(ert-deftest el-chronos-store-test-prune-updates-last-prune-time ()
+  "过了节流门就**立即**记录时间戳（无论有没有候选行），并照常删掉过期行。
+记录点必须在预检之前：否则「没有候选行」的那些 open 每分钟都要重跑 count(*)。"
+  (el-chronos-test-with-db
+    (let ((el-chronos-store--last-prune-time (- (float-time) 7200))) ; 两小时前
+      (el-chronos-test--insert-command 1000 "ancient" 5.0)
+      (el-chronos-test--insert-slow-event 1000 900.0 "block")
+      (should (el-chronos-store-test--prune-now))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'ancient'")))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM slow_events WHERE ts = 1000")))
+      (should (floatp el-chronos-store--last-prune-time))
+      (should (>= el-chronos-store--last-prune-time (- (float-time) 5))))))
 
 ;;; JSON 序列化
 
@@ -853,6 +1515,14 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
 
 ;;; 保留清理与 purge
 
+(defun el-chronos-store-test--prune-now ()
+  "在用例里强制跑一次 `--prune'（FORCE 非 nil，绕过节流门）。
+为什么必须强制：fixture 的 `el-chronos-store-open' 已经替用例跑过一次 prune 并把
+`--last-prune-time' 写成「刚刚」，不强制就会被节流门直接跳过并返回 nil ——
+那是 `prune-throttled-within-interval' 专门验证的行为，不该混进「prune 会不会删超期行」
+这类用例里。"
+  (el-chronos-store--prune t))
+
 (ert-deftest el-chronos-store-test-prune-only-details ()
   "保留清理只删 `commands' / `slow_events'，三张 hourly_* 聚合表一行不动。"
   (el-chronos-test-with-db
@@ -863,7 +1533,7 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       (el-chronos-test--insert-usage old 'command "ancient" 1 5.0)
       (el-chronos-test--insert-stack old "[\"old-fn\"]" 1)
       (should (= 1 (el-chronos-test--count "hourly_functions")))
-      (should (el-chronos-store--prune))
+      (should (el-chronos-store-test--prune-now))
       (should (= 0 (el-chronos-test--scalar
                     "SELECT count(*) FROM commands WHERE name = 'ancient'")))
       (should (= 0 (el-chronos-test--scalar
@@ -935,6 +1605,33 @@ v1 库走完 v2 就停住，本用例因后续表缺失而必红。"
       (el-chronos-store-record-command (list :name "after-purge" :duration-ms 1.0))
       (el-chronos-store-flush)
       (should (= 1 (el-chronos-test--count "commands"))))))
+
+(ert-deftest el-chronos-store-test-purge-survives-session-rebuild-lock ()
+  "COMMIT **之后**补建会话行撞锁时，purge 仍返回删除结果、且不报「已回滚」。
+事务已经提交，此处的失败不属于回滚语义：若仍走会抛错的 `--ensure-session'，异常会被
+外层 `condition-case' 当成事务失败 —— 用户看到「purge 失败（已回滚）」而 13 张表其实
+已经删干净了（错误的方向是「以为没删、实际删了」，比反过来更危险）。
+改用 `--ensure-session-quiet'：撞锁只记 `--busy-retries'，会话 ID 留 nil 等下次补建。"
+  (el-chronos-test-with-db
+    (let ((warnings nil))
+      (el-chronos-test--insert-command (el-chronos-test--hour-ts) "cmd" 5.0)
+      (cl-letf (((symbol-function 'el-chronos-store--ensure-session)
+                 (lambda (&rest _args)
+                   (signal 'sqlite-locked-error '("database is locked"))))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings))))
+        (let ((result (el-chronos-purge)))
+          ;; 删除结果照常返回（13 张表，顺序不变）
+          (should (= 13 (length result)))
+          (should (equal "commands" (car (car result))))))
+      ;; 没有「已回滚」告警
+      (should-not (cl-some (lambda (w) (string-match-p "已回滚" (format "%s" w)))
+                           warnings))
+      ;; 数据确实删掉了（提交是真的，不是被回滚过的假象）
+      (should (= 0 (el-chronos-test--count "commands")))
+      ;; 撞锁只记一次 `--busy-retries'；会话 ID 保持 nil，等下次 open / flush 补建
+      (should (= 1 el-chronos-store--busy-retries))
+      (should-not el-chronos--session-id))))
 
 (ert-deftest el-chronos-store-test-purge-empties-ten-tables ()
   "`purge' 无参时 13 张表的 1–2 行数据全部清空，只留下重建的当前会话行。
@@ -1116,7 +1813,7 @@ fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init �
       (el-chronos-test--exec "INSERT INTO hourly_drift (hour_ts, session_id, count,\
  total_ms, max_ms) VALUES (?, ?, ?, ?, ?)"
                              (list old old-id 6 4200.0 1100.0))
-      (should (el-chronos-store--prune))
+      (should (el-chronos-store-test--prune-now))
       ;; 明细超期行被删
       (should (= 0 (el-chronos-test--scalar
                     "SELECT count(*) FROM commands WHERE name = 'ancient'")))
@@ -1141,7 +1838,7 @@ fixture 把 `user-emacs-directory' 绑到临时目录（无 `.git'、无 init �
       (el-chronos-test--exec "INSERT INTO hourly_drift (hour_ts, session_id, count,\
  total_ms, max_ms) VALUES (?, ?, ?, ?, ?)"
                              (list old old-id 7 5600.0 1200.0))
-      (should (el-chronos-store--prune))
+      (should (el-chronos-store-test--prune-now))
       (should (= 0 (el-chronos-test--scalar
                     "SELECT count(*) FROM commands WHERE name = 'ancient'")))
       (should (= 1 (el-chronos-test--count "hourly_drift"))))))
@@ -1549,22 +2246,28 @@ purge 的 `session_id IN (SELECT id FROM sessions ...)' 子查询永远删不掉
 ;;; 自监控计数（T5）
 
 (ert-deftest el-chronos-store-test-flush-counter-not-cleared-by-clear-aggregates ()
-  "直接调 `--clear-aggregates' 后 5 个自监控计数器**一个也不变**。
+  "直接调 `--clear-aggregates' 后 7 个自监控计数器**一个也不变**。
 这是「独立 defvar」的反向验证正面形态：一旦把它们塞进被清空的容器
 （`--usage' / `--health' ... 或直接挂 `--buffer' / `--slow-events'），本用例必红 ——
-那正是「flush 失败把失败计数一并抹掉」的退化路径，也是设计 §6「已知悖论」的核心陷阱。"
+那正是「flush 失败把失败计数一并抹掉」的退化路径，也是设计 §6「已知悖论」的核心陷阱。
+T1/T2 新增的 `--busy-retries' / `--flush-lock-streak' 一并断言：它们是同一族标量，
+被 `--clear-aggregates' 清掉会让「撞锁发生过」这件事在第一次 flush 失败后即消失。"
   (el-chronos-test-with-db
     (setq el-chronos-store--dropped-commands 3
           el-chronos-store--dropped-events 2
           el-chronos-store--flush-failures 1
           el-chronos-store--flush-count 4
-          el-chronos-store--flush-ms-total 12.5)
+          el-chronos-store--flush-ms-total 12.5
+          el-chronos-store--busy-retries 6
+          el-chronos-store--flush-lock-streak 2)
     (el-chronos-store--clear-aggregates)
     (should (= 3 el-chronos-store--dropped-commands))
     (should (= 2 el-chronos-store--dropped-events))
     (should (= 1 el-chronos-store--flush-failures))
     (should (= 4 el-chronos-store--flush-count))
     (should (= 12.5 el-chronos-store--flush-ms-total))
+    (should (= 6 el-chronos-store--busy-retries))
+    (should (= 2 el-chronos-store--flush-lock-streak))
     ;; 对照断言：本批数据容器确实被清空了（证明函数真的跑过，不是被 cl-letf 掉）
     (should (= 0 (hash-table-count el-chronos-store--health)))
     (should-not el-chronos-store--slow-events)))
@@ -1662,15 +2365,20 @@ purge 的 `session_id IN (SELECT id FROM sessions ...)' 子查询永远删不掉
     (should (= 0 el-chronos-store--flush-failures))))
 
 (ert-deftest el-chronos-store-test-close-clears-counters ()
-  "`store-close' 清空 5 个自监控计数器，且**不依赖** `--clear-aggregates'（两者分离）。
+  "`store-close' 清空 7 个自监控计数器，且**不依赖** `--clear-aggregates'（两者分离）。
 做两件事让「close 清零」不与「flush 上报后归零」混淆：① 关句柄使 close 首行的 flush
-早退（否则计数会被正常上报）；② 把 `--clear-aggregates' 整个 cl-letf 成空操作。"
+早退（否则计数会被正常上报）；② 把 `--clear-aggregates' 整个 cl-letf 成空操作。
+T1/T2 新增的 `--busy-retries' / `--flush-lock-streak' 一并断言：它们若残留，同进程
+重开库（新会话）时会带着上一轮的撞锁 streak 进来，第一次撞锁就可能直接越过
+`--max-lock-retries' 而丢弃整批。"
   (el-chronos-test-with-db
     (setq el-chronos-store--dropped-commands 3
           el-chronos-store--dropped-events 2
           el-chronos-store--flush-failures 1
           el-chronos-store--flush-count 4
-          el-chronos-store--flush-ms-total 12.5)
+          el-chronos-store--flush-ms-total 12.5
+          el-chronos-store--busy-retries 5
+          el-chronos-store--flush-lock-streak 3)
     (cl-letf (((symbol-function 'el-chronos-store--clear-aggregates)
                (lambda (&rest _args) nil))
               ;; 句柄置 nil → close 首行 `(ignore-errors (flush))' 因 `--pending-p' 门
@@ -1681,7 +2389,9 @@ purge 的 `session_id IN (SELECT id FROM sessions ...)' 子查询永远删不掉
     (should (= 0 el-chronos-store--dropped-events))
     (should (= 0 el-chronos-store--flush-failures))
     (should (= 0 el-chronos-store--flush-count))
-    (should (= 0.0 el-chronos-store--flush-ms-total))))
+    (should (= 0.0 el-chronos-store--flush-ms-total))
+    (should (= 0 el-chronos-store--busy-retries))
+    (should (= 0 el-chronos-store--flush-lock-streak))))
 
 (ert-deftest el-chronos-store-test-pending-p-ignores-flush-count ()
   "只有 `--flush-count' / `--flush-ms-total' 非零时 `--pending-p' 必须为 nil。
@@ -1967,14 +2677,19 @@ purge 的 `session_id IN (SELECT id FROM sessions ...)' 子查询永远删不掉
 
 (ert-deftest el-chronos-store-test-prune-does-not-touch-hourly-resources ()
   "自动 retention（`--prune'）不碰 `hourly_resources'：即使行的时间戳远早于保留阈值，
-也一行不动（资源聚合永久保留，只由 purge 清理）。"
+也一行不动（资源聚合永久保留，只由 purge 清理）。
+过期明细行是本用例的前置条件：没有候选时 `--prune' 按候选预检**不开写事务**，
+「没碰聚合表」就成了空断言。"
   (el-chronos-store-test--with-hermetic-db
     (let* ((old 1000)                   ; 远早于 30 天保留阈值
            (old-id (el-chronos-test--insert-session old)))
+      (el-chronos-test--insert-command old "ancient" 5.0)
       (el-chronos-test--exec "INSERT INTO hourly_resources (hour_ts, session_id,\
  cpu_ms, wall_ms, load_n) VALUES (?, ?, ?, ?, ?)"
                              (list old old-id 50.0 200.0 1))
-      (should (el-chronos-store--prune))
+      (should (el-chronos-store-test--prune-now))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'ancient'")))
       (should (= 1 (el-chronos-test--count "hourly_resources"))))))
 
 ;;; GC 归因聚合（v5：hourly_gc_attrib）
@@ -2139,14 +2854,19 @@ flush 撞 `NOT NULL constraint failed' 回滚（一批已采数据全丢）。"
 
 (ert-deftest el-chronos-store-test-prune-does-not-touch-hourly-gc-attrib ()
   "自动 retention（`--prune'）不碰 `hourly_gc_attrib'：即使行的 `hour_ts' 远早于保留
-阈值，也一行不动（归因聚合永久保留，只由 purge 清理）。"
+阈值，也一行不动（归因聚合永久保留，只由 purge 清理）。
+过期明细行是本用例的前置条件：没有候选时 `--prune' 按候选预检**不开写事务**，
+那样「没碰聚合表」就是空断言 —— 有候选、真跑了 DELETE，才证明它只删了明细这两张表。"
   (el-chronos-store-test--with-hermetic-db
     (let* ((old 1000)                   ; 远早于 30 天保留阈值
            (old-id (el-chronos-test--insert-session old)))
+      (el-chronos-test--insert-command old "ancient" 5.0)
       (el-chronos-test--exec "INSERT INTO hourly_gc_attrib (hour_ts, session_id,\
  command, mode, gc_count, gc_ms) VALUES (?, ?, ?, ?, ?, ?)"
                              (list old old-id "c" "m" 1 1.0))
-      (should (el-chronos-store--prune))
+      (should (el-chronos-store-test--prune-now))
+      (should (= 0 (el-chronos-test--scalar
+                    "SELECT count(*) FROM commands WHERE name = 'ancient'")))
       (should (= 1 (el-chronos-test--count "hourly_gc_attrib"))))))
 
 (ert-deftest el-chronos-store-test-hourly-gc-attrib-has-no-foreign-key ()
@@ -2323,6 +3043,197 @@ fixture 特意放了注释行、另一个 ref 行与 peeled 行（`^<sha>'，单
                    (el-chronos-test--scalar
                     "SELECT value FROM session_meta WHERE key = 'git-head'\
  AND session_id = ?" (list el-chronos--session-id))))))
+
+;;; 多实例并发写：busy-retries 上报（D6 / T6）
+
+;; `busy-retries` 与 `flush-failures` 同一机制、同一 `cond` 分支族：快照在事务前取，
+;; COMMIT 成功后按快照减去已上报部分。两条额外约束：
+;;   ① 它**必须**进 `--pending-p` —— D1 路径（open 期建会话行撞锁）只 +1 计数器、不产生
+;;      任何采集数据，「只有 busy-retries 待上报」是常态；漏了它这个计数就永不落库。
+;;   ② 它是中性度量，不进 `--health-bad-keys`（锁竞争被自愈也会上升），故库里该键非 0
+;;      不代表采集异常 —— 判读按路径分：**D1 路径**（open 期建会话行撞锁）看
+;;      「busy-retries 升而 flush-failures 不升 = 自愈生效」；**D2 路径**（flush 写批撞锁）
+;;      这两个数会同时升，判据改为 `dropped-commands` / `dropped-events` 是否跟涨。
+
+(ert-deftest el-chronos-store-test-busy-retries-reported-after-successful-flush ()
+  "撞锁 → `--busy-retries' 为 1 且库内无该键（事务已回滚）；随后成功 flush 把它写进
+`hourly_health' 并把内存计数器扣回 0。
+扣回而不是置 0：事务期间新发生的撞锁必须留住，置 0 会把它们静默吞掉。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "contended" :duration-ms 1.0))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 el-chronos-store--busy-retries))
+      ;; 事务被 ROLLBACK：连自监控行也没进库
+      (should (= 0 (el-chronos-test--count "hourly_health")))
+      ;; 解除注入后重试成功 → 该键才落库，且内存计数器被扣回 0
+      ;; **F2 起语义变化**：撞锁置了 30 秒退避，紧随其后的 flush 会早退；本用例要验的是
+      ;; 「成功 flush 时才上报并扣回」，故把退避推到过去（生产里 ~35 秒后 timer 再触发）。
+      (setq el-chronos-store--flush-backoff-until nil)
+      (should (el-chronos-store-flush))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'busy-retries'")))
+      (should (= 0 el-chronos-store--busy-retries))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'flush-failures'"))))))
+
+(ert-deftest el-chronos-store-test-pending-p-includes-busy-retries ()
+  "只有 `--busy-retries' 非零时 `--pending-p' 必须为真，且 flush **真的执行**（不是早退）。
+这是 D1 路径的落库唯一入口：open 期 `--ensure-session-quiet' 撞锁 → 计数 +1，此后可能
+长时间无任何采集数据（空闲会话），若该计数不进 `--pending-p'，flush timer 每次都判定
+「无待写数据」直接早退，这个计数永远不会上报、修复效果永远不可量化。"
+  (el-chronos-test-with-db
+    (should-not (el-chronos-store--pending-p))
+    (setq el-chronos-store--busy-retries 2)
+    (should (el-chronos-store--pending-p))
+    (should (el-chronos-store-flush))
+    (should (= 2 (el-chronos-test--scalar
+                  "SELECT value FROM hourly_health WHERE key = 'busy-retries'")))
+    (should (= 0 el-chronos-store--busy-retries))))
+
+(ert-deftest el-chronos-store-test-busy-timeout-skipped-when-no-pending ()
+  "无待写数据时 flush **不进** write-timeout 包裹，也不打开任何 pragma。
+否则 5 秒一次的 flush timer 每轮都白跑两次 `sqlite-pragma'（抬 8000 + 恢复 2000），
+而这两次往返对它要做的「什么都不做」毫无帮助。"
+  (el-chronos-test-with-db
+    (let ((pragmas nil)
+          (original (symbol-function 'sqlite-pragma)))
+      (should-not (el-chronos-store--pending-p))
+      (cl-letf (((symbol-function 'sqlite-pragma)
+                 (lambda (db pragma)
+                   (when (string-prefix-p "busy_timeout" pragma)
+                     (push pragma pragmas))
+                   (funcall original db pragma))))
+        (should-not (el-chronos-store-flush)))
+      (should-not pragmas)
+      ;; 句柄仍是默认 2000（没有残留的 8000）
+      (should (= 2000 (caar (sqlite-select el-chronos-store--db
+                                           "PRAGMA busy_timeout")))))))
+
+;;; 行为对齐：close 绕过退避（B1）与丢弃可判读（S1）
+
+(ert-deftest el-chronos-store-test-close-bypasses-flush-backoff ()
+  "撞锁退避未到期时 `store-close' 仍必须尽力 flush 一次（B1）。
+锁住「退避只节流**周期性** flush，不该拦住退出前的最后一次写」：撞锁后本批是**保留**的，
+close 若被退避门早退，紧随其后的 `setq' 会把这批数据静默丢掉（无告警、无计数），与
+close docstring 的承诺相悖。改造前本用例的 `commands` 行数为 0。"
+  (el-chronos-test-with-db
+    (let ((hour (el-chronos-test--hour-ts))
+          (original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "kept-at-close" :duration-ms 7.0))
+      (el-chronos-store-record-slow-event (list :duration-ms 900.0 :kind "block"))
+      (el-chronos-store-record-usage hour 'command "kept-at-close" 1 7.0)
+      ;; 一次撞锁：本批保留、退避置位（30 秒窗口内），库里没有任何半批数据
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should el-chronos-store--buffer)
+      (should el-chronos-store--slow-events)
+      (should (el-chronos-store--flush-backoff-active-p))
+      (should (= 0 (el-chronos-test--count "commands")))
+      ;; 注入已解除、退避仍未到期：close 必须绕过退避写一次
+      (el-chronos-store-close)
+      (should (el-chronos-store-open el-chronos-db-path))
+      (should (= 1 (el-chronos-test--count "commands")))
+      (should (= 1 (el-chronos-test--count "slow_events")))
+      (should (= 1 (el-chronos-test--count "hourly_usage")))
+      ;; 撞锁计数正确：一次撞锁随 close 的那次 flush 上报（内存计数器由 close 归零，
+      ;; 库里的累计值是唯一证据）
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'flush-failures'")))
+      (should (= 1 (el-chronos-test--scalar
+                    "SELECT value FROM hourly_health WHERE key = 'busy-retries'")))
+      ;; 没有任何数据被丢弃（自愈路径不写 dropped-*）
+      (should-not (el-chronos-test--scalar
+                   "SELECT value FROM hourly_health WHERE key = 'dropped-commands'")))))
+
+(ert-deftest el-chronos-store-test-locked-discard-counts-dropped ()
+  "撞锁达到上限丢弃本批时，丢弃条数必须记进 `--dropped-commands' / `--dropped-events'（S1）。
+锁住判读口径的另一半：撞锁分支对 `busy-retries' 与 `flush-failures' **同时 +1**，
+保留重试与真丢弃在计数器上完全一样 —— 没有本用例的两个数，操作者无法判断「数据丢没丢」。
+条数口径为**缓冲长度**（明细 + 慢事件各按自己的计数），故造 2 命令 + 3 慢事件。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "c1" :duration-ms 1.0))
+      (el-chronos-store-record-command (list :name "c2" :duration-ms 1.0))
+      (dotimes (i 3)
+        (el-chronos-store-record-slow-event
+         (list :duration-ms (+ 500.0 i) :kind "block")))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (dotimes (_ (1- el-chronos-store--max-lock-retries))
+          ;; 撞锁即置 30 秒退避，紧随其后的 flush 会早退；模拟「退避到期、timer 再触发」
+          (setq el-chronos-store--flush-backoff-until nil)
+          (should-not (el-chronos-store-flush)))
+        ;; 保留重试阶段一条都不计：撞锁本身不是丢弃
+        (should (= 0 el-chronos-store--dropped-commands))
+        (should (= 0 el-chronos-store--dropped-events))
+        ;; 第 6 次：达到上限，本批按计划丢弃
+        (setq el-chronos-store--flush-backoff-until nil)
+        (should-not (el-chronos-store-flush)))
+      (should-not el-chronos-store--buffer)
+      (should-not el-chronos-store--slow-events)
+      ;; 条数必须在清空缓冲**之前**取，否则恒为 0
+      (should (= 2 el-chronos-store--dropped-commands))
+      (should (= 3 el-chronos-store--dropped-events))
+      (should (= el-chronos-store--max-lock-retries el-chronos-store--flush-failures))
+      (should (= el-chronos-store--max-lock-retries el-chronos-store--busy-retries)))))
+
+(ert-deftest el-chronos-store-test-non-lock-discard-counts-dropped ()
+  "非锁错误（磁盘满等）丢弃本批时同样累加丢弃条数（S1）。
+锁住「两条丢弃路径口径一致」：只给撞锁上限那条路径计数，会让磁盘满时的丢数据在
+`hourly_health' 里完全不可见。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "disk-full" :duration-ms 5.0))
+      (el-chronos-store-record-slow-event (list :duration-ms 800.0 :kind "block"))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (error "disk full")
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should-not el-chronos-store--buffer)
+      (should-not el-chronos-store--slow-events)
+      (should (= 1 el-chronos-store--dropped-commands))
+      (should (= 1 el-chronos-store--dropped-events))
+      (should (= 1 el-chronos-store--flush-failures)))))
+
+(ert-deftest el-chronos-store-test-locked-retry-does-not-count-dropped ()
+  "撞锁保留重试后成功（D2 自愈路径）**不计**丢弃（S1）。
+这是判读口径的前一半：`dropped-*` 不升 = 数据没丢，只有它同时升才代表真丢。
+若在撞锁分支无条件累加，自愈与丢弃将无法区分，本数就失去诊断价值。"
+  (el-chronos-test-with-db
+    (let ((original (symbol-function 'sqlite-execute)))
+      (el-chronos-store-record-command (list :name "retried" :duration-ms 3.0))
+      (el-chronos-store-record-command (list :name "retried-2" :duration-ms 4.0))
+      (cl-letf (((symbol-function 'sqlite-execute)
+                 (lambda (db sql &rest args)
+                   (if (string-match-p "COMMIT" sql)
+                       (signal 'sqlite-locked-error '("database is locked"))
+                     (apply original db sql args)))))
+        (should-not (el-chronos-store-flush)))
+      (should (= 1 el-chronos-store--flush-lock-streak))
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 0 el-chronos-store--dropped-events))
+      (setq el-chronos-store--flush-backoff-until nil)
+      (should (el-chronos-store-flush))
+      (should (= 2 (el-chronos-test--count "commands")))
+      ;; 自愈之后仍然一条不丢
+      (should (= 0 el-chronos-store--dropped-commands))
+      (should (= 0 el-chronos-store--dropped-events))
+      (should (= 0 el-chronos-store--flush-lock-streak)))))
 
 (provide 'el-chronos-store-test)
 

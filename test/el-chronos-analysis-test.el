@@ -1272,6 +1272,25 @@ SESSION-ID 默认 0；显式传入可造同一小时的多个会话行（主键�
       (dolist (range '(30d 7d 1d))
         (should (= 3600000 (plist-get (funcall fn range) :bucket-span)))))))
 
+(ert-deftest el-chronos-analysis-test-health-busy-retries-neutral ()
+  "健康 plist 含 `:busy-retries'；它**不参与** `:ok-p' 判定 —— 锁竞争被成功自愈也会让
+这个数上升，把它当坏消息会让「自愈生效」被读成「采集异常」。
+与 `:flush-failures' 同构（整数化）：库内 REAL，取整后返回。"
+  (el-chronos-test-with-db
+    (let* ((window (el-chronos-analysis-test--window))
+           (hour (el-chronos-test--hour-ts)))
+      ;; 空库：键在、值为 0（不是 nil）——「没有撞锁」与「这个字段不存在」要能区分
+      (should (= 0 (plist-get (el-chronos-analysis-health window) :busy-retries)))
+      (el-chronos-test--insert-health hour "busy-retries" 4)
+      (el-chronos-test--insert-health hour "flush-count" 2)
+      (el-chronos-test--insert-health hour "flush-ms" 10.0)
+      (let ((health (el-chronos-analysis-health window)))
+        (should (= 4 (plist-get health :busy-retries)))
+        ;; 中性度量：坏消息键全 0 → `:ok-p' 仍为 t
+        (should (eq t (plist-get health :ok-p)))
+        (should (= 0 (plist-get health :flush-failures)))
+        (should (= 3 (plist-get health :rows)))))))
+
 (provide 'el-chronos-analysis-test)
 
 ;;; el-chronos-analysis-test.el ends here

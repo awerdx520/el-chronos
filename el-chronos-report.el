@@ -532,7 +532,7 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
 (defun el-chronos-report--section-health (health)
   "渲染「采集健康」节；HEALTH 为 `el-chronos-analysis-health' 的结果或 nil。
 `指标' / `值' 两列：丢弃命令、丢弃事件、flush 失败、flush 次数、flush 平均耗时、
-采样窗口丢失。
+撞锁重试、采样窗口丢失。
 
 四个分支（I11：任何分支都不省略整节）：
 ① HEALTH 为 nil（查询失败）→ 空表 → `（无数据）'；
@@ -541,20 +541,31 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
    照抄会显示「本期无采集异常」，把「没采集」读成「一切正常」；
 ③ `:rows' 非 0 且 `:ok-p' 为 t → 只给一行「本期无采集异常」，括号里带 flush 次数与
    平均耗时 —— 它们是正常运转的度量，「无异常」不等于「无信息」；
+   撞锁重试 > 0 时再补一句「撞锁重试 N 次」：它不进坏消息键，D1 路径（open 期撞锁）
+   可以让它非 0 而 flush-failures 仍为 0 —— 不在这里露出，这种「已自愈」的常态
+   就永远看不见（为 0 时不追加，文案逐字不变）；
 ④ 否则渲染完整指标表。"
   (let ((rows (and health (plist-get health :rows)))
         (ok (and health (plist-get health :ok-p)))
-        (value (lambda (key) (and health (plist-get health key)))))
+        (value (lambda (key) (and health (plist-get health key))))
+        ;; 撞锁重试的中性度量子句：0 或取不到时返回空串（不改动既有文案）。
+        (busy-note (lambda ()
+                     (let ((n (and health (plist-get health :busy-retries))))
+                       (if (and (numberp n) (> n 0))
+                           (format "；撞锁重试 %s 次" (el-chronos-report--num n))
+                         "")))))
     (cond
      ((null health) (el-chronos-report--table-section "采集健康" '("指标" "值") nil))
      ((and (numberp rows) (zerop rows))
       (concat "* 采集健康\n" el-chronos-report--health-no-data "\n\n"))
      (ok (concat "* 采集健康\n"
                  (if (> (or (funcall value :flush-count) 0) 0)
-                     (format "本期无采集异常（flush %s 次，平均 %s）\n\n"
+                     (format "本期无采集异常（flush %s 次，平均 %s%s）\n\n"
                              (el-chronos-report--num (funcall value :flush-count))
-                             (el-chronos-report--ms->human (funcall value :flush-avg-ms)))
-                   "本期无采集异常（本期无 flush 记录）\n\n")))
+                             (el-chronos-report--ms->human (funcall value :flush-avg-ms))
+                             (funcall busy-note))
+                   (format "本期无采集异常（本期无 flush 记录%s）\n\n"
+                           (funcall busy-note)))))
      (t (el-chronos-report--table-section
          "采集健康" '("指标" "值")
          (list (list "丢弃命令" (el-chronos-report--num (funcall value :dropped-commands)))
@@ -563,6 +574,7 @@ first-idle，缺的跳过）；② 包加载 TOP（`包' / `耗时'，按耗时�
                (list "flush 次数" (el-chronos-report--num (funcall value :flush-count)))
                (list "flush 平均耗时"
                      (el-chronos-report--ms->human (funcall value :flush-avg-ms)))
+               (list "撞锁重试" (el-chronos-report--num (funcall value :busy-retries)))
                (list "采样窗口丢失" (el-chronos-report--num (funcall value :sample-misses)))))))))
 
 (defun el-chronos-report--section-config (history)
@@ -824,6 +836,9 @@ BREAKDOWN 为 nil 时只输出表头（无数据不省略区块，与 org 报告
   "生成「采集健康」CSV 区块（`# section: health'）：`metric' / `value' 两列的窄表。
 键名沿用 `hourly_health.key' 的写法（snake_case），另加一行 `rows'（窗口内行数）——
 导出件同样要能区分「没采集」与「没异常」，否则下游会重犯 org 报告曾犯的错（I11）。
+`busy_retries' 是撞锁重试次数（中性度量，不进 `:ok-p'）；本函数与
+`el-chronos-web--csv-health' 是内联重复实现，**两侧指标集合必须同步**
+（`el-chronos-report-test-csv-health-metrics-match-web' 逐项比对）。
 HEALTH 为 nil（查询失败）时只输出表头。"
   (el-chronos-report--csv-block
    "health" '("metric" "value")
@@ -834,6 +849,7 @@ HEALTH 为 nil（查询失败）时只输出表头。"
            (list "flush_count" (plist-get health :flush-count))
            (list "flush_ms" (plist-get health :flush-ms))
            (list "flush_avg_ms" (plist-get health :flush-avg-ms))
+           (list "busy_retries" (plist-get health :busy-retries))
            (list "sample_misses" (plist-get health :sample-misses))
            (list "rows" (plist-get health :rows))))))
 

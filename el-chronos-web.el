@@ -431,6 +431,9 @@ BREAKDOWN 为 nil 时只输出表头（I11：无数据不省略区块）。"
   "生成「采集健康」CSV 区块（`# section: health'）：`metric' / `value' 两列的窄表。
 键名沿用 `hourly_health.key' 的写法（snake_case），并**必须带 `rows' 一行**（窗口内行数）
 —— 导出件同样要能区分「没采集」与「没异常」，否则下游会重犯报告层曾犯的错（I11）。
+`busy_retries' 是撞锁重试次数（中性度量，不进 `:ok-p'）；本函数与
+`el-chronos-report--csv-health' 是内联重复实现，**两侧指标集合必须同步**
+（`el-chronos-report-test-csv-health-metrics-match-web' 逐项比对）。
 HEALTH 为 nil（查询失败）时只输出表头。"
   (el-chronos-web--csv-block
    "health" '("metric" "value")
@@ -441,6 +444,7 @@ HEALTH 为 nil（查询失败）时只输出表头。"
            (list "flush_count" (plist-get health :flush-count))
            (list "flush_ms" (plist-get health :flush-ms))
            (list "flush_avg_ms" (plist-get health :flush-avg-ms))
+           (list "busy_retries" (plist-get health :busy-retries))
            (list "sample_misses" (plist-get health :sample-misses))
            (list "rows" (plist-get health :rows))))))
 
@@ -727,7 +731,11 @@ analysis 返回 nil（查询失败）时降级为 JSON `null'。"
   "GET /api/health：窗口内采集器自监控计数的汇总。
 响应是 `el-chronos-analysis-health' 的 plist 加一个 `:range'：
 `:dropped-commands' `:dropped-events' `:flush-failures' `:flush-count'
-`:flush-ms' `:flush-avg-ms' `:sample-misses' `:ok-p' `:rows'。
+`:flush-ms' `:flush-avg-ms' `:busy-retries' `:sample-misses' `:ok-p' `:rows'。
+`:busy-retries' 是**中性度量**（锁竞争被成功自愈也会上升），刻意不计入 `:ok-p' ——
+「busy-retries 升而 flush-failures 不升」是 **D1 路径**（open 期建会话行撞锁）的
+自愈判据，不是异常；**D2 路径**（flush 写批撞锁）这两个数会同时升，判据改为
+`:dropped-commands' / `:dropped-events' 是否跟涨（跟涨 = 数据真丢）。
 **`:rows' 必须出现在响应里**：它是区分「本期无采集异常」（`:ok-p' 为 true 且 `:rows' > 0）
 与「本期无采集数据」（`:rows' = 0）的唯一依据 —— analysis 在一条 health 行都没有时同样
 返回 `:ok-p' 为 t，只看 `:ok-p' 会把「没采集」读成「一切正常」（T7b 在报告层修过的同一
@@ -1152,7 +1160,10 @@ function healthPanel(h){
     el.innerHTML=`<p class='mut'>${esc('本期无采集数据（采集器尚未写入健康指标）')}</p>`;return;}
   if(h['ok-p']){
     el.innerHTML=`<p class='ok'>${esc('本期无采集异常（flush '+nf(h['flush-count']||0)+' 次，平均 '
-      +(h['flush-avg-ms']==null?'-':ms(h['flush-avg-ms']))+'）')}</p>`;
+      +(h['flush-avg-ms']==null?'-':ms(h['flush-avg-ms']))+'）'
+      // 撞锁重试是中性度量（不进 ok-p）：>0 时在摘要里点出来，否则「有锁竞争但已自愈」这一
+      // 常态永远看不见。为 0 时不追加，保持文案与既有断言逐字一致。
+      +(Number(h['busy-retries']||0)>0?'；撞锁重试 '+nf(h['busy-retries'])+' 次':''))}</p>`;
     if(!Number(h['flush-count']||0))el.innerHTML+=`<p class='mut'>${esc('（本期无 flush 记录）')}</p>`;
     return;}
   const v=k=>h[k]==null?'-':nf(h[k]);
@@ -1161,6 +1172,7 @@ function healthPanel(h){
     ['flush 失败',v('flush-failures')],['flush 次数',v('flush-count')],
     ['flush 总耗时',h['flush-ms']==null?'-':ms(h['flush-ms'])],
     ['flush 平均耗时',h['flush-avg-ms']==null?'-':ms(h['flush-avg-ms'])],
+    ['撞锁重试',v('busy-retries')],
     ['采样窗口丢失',v('sample-misses')],['健康行数',v('rows')]],'（无数据）');}
 function confPanel(c){
   const el=$('conf'),items=(c&&c.sessions)||[];
