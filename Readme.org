@@ -355,21 +355,28 @@ make full-check     # check-parens + test
 
 * 当前状态
 
-- 阶段：**Phase 4（Review & Document）**，全部计划（含 GC 归因）均已归档。已实现：
+- 阶段：**Phase 4（Review & Document）**，全部计划（含 GC 归因与多实例并发写）均已归档。已实现：
   **13 表 + 3 索引**（schema v5 = v1 的 6 表 + =hourly_gc= / =startup_phases= / =hourly_health= / =session_meta=（v2）
   + =hourly_drift=（v3）+ =hourly_resources=（v4）+ =hourly_gc_attrib=（v5））、
   七条采集路径（启动 / 命令边界 / 心跳两档判定（block 2000ms + drift 500ms） / 采样 tick / 启动打点（**可由 early-init 探针前移**） / GC 与自监控 / 进程资源（CPU × RSS × 线程 × 系统负载））、归因（**self + 栈包含 + GC 三口径**：GC 那张表回答「GC 发生在哪条命令之后」）、
   **22 个**只读聚合查询、org 报告（**16 节**）、Web dashboard（**19 条只读路由**）、单命令剖析、
-  ERT **336** 用例（含 =test/el-chronos-autoload-test.el= 的 3 条 autoload 契约用例、
+  ERT **375** 用例（含 =test/el-chronos-autoload-test.el= 的 3 条 autoload 契约用例、
   =test/el-chronos-startup-probe-test.el= 的 16 条探针用例）、文档全集。
   **autoload 契约**：16 个 interactive 命令全部带 =;;;###autoload= cookie，生成入口 =make autoloads=
   （产物不入库、不进 L1/L2），供 =use-package= 等声明式配置使用。
+  **多实例共享库的锁竞争已自愈**：两个 Emacs 实例共用同一个 =chronos.sqlite= 时，撞锁不再让实例停止采集、
+  也不再整批丢数据——会话行**延迟补建**（=store-open= 不因撞锁返回 nil）、flush 撞锁**保留重试 + 30 秒退避**、
+  写事务改为 =BEGIN IMMEDIATE= 起手取写锁、=busy_timeout= 分 2 s / 8 s 两档、=prune= 候选预检与 1 小时节流；
+  并新增 =hourly_health.busy-retries= 使修复可量化（=busy-retries= 上升而 =dropped-*= 不升即自愈生效）。
+  见 [[file:docs/architecture.org][架构与实测结论]]「多进程并发写（锁竞争处置）」与
+  [[file:docs/adr/0007-multi-process-write-concurrency.md][ADR-0007 多进程共享写库]]。
 - 计划（已全部归档）：[[file:openspec/completed/startup-probe-and-resources.md][openspec/completed/startup-probe-and-resources.md]]（启动探针 + 资源观测，T1–T9 已完成，2026-10-26 归档）、
   [[file:openspec/completed/2026-10-26-compact-observability.md][openspec/completed/2026-10-26-compact-observability.md]]（观测能力收敛：栈包含归因 + 命令型慢事件不再记自身栈，T1–T5 已完成，2026-10-26 归档）、
-  [[file:openspec/completed/gc-attribution.md][openspec/completed/gc-attribution.md]]（GC 归因：schema v5 =hourly_gc_attrib= + 报告第 16 节，C1a–C1c 与全量验证均已完成，2026-10-26 归档）
+  [[file:openspec/completed/gc-attribution.md][openspec/completed/gc-attribution.md]]（GC 归因：schema v5 =hourly_gc_attrib= + 报告第 16 节，C1a–C1c 与全量验证均已完成，2026-10-26 归档）、
+  [[file:openspec/completed/multi-instance-concurrency.md][openspec/completed/multi-instance-concurrency.md]]（多实例并发写：锁竞争自愈 + 降竞争，T1–T10 全部完成，ADR-0007，2026-10-30 归档）
 - 计划：[[file:openspec/completed/el-chronos-core.md][openspec/completed/el-chronos-core.md]]（核心，2026-10-24 归档）、
   [[file:openspec/completed/expand-observation-surface.md][openspec/completed/expand-observation-surface.md]]（观测面扩展 S1 已完成，T1–T10，2026-10-25 归档）
-- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]、[[file:docs/adr/0005-two-tier-block-detection.md][ADR-0005 两档阈值（block + drift）]]、[[file:docs/adr/0006-resource-observation.md][ADR-0006 启动探针提前到 early-init + 资源维度观测]]
+- 决策：[[file:openspec/decisions.md][openspec/decisions.md]]、[[file:docs/adr/0001-observer-architecture.md][ADR-0001 观测器架构]]、[[file:docs/adr/0002-dual-visualization.md][ADR-0002 双形态可视化（已被 ADR-0003 取代）]]、[[file:docs/adr/0003-web-only-visualization.md][ADR-0003 可视化收敛为 Web dashboard + org 报告]]、[[file:docs/adr/0004-observation-surface-expansion.md][ADR-0004 观测面扩展]]、[[file:docs/adr/0005-two-tier-block-detection.md][ADR-0005 两档阈值（block + drift）]]、[[file:docs/adr/0006-resource-observation.md][ADR-0006 启动探针提前到 early-init + 资源维度观测]]、[[file:docs/adr/0007-multi-process-write-concurrency.md][ADR-0007 多进程共享写库：锁竞争自愈 + 降竞争]]
 - 技术债：[[file:openspec/tech-debt.md][openspec/tech-debt.md]]。仍未实施：P95 精度 TD-7、
   清理粒度不一致 TD-17、JSON 导出键名风格 TD-18、CSV 导出两处内联重复 TD-19、
   GUI 侧开销与 redisplay 未实测 TD-21、drift 阈值未经数据校准 TD-22、
@@ -377,7 +384,8 @@ make full-check     # check-parens + test
   测试临时目录残留 **TD-25**、命令窗口内采样栈未按命令切分 **TD-26**、=hourly_resources= 缺独立 RSS 样本计数 **TD-27**；
   按设计**不修**的边界：堆大小需 Emacs **31.1+**（TD-15）、启动分解的残留覆盖边界（TD-16，主体已由 early-init 探针解决）；
   已关闭：TD-1 =.eln= 归因、TD-2 阻塞覆盖率、TD-3 采样开销、TD-5 ETAF 性能、TD-9 局部 hook、TD-11 阻塞捕获残余缺口（主体 2026-10-25，残余转 TD-21～TD-24）、TD-12 Web 自观测抑制、TD-13 全 nil 栈；
-  本批（GC 归因）新增 / 改写：**TD-32**（GC 归因 command 维度覆盖率有限：实测 45 次中 37 次即 88.1% 落 =<none>=，因为 GC 多发生在命令循环等待输入的窗口）、**TD-33**（归因键与 =commands.name= 的 =real-this-command= 口径不一致，低优先）、**TD-34**（Org 的 code 标记被误写成带反斜杠的形式：=architecture.org= 已修、=schema.org= 待修）、**TD-35**（=--post-gc= docstring 的「唯一分配」措辞不精确，低优先）
+  本批（GC 归因）新增 / 改写：**TD-32**（GC 归因 command 维度覆盖率有限：实测 45 次中 37 次即 88.1% 落 =<none>=，因为 GC 多发生在命令循环等待输入的窗口）、**TD-33**（归因键与 =commands.name= 的 =real-this-command= 口径不一致，低优先）、**TD-34**（Org 的 code 标记被误写成带反斜杠的形式：=architecture.org= 已修、=schema.org= 待修）、**TD-35**（=--post-gc= docstring 的「唯一分配」措辞不精确，低优先）；
+  多实例并发写批新增：**TD-36**（会话行延迟补建期间**聚合**数据缺一段、明细保留）、**TD-37**（=--prune= 只由 =store-open= 调用，retention 的实际生效仍依赖实例重启）、**TD-38**（延迟补建使 =sessions.started_at= 可能等于补建时刻）、**TD-39**（flush 的两处 =sqlite-select= 位于 =condition-case= 之外，未实施）
 - 文档：[[file:docs/architecture.org][架构与实测结论]]、[[file:docs/schema.org][数据模型]]、[[file:docs/ui.org][界面与路由]]、[[file:docs/api.org][接口索引]]、[[file:docs/operations.org][运维手册]]
 
 * 许可证

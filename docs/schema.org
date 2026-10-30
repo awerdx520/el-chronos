@@ -322,15 +322,16 @@ NULL —— 该小时最后一次写入恰好是 NULL 时，整小时采到的�
 | =key= | TEXT NOT NULL | 计数字段名，见下方键名单 |
 | =value= | REAL NOT NULL DEFAULT 0 | 本小时该键的量（计数或毫秒），upsert **累加** |
 
-主键：=(hour_ts, session_id, key)=。键名单固定为六个（=store= 侧 5 个、=collect= 侧 1 个）：
+主键：=(hour_ts, session_id, key)=。键名单固定为七个（=store= 侧 6 个、=collect= 侧 1 个）：
 
 | 键 | 含义 | 写入点 |
 |---|---|---|
-| =dropped-commands= | 因缓冲达 =--max-buffer-items= 被截断而丢弃的**命令事件**条数 | store =--push-event= |
-| =dropped-events= | 同上，被丢弃的**慢事件**条数（与上一行按 SLOT 分流，不混计） | store =--push-event= |
-| =flush-failures= | flush 事务 ROLLBACK 的次数 | store =el-chronos-store-flush= 的 error 分支 |
+| =dropped-commands= | 丢失的**命令事件**条数，两类来源同口径累加：① 因缓冲达 =--max-buffer-items= 被截断；② **整批写库失败被丢弃**（撞锁达上限 / 非锁错误） | store =--push-event=、flush 的两条丢弃分支（清空缓冲**之前**取 =length=） |
+| =dropped-events= | 同上，被丢弃的**慢事件**条数（与上一行按 SLOT 分流，不混计） | store =--push-event=、flush 的两条丢弃分支 |
+| =flush-failures= | flush 事务 ROLLBACK 的次数（**撞锁后保留重试的那一次也计入** —— 故它不能区分「自愈」与「丢弃」，判据见 =busy-retries= 行） | store =el-chronos-store-flush= 的 =sqlite-locked-error= 与 =(error ...)= 两个分支 |
 | =flush-count= | flush COMMIT 成功的次数 | store flush 成功路径 |
 | =flush-ms= | flush 累计耗时（毫秒，=float-time= 差 × 1000） | store flush 成功路径 |
+| =busy-retries= | **写库撞锁次数**（=sqlite-locked-error=）。语义：锁竞争的**中性度量**，**不是坏消息键** —— 竞争被成功自愈同样会让它上升，故不进 =el-chronos-analysis--health-bad-keys=、不参与 =:ok-p= 判据。累加口径：**每次**撞锁 +1，含 flush 保留重试那次与 =--ensure-session-quiet= 建会话行那次（后者不产生任何采集数据，是「只有它待上报」的常态）。上报机制与 =flush-failures= 同构：事务前取快照 → COMMIT 成功后**扣减已上报部分**（不是置 0，否则上报期间新发生的撞锁会被抹掉）。判读：配合 =dropped-commands= / =dropped-events= 区分「自愈」与「真丢」—— 前者升而 =dropped-*= 不升就是保留重试成功，两者同时升才是真丢 | store =el-chronos-store-flush= 的 =sqlite-locked-error= 分支与 =--ensure-session-quiet=；经 =--health-snapshot= 上报（**不在** =el-chronos-store-record-health= 的枚举内，外部调用方不得写这个键） |
 | =sample-misses= | 采样窗口丢失次数（相邻两次 tick 间隔 > 2 × =el-chronos-sample-window-seconds=） | collect =--sample-tick= |
 
 **已知悖论（必然存在，不是 bug）**：flush 失败时无法把失败计数写进库——写库本身就是失败的那件事。
@@ -589,7 +590,7 @@ ORDER BY hour_ts;
 | =hourly_usage= | **永久** | 小时聚合，行数 ≤ 24 × 维度取值数/天 |
 | =hourly_stacks= | **永久** | top-N 淘汰（默认 200/小时/会话），行数 ≤ 24 × 200 × 会话数/天 |
 | =hourly_gc= | **永久**（仅 purge） | 每会话每小时 ≤ 1 行；与既有 =hourly_*= 同量级 |
-| =hourly_health= | **永久**（仅 purge） | 每会话每小时 ≤ 6 行（6 个固定键）；与既有 =hourly_*= 同量级 |
+| =hourly_health= | **永久**（仅 purge） | 每会话每小时 ≤ 7 行（7 个固定键，只写非零项）；与既有 =hourly_*= 同量级 |
 | =hourly_drift= | **永久**（仅 purge） | 每会话每小时 ≤ 1 行；只在命令外 500–2000ms 停转发生时写入，主键去重 upsert。与 =commands= 的时长**不可相加** |
 | =hourly_resources= | **永久**（仅 purge） | 每会话每小时 ≤ 1 行；v4 新增。只在 10 秒采样 tick 上写入，主键去重 upsert；行数上界与 =hourly_gc= 同量级 |
 | =hourly_gc_attrib= | **永久**（仅 purge） | 每会话每小时 ≤ 实际 =(command, mode)= **组合数**（不是笛卡尔积）；v5 新增。只在 =post-gc-hook= 累积后经 10 秒窗口 flush 写入，四元主键累加 upsert；量级与 =hourly_gc= 同阶偏低（归因键只在真的发生 GC 时出现） |

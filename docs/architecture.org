@@ -363,6 +363,116 @@ analysis 只读数据库，呈现层只消费 plist——因此新增一种呈�
 - sqlite 不可用（Emacs < 29 或编译时缺 sqlite）：=message= 警告并禁用，不报错、不阻断启动。
 - 采集路径全程 =condition-case=，失败降级 =unknown= 并继续（I6）。
 
+* 多进程并发写（锁竞争处置）
+
+el-chronos 的数据模型是**汇总**的：=sessions= 每会话一行、=sessions.host= 记主机名、
+=hourly_*= 的主键含 =session_id= —— 这些设计只有在「多个 Emacs 进程写进同一个库」时才有意义，
+I3（数据只写 =el-chronos-db-path=）也把「一个库文件」定成不变量。代价是 SQLite 的**单写者**
+模型：同一时刻只允许一个连接持写锁，其他写者要么等（=busy_timeout= 期间由 busy handler
+轮询）、要么失败（=SQLITE_BUSY=）。本机常态是 GUI 主实例 + 隔离验证实例（=elisp-test=）+
+偶发 =emacs -Q --batch=，三者共用 =<user-emacs-directory>/.local/state/chronos/chronos.sqlite=。
+
+因此锁竞争在本项目里属**正常语义**而非故障：把它当故障处置（丢弃整批数据、放弃整场采集）
+才是缺陷。下面的机制全部围绕「竞争时自愈 + 从源头降竞争 + 让竞争可量化」，决策全过程见
+[[file:adr/0007-multi-process-write-concurrency.md][ADR-0007]]。
+
+** 实测：失败率很低，但失败后果不对称
+
+真实库取证（2026-10-30，47 MB，schema v5，WAL，=-wal= 4.5 MB）：
+
+| 项 | 实测值 |
+|---|---|
+| =flush-failures= / =flush-count= | **7 / 48158 = 0.0145%**，散落在 3 个小时桶 |
+| =commands= 行数 | 118 466 |
+| =sessions= 行数 | 83 → 85（观测期间仍在增长），单 host |
+| 同一小时桶内最多并存会话数 | 9 |
+
+万分之一点五按比例看可忽略，但**失败之后发生什么**不能忽略：修复前一次 2 秒的锁竞争就能让
+该实例 =store-open= 返回 nil、整场会话零数据（见下表模式 ① 与下文「会话行延迟补建」）。
+
+** 三种失败模式（=emacs -Q --batch= 双进程实测，Emacs 32.0.50）
+
+| # | 模式 | 实测证据 | =busy_timeout= 能否救 | 对应处置 |
+|---|---|---|---|---|
+| ① | 对端**单次**持写锁超过超时 | 对端持锁 2.5 s → 本端 =dt= 2.003 s 后抛 =(sqlite-locked-error "database is locked")= | 能（延长时间） | 超时分层（后台写 8000 ms）+ 保留重试 |
+| ② | 对端**零间隙**背靠背抢锁，饿死对手 | 每次事务只持 0.2 s、间隙 0.2 s → 双方 0 失败；**间隙归零 → 一方连续 4 次等满 2 s 全失败** | 有限（可能永远撞不进空隙） | 保留重试（=streak < 6=）+ 30 秒退避 |
+| ③ | deferred =BEGIN= 里**先读后写** | 升级写失败，**等锁耗时 0.000 s**（busy handler 未被调用，=SQLITE_BUSY_SNAPSHOT=） | **无效** | 7 处写事务改 =BEGIN IMMEDIATE=（起手即抢锁） |
+
+模式 ③ 的要害是「加超时救不回来」：快照冲突路径上 busy handler 根本不跑，只能靠事务起点就
+拿写锁。chronos 现状的 7 处事务（迁移 v2 / v3 / v4 / v5 + flush + prune + purge）首条语句全是
+写，不存在读后升级病灶；改 =BEGIN IMMEDIATE= 是**消灭复发条件**而非修既有 bug —— 只要将来有人
+在 =BEGIN= 与首条写语句之间插一条 =SELECT=，模式 ③ 就会静默复活。
+
+** 分层处置（六道）
+
+1. **写事务改 =BEGIN IMMEDIATE=（7 处）**：迁移四步 + flush + prune + purge。抢锁前移到事务
+   起点，不会「干完半批活才失败」。
+2. **超时分层**：启动路径（=--open-db= 与建会话行）保持 =busy_timeout= 2000 ms；后台批量写
+   （flush / prune / purge）经 =--call-with-write-timeout= 抬到 8000 ms
+   （=--busy-timeout-write-ms=）。依据：open 拖长就是**拖慢 Emacs 启动**，而 flush 是后台写、
+   写完才继续采集，等 8 秒无人感知。8 秒仍是**有界**等待（卡死时最坏多占 8 秒主线程）。
+   恢复必须走 =unwind-protect= —— 连接级 pragma 会残留，漏恢复会让后续所有写入都等 8 秒。
+3. **撞锁保留重试**：flush 的 =condition-case= 先接 =sqlite-locked-error=（**分支顺序是硬
+   约束**：它是 =sqlite-error= → =error= 的子类型，排在 =(error ...)= 之后会被静默吞掉，锁竞争
+   又会走「丢弃整批」，且不注入 locked 错误的用例根本不会变红）。撞锁 → =ROLLBACK= +
+   =--flush-failures= / =--busy-retries= / =--flush-lock-streak= 各 +1，**保留**明细缓冲、
+   慢事件缓冲与九个聚合 hash（=ROLLBACK= 之后库状态与事务前一致，原样重写不会重复计数）；
+   =streak= 达到 =--max-lock-retries=（6）才丢弃本批并告警。其余错误（磁盘满、=no such table=、
+   约束冲突）一律**立即丢弃**：重试无意义，保留只会让内存无界增长。
+4. **30 秒退避**（=--flush-backoff-seconds= / =--flush-backoff-until=）：保留重试让
+   =--pending-p= 恒真，下一个 flush timer（5 秒）立刻再撞，而单次撞锁最坏等满 8 秒 ——
+   实测「8 次 × 8.01 s」主线程被占满，比老行为（失败即丢弃后早退）**更糟**。故撞锁分支的保留
+   与丢弃**两条路径**都置 =now + 30 s=，退避期内 flush **最前面**就早退（不碰库、不打 pragma、
+   缓冲与计数器原样）。=store-close= 在它那次 flush 之前清零退避：退避是给周期性 flush 的
+   节流，不该拦住「退出前的最后一次写」。
+5. **prune 候选预检 + 1 小时节流**：=--prune= 先按 =--prune-interval-seconds=（3600 s）节流，
+   过门后对 =commands= 与 =slow_events= 各做一次 =SELECT count(*) ... WHERE ts < ?=（走
+   =idx_commands_ts= / =idx_slow_events_ts=，WAL 下读锁不阻塞写者），两表都为 0 就**完全不开
+   写事务**。实测的两次严重撞锁都源于「无候选也开事务」的空转。
+   （=--prune= 的唯一调用点是 =store-open=，不挂周期 timer，见
+   [[file:operations.org][docs/operations.org]]「保留策略的实际生效依赖实例重启」。）
+6. **会话行延迟补建**：=--ensure-session-quiet= 把「建会话行」从 open 的**前置条件**降级为
+   「尽力而为」—— 撞锁时只记一次 =--busy-retries= 并返回 nil（从不抛错），=store-open= 照常
+   交出句柄、照常起 flush timer；=el-chronos-store-flush= 在事务**之前**补建一次（必须发生在
+   =let*= 求值之前，否则 =session= / =stack-session= / =session-known= 三个绑定取到旧的 nil）。
+   这消灭了最坏结局：一次 2 秒竞争不再等于「整场会话零数据」。
+
+** 判读口径：撞锁自愈 vs 真的丢了
+
+撞锁分支对 =--busy-retries= 与 =--flush-failures= **同时 +1**，故这两个数**不能**区分
+「保留重试」与「整批丢弃」。区分靠 =dropped-commands= / =dropped-events=：
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| =busy-retries= 升，=dropped-commands= / =dropped-events= **不升** | 本批被保留、下轮重试成功（自愈，数据没丢） | 无需处理；只有被 600 秒限流的「撞锁（第 N/6 次）」过程告警 |
+| =dropped-*= **同时升**（条数 = 被丢弃的缓冲长度） | 真的丢了（streak 到 6，或非锁错误） | 查对端在干什么（大 prune / 迁移 / 外部 =sqlite3= 长事务）；伴随一条「本批已按计划丢弃」**结果告警**（=--warn-force=，绕过节流） |
+| =busy-retries= 升而 =flush-failures= 不升 | D1 路径（=store-open= 期建会话行撞锁），不涉及任何缓冲 | 自愈生效的标记，忽略即可 |
+
+一句话口诀：**看 =dropped-*= 是否跟涨**。运行期另一路信号是告警文案 ——「保留待下次重试」是
+过程（≠ 丢数据），「已按计划丢弃」才是结果。四键（=busy-retries= / =flush-failures= /
+=dropped-commands= / =dropped-events=）都进 =hourly_health=，故事后可判读。
+
+** 代价：崩溃丢数据窗口从 5 s 放大到 35 s
+
+撞锁期间本批被保留，为免「每 5 秒白撞 8 秒」而退避 30 秒，故**撞锁期间**崩溃会丢
+「至多一个 flush 周期 + 一个退避窗口」，即 **35 秒**的数据（无锁竞争时仍是 5 秒）。
+取 30 秒的依据：对端大 prune / 迁移实测在 0.5–2.2 秒量级，30 秒足以跨过；又远小于用户
+「这软件卡住了」的感知阈值。**不要**为缩回 5 秒而取消退避 —— 那会让主线程被占满。
+
+** 已知口径损失：会话行补建窗口内的聚合缺失（TD-36）
+
+补建只能救回**明细**，聚合救不回，且两类机制**不同**：
+
+- 六个 =record-*= 聚合入口（gc / drift / resources / gc-attrib / health / startup）经
+  =--aggregate-session= 在**记录时**即跳过（=session_id= 为 nil 时不入 hash）：hash 里从来没有
+  那些键，事后无法补算。
+- =hourly_stacks= 经 =--stack-session= 在 **flush 期**跳过（判「会话行是否存在」要查库，热路径
+  不做），故补建成功后**本批**就可能写入。
+
+合起来即「补建窗口（≈ 一个 flush 周期，5 秒）内聚合维度全线缺失，明细完好」。这是「丢 5 秒
+聚合」换「整场会话零数据」的**有意取舍**；症状是某实例某时段的 =hourly_*= 曲线缺一段而
+=commands= 不缺。
+
 * 实测结论（2026-10-24，Emacs 31.1，=emacs -Q --batch=）
 
 实现过程中验证的运行时事实，与设计阶段的假设有出入处**以本节为准**（源码注释里也逐条注明）。
@@ -796,6 +906,7 @@ emacs -Q --batch --eval '(prin1 (mapcar (lambda (c) (car c)) (process-attributes
 | **连续命令流中的累计卡顿不可见** | 卡顿分散在几十条 20–50ms 的连续命令里（总 1.5s、**单条都不慢**）时：每条命令都进不了 =slow_events=（<200ms 阈值）、命令时间又被基线重置切掉 → block / drift 与 =slow_events= **都看不到** | 方案 B（重置换判据）的**结构性能力损失**：判据方案至少能在命令内记 block，重置方案不能。这类卡顿只能查 =commands= 的**时间戳密度**（按小时聚合已有，但需人工解读时间戳聚类）。登记 tech-debt；不要把它当成「采集器坏了」 |
 | **=--pre-command= 补判的边界** | 补判只覆盖「**命令开始前**」这一时机：停转后立刻按键 → 由它捕获；若停转后主线程恢复执行的**不是命令**（如另一个 timer 回调、进程过滤器），补判不会发生 | 设计边界，非缺陷：这类情形由 timer 心跳在其后捕获（间隙内主线程空闲时 timer 每 250ms 一直在跑）。补判的作用只是「补上 timer 被饿死的那一类」，不是万能兜底；另一残余是 D1 双跑守卫命中时 pre 直接返回（同一命令双跑、无真实间隙，无害） |
 | **aborted 路径下命令外停转被归为命令内** | 上一条命令的 =post-command-hook= 被彻底跳过（aborted）时，从它异常退出到用户按下一条命令之间的**命令外**停转，会被 =--finish 'aborted= 的 =duration-ms= 一并计入该 aborted 命令，同时基线重置把它切出 gap → 既不进 block 也不进 drift | 采集器无法区分「命令执行 2.55s」与「命令执行 50ms + 2.5s 命令外停转」；数据**没有丢**（记在 =commands= 的 aborted 行），只是归类口径不同。aborted 是罕见路径（post hook 被彻底跳过）。**不要**把它当采集 bug 修 |
+| **会话行补建窗口内的聚合缺失（TD-36）** | =store-open= 期建会话行撞锁时 =el-chronos--session-id= 保持 nil：六个 =record-*= 聚合入口经 =--aggregate-session= 在**记录时**即跳过、=hourly_stacks= 经 =--stack-session= 在 **flush 期**跳过 → 该窗口（≈ 一个 flush 周期，5 秒）的 =hourly_*= 曲线缺一段，而 =commands= 明细完好 | 见「多进程并发写（锁竞争处置）」节末：这是「丢 5 秒聚合」换「整场会话零数据」的**有意取舍**，不可后补（hash 里从来没有那些键）。**不要**读成采集 bug，也不要试图用补建「补算」聚合 |
 
 * 待补（Phase 4 之后）
 

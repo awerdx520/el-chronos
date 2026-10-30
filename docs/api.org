@@ -19,7 +19,7 @@
 |---|---|---|---|
 | 入口 | =el-chronos.el= | 自定义组、minor mode、启停编排、错误降级 | 2 命令 + 21 defcustom |
 | 归因 | =el-chronos-attrib.el= | 符号 → 源码文件 → 包 / 模块；命令上下文 | 4 |
-| 存储 | =el-chronos-store.el= | SQLite schema（v5，13 表）、批量 flush、保留与 purge | 17 |
+| 存储 | =el-chronos-store.el= | SQLite schema（v5，13 表）、批量 flush（撞锁保留重试 + 30 秒退避）、保留与 purge、多实例并发写自愈 | 17 |
 | 采集 | =el-chronos-collect.el= | 命令计时、心跳阻塞、profiler 窗口聚合、GC / 资源 / 启动打点 | 2 + 1 defcustom |
 | 分析 | =el-chronos-analysis.el= | 22 个只读分析函数（另有 =names= 作为补全辅助，不计入）；22 = 23 个 public defun 减去 =names= | 22 |
 | 报告 | =el-chronos-report.el= | org 报告、周报、CSV/JSON 导出、单命令剖析 | 5 + 1 defcustom |
@@ -108,21 +108,21 @@ collect / report 侧的 defcustom（历史分散项，不迁入 =el-chronos.el=�
 
 | 符号 | 签名 | 返回 | 说明 |
 |---|---|---|---|
-| =el-chronos-store-open= | =(&optional PATH)= | SQLite 句柄或 =nil= | 打开（或复用）数据库：pragma、=user_version= 检查与迁移、幂等；失败返回 nil 且已告警。 |
-| =el-chronos-store-close= | =()= | =t= / =nil= | flush 缓冲 → 取消 flush timer → 关库 → 清状态。 |
+| =el-chronos-store-open= | =(&optional PATH)= | SQLite 句柄或 =nil= | 打开（或复用）数据库：pragma、=user_version= 检查与迁移、幂等；失败返回 nil 且已告警。**返回句柄不再保证「会话行已存在」**（并发写 D1）：=--ensure-session-quiet= 撞锁时 =el-chronos--session-id= 保持 nil，句柄照常返回、flush timer 照常启动，会话行由下一次 flush 批前补建。 |
+| =el-chronos-store-close= | =()= | =t= / =nil= | flush 缓冲（**绕过撞锁退避**：退避只节流周期性 flush）→ 取消 flush timer → 关库 → 清状态（含 7 个自监控计数器与 =--flush-backoff-until=）。 |
 | =el-chronos-store-record-command= | =(EVENT)= | 无 | 命令事件入缓冲（plist，键见 =commands= 表）。 |
 | =el-chronos-store-record-slow-event= | =(EVENT)= | 无 | 慢事件 / 阻塞事件入缓冲。 |
 | =el-chronos-store-record-usage= | =(HOUR-TS DIMENSION KEY COUNT DURATION-MS)= | 无 | 累加小时用量；=DIMENSION= 取 =command= / =mode= / =project= / =file=。 |
 | =el-chronos-store-record-function-samples= | =(HOUR-TS FUNCTION FILE PACKAGE SELF-MS TOTAL-MS SAMPLES)= | 无 | 累加小时函数聚合（upsert）。 |
 | =el-chronos-store-record-stacks= | =(HOUR-TS STACKS)= | 无 | 累加小时栈样本；=STACKS= 为 =((STACK-JSON . SAMPLES) ...)=。 |
 | =el-chronos-store-record-gc= | =(HOUR-TS GC-COUNT GC-MS HEAP-BYTES)= | 无 | 累加小时 GC 统计（v2）。=HEAP-BYTES= 为 nil 表示本窗口无堆样本 → 该行 =heap_bytes= **保持上一次观测值**（=COALESCE=，last-observation-carried-forward）；只有非 nil 才覆盖。 |
-| =el-chronos-store-record-health= | =(HOUR-TS KEY VALUE)= | 无 | 累加采集器自监控计数（v2）。=KEY= 为固定枚举：=dropped-commands= / =dropped-events= / =flush-failures= / =flush-count= / =flush-ms= / =sample-misses=。库里是 **eventual** 值（flush 失败时无法写库，下一次成功 flush 补写）。 |
+| =el-chronos-store-record-health= | =(HOUR-TS KEY VALUE)= | 无 | 累加采集器自监控计数（v2）。=KEY= 为固定枚举：=dropped-commands= / =dropped-events= / =flush-failures= / =flush-count= / =flush-ms= / =sample-misses=。**=busy-retries= 不在本枚举内**：它由 =--health-snapshot= 直接上报（store 自持计数器，成功 flush 后按快照扣减），外部调用方**不得**手工写这个键 —— 与「减去已上报部分」的口径冲突后，库内值就不再等于真实撞锁次数。库里是 **eventual** 值（flush 失败时无法写库，下一次成功 flush 补写）。 |
 | =el-chronos-store-record-drift= | =(HOUR-TS GAP-MS)= | 无 | 累加「命令外停转」小时聚合（v3）：=count= +1、=total_ms= 累加、=max_ms= 取较大值。=GAP-MS= 是**浮点毫秒**（当前时刻与 =--last-heartbeat= 之差 × 1000，含 ∈[0, 心跳间隔] 的偏移，故为**高估值**）。整体 =condition-case= 包裹；会话未知时**跳过并每进程告警一次**（=hourly_drift= 无外键，孤儿行 purge 删不掉）。 |
 | =el-chronos-store-record-resources= | =(HOUR-TS PLIST)= | 无 | 累加一次**进程资源**采样到 =hourly_resources=（v4）。=PLIST= 键全部可选：=:cpu-ms= / =:wall-ms=（毫秒，**累加**；两者之比即 CPU 占用率）、=:rss-kb-max= / =:rss-kb-sum=（**KB**）、=:threads-max=（峰值）、=:load1-sum= / =:load5-sum= / =:load15-sum=（累加）。=load_n= **不接受显式传值**：三值里任一非空即记一条负载样本（+1）。**NULL 语义**：可空字段传 nil **不得覆盖已有非 NULL 值**（内存槽「有值才更新」+ 落库 =COALESCE= 两道都必要）。非数值（字符串 / 符号）一律按「没采到」处理，不让脏输入毁掉整批 flush。 |
 | =el-chronos-store-record-startup-phase= | =(SESSION-ID PHASE MS)= | 无 | 记录启动阶段耗时（v2）。=PHASE= 取 =mode-start= / =after-init= / =startup= / =first-idle=，包加载明细用 ="load:<library>"=；同 =(SESSION-ID, PHASE)= 重复打点**覆盖**。 |
 | =el-chronos-store-record-session-meta= | =(SESSION-ID KEY VALUE)= | 无 | 写会话级元数据（v2，=git-head= / =config-sig=）。**直接 =sqlite-execute= 写入、不走缓冲**（每会话一次的冷路径，立即可见、不占缓冲、失败可独立告警）；=VALUE= 为 nil 时**不写行**。 |
 | =el-chronos-store-note-startup-ms= | =(MS)= | 无 | 登记待补写的 =sessions.startup_ms=，落库并入**下一次 flush 的既有事务**。**纯内存、零 IO**：不碰 sqlite、不告警、不登记 timer（见「内部函数约定」）。 |
-| =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 / v3 / v4 新表 + 待补写的 =startup_ms=）；失败整体 ROLLBACK、丢弃本批、限流告警（10 分钟一次）。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
+| =el-chronos-store-flush= | =()=，interactive | 无 | 全部缓冲单事务写库（含 v2 / v3 / v4 / v5 新表 + 待补写的 =startup_ms=），事务用 =BEGIN IMMEDIATE=。**失败按错误类型分流**：=sqlite-locked-error=（锁竞争）→ 保留本批（明细 + 慢事件 + 九个聚合 hash 一个都不清）、=streak= +1 并置 30 秒退避；=streak= 达 =--max-lock-retries=（6）才丢弃本批并打**结果告警**（=--warn-force=，不受限流）；其余错误（磁盘满 / =no such table= / 约束冲突）**立即丢弃**本批 + 限流告警。**一般不直接调用**：由 =el-chronos-mode= 与 5s flush timer 编排（=interactive= 只让 =M-x= 可用）。 |
 | =el-chronos-purge= | =(&optional BEFORE)=，interactive | =((表名 . 删除行数) ...)= | 删除 =BEFORE=（epoch ms）之前的**全部**数据（含七张 =hourly_*= 与两张会话级表）：**共 13 张表**，删除顺序钉死（见 [[file:schema.org][docs/schema.org]]「purge 的 13 表删除顺序」）。=BEFORE= 为 nil 时清空全部 13 张表。与自动 retention 的区别是连聚合一起删。 |
 | =el-chronos-store-vacuum= | =()=，interactive | =t= / =nil= | 对当前库执行 =VACUUM= 回收空间（不能在事务内）。 |
 
@@ -169,7 +169,7 @@ store / attrib 是软引用（=declare-function= + =fboundp= 守卫）。
 | =el-chronos-analysis-stacks= | =(RANGE &optional LIMIT)= | list of plist | 调用栈排行；=(:stack :samples :pct)=，=:stack= 第 0 帧是 leaf；默认 50 |
 | =el-chronos-analysis-sessions= | =(RANGE)= | list of plist | 会话列表，按启动时间降序；=(:id :started-at :startup-ms :emacs-version :host)= |
 | =el-chronos-analysis-startup-breakdown= | =(&optional SESSION-ID)= | plist | **启动耗时分解（v2）**。=:session-id= =:started-at= =:startup-ms= =:phases= =:loads=；=:phases= 为 =((PHASE MS) ...)=（固定顺序 =mode-start= → =after-init= → =startup= → =first-idle=，缺的跳过），=:loads= 为 =((LIBRARY MS) ...)=（=phase= 以 ="load:"= 开头的行，按 ms 降序、前缀已去掉、入库前已按 =el-chronos-startup-top-n= 截断）。=SESSION-ID= 省略时取最近一次有启动数据的会话。**两条口径**：① 包加载耗时是相邻 =after-load-functions= 回调的时间差，属**近似归因**；② 覆盖范围受限——mode 在启动结束后启用时只有 =mode-start= 一个锚点、无包加载明细（物理边界，见 [[file:operations.org][docs/operations.org]]）。无数据时返回**同构空结构**（不返回 nil）。 |
-| =el-chronos-analysis-health= | =(RANGE)= | plist | **采集器自监控（v2）**。=:dropped-commands= =:dropped-events= =:flush-failures= =:flush-count= =:flush-ms= =:flush-avg-ms= =:sample-misses= =:ok-p= =:rows=。关键约定：=:ok-p= 只看四个「坏消息」键（=dropped-commands= / =dropped-events= / =flush-failures= / =sample-misses=）是否全 0；**=:rows= 是区分「本期无异常」与「本期无数据」的唯一依据**——一条 health 行都没有时 =:ok-p= 同样为 t，只看 =:ok-p= 会把「没采集」读成「一切正常」（报告与 Web 都按 =:rows= 先行分支）。计数是 **eventual** 值（flush 失败要等下一次成功 flush 才可见）。 |
+| =el-chronos-analysis-health= | =(RANGE)= | plist | **采集器自监控（v2）**。=:dropped-commands= =:dropped-events= =:flush-failures= =:flush-count= =:flush-ms= =:flush-avg-ms= =:busy-retries= =:sample-misses= =:ok-p= =:rows=。关键约定：=:ok-p= 只看四个「坏消息」键（=dropped-commands= / =dropped-events= / =flush-failures= / =sample-misses=）是否全 0；**=:busy-retries= 是中性度量，不进 =:ok-p=** —— 锁竞争被成功自愈也会让它上升（=el-chronos-analysis--health-bad-keys= 刻意不含它），把它当健康判据会把「多实例并发被自愈」读成「采集异常」；**=:rows= 是区分「本期无异常」与「本期无数据」的唯一依据**——一条 health 行都没有时 =:ok-p= 同样为 t，只看 =:ok-p= 会把「没采集」读成「一切正常」（报告与 Web 都按 =:rows= 先行分支）。计数是 **eventual** 值（flush 失败要等下一次成功 flush 才可见）。 |
 | =el-chronos-analysis-config-history= | =(RANGE)= | plist | **配置变更时间线（v2）**。=:sessions= 元素 =(:id :started-at :git-head :config-sig :changed)=（按 =started_at= 升序）；=:changes= 为 =:changed= 为 t 的会话数。关键约定：=:changed= 表示**与前一个会话相比** =(git-head, config-sig)= 有变化，**=nil= 有两种含义且本层不区分**——① 首会话（没有「前一个」，无从比较）；② 与前一会话相比标记无差异；调用方若需区分请**自行判断会话序号**（=:sessions= 的首个元素即第一个会话）；引入三态（=:n/a= / nil / t）属行为变更、未实施，见技术债 TD-20；两个键都为 nil 的相邻会话视为没变化（无法断言配置变了，谎报比漏报更糟）。=git-head= / =config-sig= 为 nil 表示**未取到**（store 层取不到就不写行），不是「取了但为空」。空库返回 =(:sessions nil :changes 0)=。 |
 | =el-chronos-analysis-blocking-events= | =(RANGE &optional LIMIT)= | list of plist | 命令外阻塞事件，按耗时降序；=(:id :ts :duration-ms :kind :command :mode :project)= |
 | =el-chronos-analysis-drift-trend= | =(RANGE &optional BUCKETS)= | plist | **命令外停转（drift）趋势（v3）**。=:range= =:bucket-span= =:buckets= =:drift-total= =:ms-total= =:slowest-ms=；=:buckets= 元素 =(:bucket :count :total-ms :max-ms)=（桶内求和 + 取最大）。三条约定：① **语义是「命令之外」的停转** —— 命令内的停转由 =commands= 的 =duration-ms= 覆盖、经 =slow-events(kind="command")= 呈现，两表**不可相加**（不相交集合）；② =:ms-total= / =:slowest-ms= 是**高估值**，每次最多多算一个心跳间隔（默认 250ms），减掉至多一个间隔才是真实下界；③ =hourly-drift= 属**永久保留**的聚合表（不受 =el-chronos-retention-days= 约束），需手动 purge。**无数据时返回 plist（=:buckets= 为 nil）而不是 nil**，避免调用方判空分支分叉。 |
@@ -367,8 +367,59 @@ straight 的 autoloads 步骤依据包侧 cookie 生成 =build-<ver>/el-chronos/
     主键 upsert 吸收幂等；=:loads= 取走即 =clrhash=）；=--finish= **幂等**且必须 =cancel-timer=
     **两个** timer（=--finish-timer= 与 =--fallback-timer=，漏一个就是探针侧遗留 timer，
     I5 在此无覆盖）；探针**不 require** 任何 el-chronos 模块（反向交接靠 =fboundp= 软调用）。
+- **并发写的内部约定（多实例共享一库，2026-10-30）**（口径见
+  [[file:architecture.org][docs/architecture.org]]「多进程并发写（锁竞争处置）」与
+  [[file:adr/0007-multi-process-write-concurrency.md][ADR-0007]]）：
+  - =el-chronos-store--ensure-session-quiet (DB)=：确保当前会话行存在并返回 id，**失败返回 nil、
+    从不抛错**（=sqlite-locked-error= → =--busy-retries= +1 后静默返回 nil；其余错误 → =--warn=
+    限流告警后返回 nil）。它是 =store-open= 与 flush 批前补建的**唯一入口**，调用方必须把
+    「会话行暂时不存在」当作**可延迟状态**而不是打开失败。
+  - =el-chronos-store--call-with-write-timeout (THUNK)=：在 =busy_timeout= 8000 ms 生效期间调用
+    THUNK 并返回其结果。**不可嵌套**：恢复分支恒把 =busy_timeout= 恢复成默认的 2000 ms
+    （不记「进来前的值」），故在 THUNK 内部再调本函数时，内层退出会把外层的 8000 ms 提前降回
+    2000 —— 外层剩余的写操作就在 2 秒超时下跑，表现为「偶发撞锁」而不是报错。恢复动作用
+    =ignore-errors= 包住（句柄已关闭时 =sqlite-pragma= 会抛错，不该盖住 THUNK 的真实结果）。
+    用于 flush / prune / purge；**不用于** =--open-db= 与建会话行（启动路径保持 2 秒，不拖慢启动）。
+  - =el-chronos-store--flush-batch ()=：flush 的事务体（单独成函数只为让写超时包装器包住整个批次）。
+    **不检查撞锁退避** —— 退避门只在 =el-chronos-store-flush= 最前面，故直接调它是「显式绕过退避」
+    的内部入口，**仅测试与排障使用**；它自带「有库 + 有待写数据」守卫，裸调是安全的。
+    会话补建（D1）也在它内部、=let*= 求值之前（顺序是硬约束）。
+  - =el-chronos-store--warn-emit= / =--warn= / =--warn-force=（共同实现 + 两个门）：
+    =--warn= 限流（每 =--warn-interval-seconds= 最多一条），**只给过程消息**（撞锁重试、补建失败、
+    prune 失败…）；=--warn-force= 判定时不限流（仍更新 =--warned-at=），**只给「数据真的丢了」
+    这类结果消息**（`本批缓冲已按计划丢弃`）—— 否则第 1 次撞锁的过程告警就把 600 秒窗口占满，
+    用户永远看不到结果。**不要**用「频繁清空重试计数器」绕这个限制（那会让过程消息刷屏，
+    只见过程不见结果）。拆三个函数而不是给 =--warn= 加 =FORCE= 位置参数：现有调用点全是
+    =(FMT ERR)= 形态，插参会让 ERR 绑到 FORCE 上 → 全部既有告警变成不受限流（刷屏式静默退化）。
+  - =el-chronos-store--prune (&optional FORCE)=：逻辑是「节流门（=--prune-interval-seconds=，
+    3600 s）→ 候选预检（=commands= / =slow_events= 各一次 =SELECT count(*)=，两表都 0 就不开写事务）
+    → 有候选才开 =BEGIN IMMEDIATE= 写事务（包在写超时包装器里）」。过门即记 =--last-prune-time=
+    （预检不过也记；撞锁失败同样算「已过门」，会把下一次尝试推迟一小时）。**唯一调用点是
+    =el-chronos-store-open=**，不挂周期 timer —— 故它只节流「同进程反复 open / close」，
+    =el-chronos-retention-days= 的实际生效仍依赖实例重启（见 [[file:operations.org][docs/operations.org]]）。
 - 采集路径（hook / timer / profiler 回调）中的内部函数一律 =condition-case= 包裹，失败降级
   继续，不向宿主抛错（I6）。
+
+** 并发写相关的常量与变量（全部 =defconst= / =defvar=，不新增 defcustom）
+
+| 符号 | 类别 | 值 / 单位 | 说明 |
+|---|---|---|---|
+| =el-chronos-store--busy-timeout-ms= | defconst | 2000 ms | 默认 / 启动路径的 =busy_timeout= |
+| =el-chronos-store--busy-timeout-write-ms= | defconst | 8000 ms | 后台批量写（flush / prune / purge）的 =busy_timeout=；由 =--call-with-write-timeout= 抬降 |
+| =el-chronos-store--max-lock-retries= | defconst | 6 批 | flush **连续**撞锁上限，到即丢弃本批（**只对 =sqlite-locked-error= 计数**） |
+| =el-chronos-store--flush-backoff-seconds= | defconst | 30 s | 撞锁后退避时长（避免「每 5 s 撞一次、每次等 8 s」占满主线程） |
+| =el-chronos-store--prune-interval-seconds= | defconst | 3600 s | 两次 =--prune= 之间的最小间隔 |
+| =el-chronos-store--flush-backoff-until= | defvar | =float-time= 或 nil | **下次允许尝试 flush** 的时刻（nil 表示无退避）；置位时机：撞锁的保留与丢弃两条路径；清零时机：COMMIT 成功 / 非锁错误 / =store-close= |
+| =el-chronos-store--last-prune-time= | defvar | =float-time= 或 nil | 上次过 prune 节流门的时刻（预检不过、撞锁失败也记） |
+| =el-chronos-store--busy-retries= | defvar | 整数，单调累加 | 撞锁次数（**中性度量**）：进 =--pending-p=、经 =--health-snapshot= 上报 =hourly_health= 的 =busy-retries=，**不进** =--health-bad-keys= |
+| =el-chronos-store--flush-lock-streak= | defvar | 整数 | **连续**撞锁批次数；COMMIT 成功或走非锁错误分支后归零 |
+
+三条放置纪律：① 这些计数器与 =--flush-backoff-until= **不进** =--clear-aggregates= 清空的容器
+（那批容器的清空点是「本批已处理 / 已丢弃」，放进会被一次 flush 失败抹掉）；
+② =--busy-retries= / =--dropped-*= / =--flush-failures= **要进** =--pending-p=（否则 D1 路径的
+撞锁计数永不触发上报），而 =--flush-backoff-until= **不能进**（它是「暂时不许尝试」而非
+「有待写数据」）、=--flush-count= / =--flush-ms-total= **不能进**（会让判定恒真 → 无限 flush 循环）；
+③ 唯一无条件清零点在 =el-chronos-store-close=。
 
 * 启动探针模块（=el-chronos-startup-probe.el=，2 个对外接口）
 

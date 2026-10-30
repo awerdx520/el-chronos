@@ -45,7 +45,7 @@
 | 13 | GET | =/api/gc= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720） | =range= =bucket-count=（省略为 null）= =bucket-span= =gc-total= =heap-latest= =items=[{:bucket :gc-count :gc-ms :heap-bytes}]= |
 | 14 | GET | =/api/resources= | =range= =buckets=（省略由 analysis 按窗口选 24/168/720，与 =/api/gc= 同一套） | =range= =bucket-count=（省略为 null）= =bucket-span= =cpu-ms-total= =wall-ms-total= =cpu-pct-avg= =rss-kb-max= =rss-kb-avg= =threads-max= =load1-avg= =load5-avg= =load15-avg= =samples= =items=[{:bucket :cpu-ms :wall-ms :cpu-pct :rss-kb-max :rss-kb-avg :threads-max :load1-avg :load5-avg :load15-avg :samples}]= |
 | 15 | GET | =/api/startup= | =session=（正整数；省略/非法 → 取最近一次有启动数据的会话） | =session-id= =started-at= =startup-ms= =phases=[[阶段 耗时]=…]= =loads=[[库 耗时]=…]= |
-| 16 | GET | =/api/health= | =range= | =range= =dropped-commands= =dropped-events= =flush-failures= =flush-count= =flush-ms= =flush-avg-ms= =sample-misses= =ok-p= =rows= |
+| 16 | GET | =/api/health= | =range= | =range= =dropped-commands= =dropped-events= =flush-failures= =flush-count= =flush-ms= =flush-avg-ms= =busy-retries= =sample-misses= =ok-p= =rows= |
 | 17 | GET | =/api/config-history= | =range= | =range= =total-sessions= =truncated= =changes= =sessions=[{:id :started-at :git-head :config-sig :changed}]= |
 | 18 | GET | =/api/event= | =id=（正整数） | 单事件对象 ={:id :ts :duration-ms :kind :command :stack :context}=；缺失/非法/不存在 → =null= |
 | 19 | GET | =/api/export.csv= | =range= | 多区块 CSV（=text/csv= + =Content-Disposition: attachment=） |
@@ -57,6 +57,10 @@
 - =/api/event= 用「200 + =null=」而非 404：事件可能已被保留策略清理，属正常空结果；
   只有未知路径才 404。非 GET → 405（带 =Allow: GET=），路径不以 =/= 开头 → 400，
   请求头超过 =16384= 字节 → 413。
+- **键名风格**：JSON 里的健康指标用**连字符**（=busy-retries=，与既有 =flush-failures= /
+  =dropped-commands= 一致，取自 analysis plist 的键名）；两个 CSV 导出件里的同名指标用
+  **下划线**（=busy_retries=，与 =flush_failures= 一致，取自 =hourly_health.key= 的写法）。
+  两套写法各自一致，**不要**在导出件里混入连字符或反向混入下划线。
 
 ** 四个新端点（v2）的参数与降级行为
 
@@ -64,7 +68,7 @@
 |---|---|---|
 | =/api/gc= | =range=、=buckets= | analysis 返回 nil（库打不开 / 查询失败）→ =:items= 为 =null=，**仍返回 200**，页面显示「（无数据）」。=:heap-bytes= 为 null 表示该桶内**没有任何堆样本**，前端渲染 =−= 而**不是 0**；Emacs < 31.1 时 =:heap-latest= 恒为 null，页面给出「本机 Emacs 不支持堆采样」的说明。本期全为基线桶（=gc-count= / =gc-ms= 全 0）时也给降级说明——基线桶不等于「没有发生 GC」 |
 | =/api/startup= | =session=（正整数） | 省略 / 非数字 / 非正数 → 取**最近一次有启动数据**的会话；提供了但库里没有该会话 → =:session-id= 回填请求的 id、其余键为 null 的**同构空结构**，**不返回 404**（会话可能已被保留策略清理，属正常空结果）；analysis 返回 nil → JSON =null=，页面显示「（无数据）」。页面标题显式标注覆盖范围（自 mode 启动起 X ms / 总 Y ms），无 =mode-start= 时显示 =−= |
-| =/api/health= | =range= | analysis 返回 nil → JSON =null=，页面显示「（无数据）」。**=:rows= 必须先行分支**：=:rows= 为 0 → 「本期无采集数据」；=:rows= > 0 且 =:ok-p= 为 true → 「本期无采集异常（flush N 次，平均 X）」。=:ok-p= 显式归一为 JSON 布尔（analysis 的 nil 会被序列化成 null，而「没有坏消息」是确定的判断，不该与「未知」共用一个值） |
+| =/api/health= | =range= | analysis 返回 nil → JSON =null=，页面显示「（无数据）」。**=:rows= 必须先行分支**：=:rows= 为 0 → 「本期无采集数据」；=:rows= > 0 且 =:ok-p= 为 true → 「本期无采集异常（flush N 次，平均 X）」+ 撞锁重试 > 0 时追加「；撞锁重试 N 次」。=:ok-p= 显式归一为 JSON 布尔（analysis 的 nil 会被序列化成 null，而「没有坏消息」是确定的判断，不该与「未知」共用一个值）。**=busy-retries= 是中性度量、不进 =:ok-p= 判据**（锁竞争被自愈也让它上升），它只作为面板里的一行与「已自愈」的说明出现 |
 | =/api/config-history= | =range= | analysis 返回 nil → =:sessions= 为 null、计数为 0 的空结构。**只返回最近 =el-chronos-web--config-history-sessions=（50）个会话**（取尾部）：会话行随每次重启单调增长，全量返回会让单线程 Web 的主线程查询与浏览器渲染一起变长；截断后 =:changes= 按**返回的**会话重算，=:truncated= 显式归一为 JSON 布尔标出截断；保留下来的第一条若 =changed= 为 true，它参照的前一会话已不在列表里（截断的固有代价）。=git-head= / =config-sig= 为 null 表示**未取到**（store 层取不到就不写行），不是「取了但为空」 |
 
 ** v3 新端点 =/api/drift= 的参数与降级行为
@@ -89,6 +93,8 @@
 ** 新端点的响应体很小：以 fixture（3 个 GC 桶 / 6 个健康键 / 3 个阶段锚点 + 3 条包加载 /
 1 个会话）实测，=200= 响应体分别为 **252 / 203 / 184 / 237 字节**，均在 300 字节内；
 =range= 与 =buckets= 变大、会话变多（=config-history= 受 50 封顶）时线性增长，仍属同一量级。
+（health 的 184 是**加入 =busy-retries= 之前**的实测值；新增一个整数字段使同一量级的 fixture
+增加约 18 字节，仍远小于 300，故本节结论不变。）
 
 ** 内嵌前端结构
 
@@ -111,7 +117,7 @@
 | 热点函数 | =#q-func= 搜索 + =table#t-func= | 同上 |
 | 阻塞事件 | =div#drift= + =table#t-block= | **顶部的 drift 小节**（v3）：一行「命令外停转（≥N ms）：本期 X 次，累计 Y，最坏 Z」+ 最近 24 桶小表（小时/次数/累计/最坏）；阈值 N 取自 =/api/drift= 的 =threshold-ms=。下方是 block 明细表格 + 行点击下钻。drift 小节含「仅命令之外的停转；累计与最坏为高估值（每个样本最多多算一个心跳间隔 250ms）；命令内停转见上表，两者不可相加」的口径注 |
 | 回归 | =table#t-reg= | 表格 |
-| **采集健康** | =div#health= | 六个指标 + flush 平均耗时；=rows= 为 0 时显示「本期无采集数据」（不是「无异常」） |
+| **采集健康** | =div#health= | 七个指标 + flush 平均耗时（含「撞锁重试」=busy-retries=；它是中性度量，**不参与**「无异常」判据）；=rows= 为 0 时显示「本期无采集数据」（不是「无异常」） |
 | **配置变更** | =div#conf= | 表格：会话启动时间 / 提交（前 8 字符）/ 配置指纹（前 8 字符）/ 变化 ✓；截断时标注「仅显示最近 50 个会话」 |
 | 会话 | =table#t-sess= | 表格（多会话对比） |
 | 火焰图 | =svg#flame= + =#flame-legend= | **按层聚合近似**：栈按层级折叠，深度 ≤6 层，宽度按样本数占比 |
@@ -172,7 +178,7 @@
 | 7 | **GC 归因（发生在哪条命令之后）**（v5） | =el-chronos-analysis-gc-attribution= → =--section-gc-attribution= | TOP 15 行；列：命令/次数/GC 耗时(ms)/占比；首行固定写明语义限定，无数据走 =--gc-attrib-degrade= |
 | 8 | **资源（CPU / 内存 / 负载）**（v4） | =el-chronos-analysis-resource-trend= / =resource-summary= → =--section-resource= | 最近 48 桶；列：小时/CPU%/RSS 峰值/线程/负载 1m；无数据走 =--resource-degrade= |
 | 9 | 启动分解 | =el-chronos-analysis-startup-breakdown= → =--section-startup= | 阶段锚点全列 + 包加载 TOP 10 行 |
-| 10 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 六个指标 + flush 平均耗时 |
+| 10 | 采集健康 | =el-chronos-analysis-health= → =--section-health= | 七个指标 + flush 平均耗时（含「撞锁重试」=busy-retries=；=:ok-p= 为 t 时以「；撞锁重试 N 次」字样追加，为 0 时不追加） |
 | 11 | 配置变更 | =el-chronos-analysis-config-history= → =--section-config= | 会话全列（哈希各显示前 8 字符） |
 | 12 | 阻塞事件 | =el-chronos-analysis-drift-trend= → =--drift-line=；=el-chronos-analysis-blocking-events= | 节内**先给一行 drift 汇总**，再列 block 明细 20 行（列：时间/时长/命令/mode/project）。drift 汇总**不新开节**（见下） |
 | 13 | 回归（近 N 天） | =el-chronos-analysis-regressions= | 20 行；标题天数取 =el-chronos-regression-window-days= |
@@ -236,7 +242,7 @@ block 覆盖 ≥2000ms）。抽成独立节会让「命令外停转」被拆到�
 | 启动分解 | 无阶段锚点 | =--startup-phases-degrade=：「（无阶段锚点：mode 启动时启动已结束，只能记录 mode-start 之后的阶段）」 |
 | 启动分解 | 无包加载明细 | =--startup-loads-degrade=：「（无包加载明细：mode 启动时启动已结束，不记录 after-load-functions）」 |
 | 采集健康 | =:rows= 为 0（本期没有 health 行） | 「本期无采集数据（采集器尚未写入健康指标）」——**不许**落到 =:ok-p= 分支（analysis 无数据时同样给 =:ok-p= 为 t，照抄会把「没采集」读成「一切正常」） |
-| 采集健康 | =:rows= > 0 且 =:ok-p= 为 t | 只给一行「本期无采集异常（flush N 次，平均 X）」——「无异常」不等于「无信息」，flush 次数与均值是正常运转的度量 |
+| 采集健康 | =:rows= > 0 且 =:ok-p= 为 t | 只给一行「本期无采集异常（flush N 次，平均 X）」——「无异常」不等于「无信息」，flush 次数与均值是正常运转的度量；=:busy-retries= > 0 时在同一行末尾追加「；撞锁重试 N 次」（为 0 或取不到时**不追加**，文案逐字不变）——它不进坏消息键，但不在这里露出，「多实例并发被成功自愈」这种常态就永远看不见 |
 | 采集健康 | 查询失败（analysis 返回 nil） | 空表 + =（无数据）= |
 | 配置变更 | =:sessions= 为空或查询失败 | =--config-degrade=：「本期无会话变更记录（会话启动时未取到 git-head / config-sig，或窗口内没有会话）。」整节不省略 |
 
@@ -250,6 +256,7 @@ block 覆盖 ≥2000ms）。抽成独立节会让「命令外停转」被拆到�
 - =el-chronos-weekly-report= 把近 7 天报告写入 =chronos-weekly.org=（默认落运行时状态目录）。
 - =el-chronos-export= 导出 CSV（=# section:= 分块，**10 个区块**：5 个通用规格 + startup / health / config-history / drift / resources 五个手写）或 JSON（单对象，含 overview 与各明细区块）。
 - Web 的 =/api/export.csv= 有 **13 个区块**（8 个通用规格 + startup / health / config-history / drift / resources 五个手写）。两侧的区块名与表头**逐字对齐**，drift 与 resources 在两侧都放**末尾且同序**（drift 之后是 resources；位置一致是被用例 =el-chronos-report-test-csv-sections-match-web= 断言的不变量）。resources 区块列：=bucket_ms= / =cpu_ms= / =wall_ms= / =cpu_pct= / =rss_kb_max= / =rss_kb_avg= / =threads_max= / =load1_avg= / =load5_avg= / =load15_avg= / =samples=（可空列输出**空串**而非 0）。
+- **health 区块的列（两个 CSV 都含）= metric / value 两列**，指标行为 =dropped_commands= / =dropped_events= / =flush_failures= / =flush_count= / =flush_ms= / =flush_avg_ms= / **=busy_retries=** / =sample_misses= / =rows=。注意 =busy_retries= 在导出件里用**下划线**、在 JSON（=/api/health=）里用**连字符** =busy-retries=；两侧 CSV 的指标集合与顺序由用例 =el-chronos-report-test-csv-health-metrics-match-web= 断言 =equal=（两个 CSV 是内联重复实现，漏一处只表现为「某个导出件少一行」）。
 - =el-chronos-show-event= 展示单条慢事件完整栈与 context（=*el-chronos-event*= 只读 buffer）。
 - =el-chronos-profile-command= 对单条命令做 1ms 高精度剖析（不查库，实时跑一次）。
 

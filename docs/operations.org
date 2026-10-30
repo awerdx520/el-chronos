@@ -440,7 +440,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 
 | 操作 | 入口 | 作用范围 | 备注 |
 |---|---|---|---|
-| 自动 retention | 采集运行中周期执行 | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 七张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理 |
+| 自动 retention | **仅在 =el-chronos-store-open= 时执行一次**（不挂周期 timer；1 小时节流只作用于同进程反复 open / close） | 仅 =commands= / =slow_events=，按 =el-chronos-retention-days=（默认 30 天） | 七张 =hourly_*= 聚合表与两张会话级表（=startup_phases= / =session_meta=）**永久保留**，不参与自动清理。**改 =el-chronos-retention-days= 或想让过期行被清掉，都要等实例重启**（见本节后「保留策略的实际生效依赖实例重启」）；两表都没有过期候选时**完全不开写事务**（候选预检） |
 | 按日期 purge | =M-x el-chronos-purge=（交互输入 =YYYY-MM-DD=） | 该日期之前的**全部**数据（含七张 =hourly_*= 与两张会话级表） | 输入留空 = 清空全部 **13 张表** |
 | 全部 purge | =M-x el-chronos-purge= 后直接回车 | 清空 13 张表 | purge 会顺带补建当前会话行，避免后续写入撞外键（并把它重建行的 =startup_ms= 置 NULL） |
 | 回收空间 | =M-x el-chronos-store-vacuum= | =VACUUM=（重写库文件） | 不能在事务内执行；purge 后跑一次可显著缩小文件 |
@@ -451,6 +451,20 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 ;; => (("commands" . 12345) ("slow_events" . 67) ("hourly_functions" . 890) ...)
 (el-chronos-store-vacuum)   ; => t
 #+END_SRC
+
+** 保留策略的实际生效依赖实例重启
+
+自动 retention（=el-chronos-store--prune=）**只在 =el-chronos-store-open= 里调用一次**，不挂
+flush timer、也没有任何周期 timer —— 因此：
+
+- 改 =el-chronos-retention-days= 之后，要**下次启动**（或重开库）才按新值清理；常驻一整天不重启
+  的实例不会中途清理。**不要**把它读成「1 小时 + 5 秒后生效」：那个 5 秒是 flush 周期，与 retention
+  无关；=el-chronos-store--prune-interval-seconds=（3600 s）节流的是「**同进程**反复 open / close」，
+  跨进程各自计时（多实例同时启动时「首次各自执行一次」）。
+- 想让过期数据立即消失，用 =M-x el-chronos-purge=（交互输入日期）或手动 =DELETE=，不要指望等。
+- 每次 open 都会先做**候选预检**（对 =commands= / =slow_events= 各一次 =SELECT count(*)=，
+  走时间索引、WAL 下读锁不阻塞写者）；两表都没有过期行就**完全不开写事务** —— 故「反复 open
+  但没有过期数据」不再产生空转写事务，也就不是锁竞争源。
 
 ** 何时该 purge
 
@@ -481,6 +495,82 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | v3 前后 =slow_events(kind='block')= 的量看起来变少了 | **口径变了，不是采集退化**：v3 之前命令内 ≥2 s 停转会**同时**记 =kind='command'= 与 =kind='block'=（双记，TD-11 ③）；v3 起 block 只记命令外停转，命令内那一条不再产生 | 做跨版本趋势对比时**必须按时间点切开**（升级前后分段统计），否则会把「双记消失」误读成「阻塞变少了」。历史行不迁移、不回改 |
 | 慢事件里 =kind='command'= 的 =stack_json= 全是 NULL | **v4 起的有意为之**：结算时命令帧已弹出，原先记的全是采集器**自身帧**（无信息量），故改为写 NULL | 命令归属请查同时段的 =hourly_stacks= 样本；不要把 NULL 当采集失败 |
 | =make lint= 报 =Defining as dynamic an already lexical var=，但 **exit code 仍是 0** | **工具链坑**：=lint= 目标里 =(let ((byte-compile-dest-file-function …)) (byte-compile …))= 在 **=bytecomp= 未加载**时先按动态绑定编译这些变量名，于是报这条警告；而且字节编译的告警不改变 =emacs --batch= 的退出码 → **会被误判成「零告警」** | 正确写法是**先 =(require 'bytecomp)=** 再 =let= 绑定；判断 lint 是否真通过要看**输出里有没有告警行**，不能只看 exit code（=make lint= 的实现已按「有告警即失败」处理，自己写脚本时注意别踩） |
+
+** 多实例共享库是设计意图，不是配置错误
+
+同一 =user-emacs-directory= 下的多个 Emacs（GUI 主实例 + daemon + 隔离验证实例 =elisp-test=，
+以及偶发的 =emacs -Q --batch= 脚本）会共用同一个 =chronos.sqlite= —— **这是设计意图**：
+=sessions= 每会话一行、=sessions.host= 记主机名、=hourly_*= 的主键含 =session_id=，三者的存在
+前提就是「一个库、按会话纵向分行」。报告与 Web 因此能一眼看到「今天两个实例各自花了多少」，
+不必跨库归并（SQLite 没有跨库 JOIN）。I3 也把「数据只写 =el-chronos-db-path=」定成不变量，
+按实例分库正是为此被否决的方案（见 [[file:adr/0007-multi-process-write-concurrency.md][ADR-0007]]）。
+
+代价是 SQLite 的单写者模型：多写者会撞锁。观测器的处置是**自愈**（保留本批 + 退避重试），
+不是报错也不是分库 —— 判读见下两节。
+
+** 何时算异常
+
+| 现象 | 判定 | 处置 |
+|---|---|---|
+| 库里有多个 =sessions= 行、多会话时间并行 | **正常**：每个 Emacs 进程一个会话 | 无需处理；报告 / 页面按会话分行显示，总量看汇总 |
+| =hourly_health= 里 =busy-retries= 持续上升，而 =dropped-commands= / =dropped-events= 不动 | **正常**：撞锁被自愈 | 无需处理（这就是并发写处置在工作） |
+| 出现「写库连续撞锁 6 次，本批缓冲已按计划丢弃」 | **异常**：数据真的丢了 | 按下一节第 2 档处置 |
+| 某实例一整天没有 =commands= 行，但 =el-chronos-status= 显示在跑 | **异常** | 旧版会因 open 期建会话行撞锁而整场不采集（现已改为延迟补建）；仍复现则查 =*Messages*= 的「打开数据库失败」、库文件权限与磁盘空间 |
+| 同一会话的 =commands= 与 =hourly_*= 时间范围对不上 | **可能正常**：会话行补建窗口（≈ 5 秒）内聚合被跳过、明细保留 | 见 [[file:architecture.org][docs/architecture.org]]「已知口径损失」（TD-36）；缺口只有几秒，不是整天 |
+
+** database is locked 怎么判（三档）
+
+判据全部来自 =hourly_health= 四个键（=busy-retries= / =flush-failures= / =dropped-commands= /
+=dropped-events=）与告警文案，**不需要**打开库手查。先看 =dropped-*= 有没有涨，再决定要不要管：
+
+1. **自愈，无需处理**：=dropped-*= 不涨，只有「写库撞锁（第 N/6 次），明细与聚合保留待下次 flush
+   重试」这类**过程**告警（受限流，10 分钟最多一条）。数据没丢，退避 30 秒后自动重试。
+   查库确认：
+   `select key, sum(value) from hourly_health where key like 'dropped-%' group by key;`
+   —— 两行都为 0（或无行）即为自愈。
+2. **真丢了，需要查对端在干什么**：出现「写库连续撞锁 6 次，本批缓冲已按计划丢弃」这条**结果**
+   告警（绕过节流，一定会出现），或 =dropped-commands= / =dropped-events= 同时上升（条数 = 被
+   丢弃的缓冲长度，单类上限 50000）。对端常见原因：大 =prune=（删百万行实测 2.18 s）、schema
+   迁移、外部 =sqlite3= 长事务、磁盘 / 文件系统卡顿。处置：确认没有外部进程长期持写锁
+   （=fuser -v chronos.sqlite=；看 =*Messages*= 里同时段是否有另一实例在跑 prune / 迁移）。
+   **不要**删 =-wal= / =-shm= 文件（未 checkpoint 的数据会一起丢）。
+3. **多实例常态，可忽略**：=hourly_health.busy-retries= 持续上升而 =dropped-*= 纹丝不动 ——
+   「抢锁、失败、保留、重试成功」的循环，属正常并发读数。
+
+一句话口诀：**看 =dropped-*= 是否跟涨**。=busy-retries= 与 =flush-failures= 在撞锁时会**同时**
+上升 1，保留重试与达上限丢弃在它们上面完全一样，故**不能**拿它们当「丢没丢数据」的判据。
+
+** 迁移 / checkpoint / vacuum 的撞锁边界（既有行为，本批不改）
+
+并发写处置只覆盖「flush / prune / purge / 建会话行」四条路径，下面三处仍是**既有行为**，
+遇到时按此解释，不要当新 bug：
+
+- **迁移撞锁仍使 =store-open= 返回 nil**：=el-chronos-store--open-db= 内的迁移走启动路径的
+  2000 ms 超时（不套写超时包装器）。只在「升级后首次启动 + 对端恰好持写锁」时发生，概率低；
+  处理办法是关掉另一个实例后重开，或等它写完再 =M-x el-chronos-mode= 重开。
+- **=--migrate= 的 =wal_checkpoint(TRUNCATE)= 会静默跳过**：他人持写锁时该 pragma 失败，被
+  =ignore-errors= 吞掉 —— 后果是迁移生成的 =chronos.sqlite.bak= **可能不含最新 WAL 数据**
+  （备份点会比预期早一点）。回滚前若在意这点，先确保没有别的实例在跑再迁移。
+- **=el-chronos-store-vacuum= 用默认 2000 ms 且不套写超时包装器**：它是手动命令（不是周期路径），
+  对端持锁时可能直接失败并给限流告警；重跑一次即可，**没有**「等 8 秒」的优待。
+
+** 多实例共享库：撞锁退避的代价与判读
+
+多个 Emacs 实例共用同一个库时写者之间会撞锁（SQLite 单写者模型）。观测器的处置是
+「保留本批 + 短退避后重试」，由此产生三条必须知道的读法：
+
+- **崩溃丢数据窗口从 5 秒放大到 35 秒**：一次 flush 撞锁后本批被保留，并退避
+  =el-chronos-store--flush-backoff-seconds=（30 秒）再试，故撞锁期间崩溃最多丢
+  「一个 flush 周期（5 s）+ 一个退避窗口（30 s）」。取 30 秒的依据是对端的大 prune /
+  迁移实测在 0.5–2.2 秒量级，30 秒足以跨过，又远小于「这软件卡住了」的感知阈值。
+  **不要为了缩回 5 秒而取消退避**：不退避会让主线程被「每 5 秒一次、每次等满 8 秒」的
+  等锁占满（实测 8 次 × 8.01 s），比丢几秒数据严重得多。
+- **过程告警 ≠ 丢数据，结果告警才是**：被限流（10 分钟一条）的是「撞锁（第 N/6 次）」这类
+  **过程**消息；「本批缓冲已按计划丢弃」走 =el-chronos-store--warn-force= **不受限流**，出现即
+  数据真的丢了。分档判读、查库 SQL 与对端排查见上一节「=database is locked= 怎么判（三档）」。
+- **退避只推迟重试，不丢缓冲**：退避期内 flush 直接早退（不碰库、不打 pragma），缓冲、
+  聚合 hash 与自监控计数原样保留；下一次允许尝试的时刻由
+  =el-chronos-store--flush-backoff-until= 决定（到点自动恢复，无需人工干预）。
 
 * 验证步骤
 
@@ -544,7 +634,7 @@ rm -f ~/.emacs.d/.local/state/chronos/chronos.sqlite*
 | =hourly_usage= | **永久** | 仅 purge | ≤ 24 × 维度取值数 / 天 |
 | =hourly_stacks= | **永久** | 仅 purge | ≤ 24 × =el-chronos-store-stack-top-n=（默认 200）× 会话数 / 天 |
 | =hourly_gc= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 1 行（与既有 =hourly_*= 同量级，可忽略） |
-| =hourly_health= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 6 行（6 个固定键；同量级，可忽略） |
+| =hourly_health= | **永久**（仅 purge） | 仅 purge | 每会话每小时 ≤ 7 行（7 个固定键，只写非零项；同量级，可忽略） |
 | =hourly_drift= | **永久**（仅 purge） | 仅 purge（=el-chronos-store--prune= **不碰它**） | 每会话每小时 ≤ 1 行；只在命令外 500–2000ms 停转发生时写入（主键去重 upsert），与 =commands= 的时长**不可相加** |
 | =hourly_resources= | **永久**（仅 purge） | 仅 purge（=el-chronos-store--prune= **不碰它**） | 每会话每小时 ≤ 1 行（v4）；只在 10 秒采样 tick 上写入（=el-chronos-resource-sampling= 为 nil 时完全不写）。**只含进程自身的 CPU / RSS / 线程数与系统负载，不含任何用户内容**（不涉 I7） |
 | =startup_phases= | 随 =sessions= 由 purge 清理 | 仅 purge | **每会话 ≤ top-N + 3 行**（默认 ≤ 53，=el-chronos-startup-top-n= 为 50；=first-idle= 记录时 ≤ 54）—— 比 =sessions= 高两个量级，**频繁重启的机器上会明显增长，是本项目最值得留意的一张表** |
